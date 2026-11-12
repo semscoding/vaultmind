@@ -242,7 +242,7 @@ function formatSafeHighlightedWire(blindedPrompt, paillierBits) {
         `"contains_raw_pii": false,\n` +
         `"contains_raw_secrets": false,\n` +
         `"paillier_phe_modulus_bits": ${Number(paillierBits) || 1024},\n` +
-        `"bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)"`
+        `"bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]"`
     );
 }
 

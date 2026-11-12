@@ -1,20 +1,21 @@
 """
 Span-Based Cryptographic Blind Tokenizer, Native C AES-256 Secret Sealer,
-1024-bit Paillier PHE & Native C Lattice RLWE-BFV FHE Encryptor.
+1024-bit Paillier PHE & 128-bit PQ Lattice RLWE-BFV FHE Encryptor.
 
 Capabilities:
-1. Arbitrary Secret & Credential Blinding:
-   - Explicit `<secret>...</secret>` tags
-   - Free-text passwords/passphrases/PINs (`password is ...`, `passphrase: ...`, `pin: ...`)
-   - Labeled keys/tokens (`secret: ...`, `master_key=...`, `api_key: ...`, `Bearer ...`)
-   - Raw API keys (`sk-...`, `AIza...`, `ghp_...`, `AKIA...`), JWTs (`eyJ...`), and raw 128/256-bit hex keys
-   All `SECRET` spans are immediately sealed in C memory via AES-256-CBC + HMAC-SHA256 (`SessionSecretVault`).
-2. PII / Banking / Medical Blinding:
-   - IBANs, Emails, BSN/SSN/MRN IDs, Person/Vendor/Location names via session-keyed HMAC-SHA256.
-3. Dual Homomorphic Encryption on Numerical Spans:
-   - 1024-bit Fixed-Point Paillier PHE for large currency sums & exact percentage policy scalars.
-   - Compiled C Lattice Ring-LWE BFV FHE over R_q = Z_{2^60}[X]/(X^64 + 1) for non-linear
-     ciphertext × ciphertext multiplication E(m1) * E(m2) with 4-limb gadget relinearization.
+1. Zero-Retention Arbitrary Secret & Credential Blinding:
+   - Explicit `<secret>...</secret>` tags (including empty-tag sanitization)
+   - Free-text passwords/passphrases/PINs (`password is ...`, `passphrase: ...`, `pin = ...`)
+   - Compound key labels (`secret key is ...`, `master key: ...`, `api_key=...`) & Bearer/JWT/Hex keys
+   All `SECRET` spans are sealed in C memory via AES-256-CBC + HMAC-SHA256 (`SessionSecretVault`)
+   and NEVER stored as keys or values in plaintext Python dictionaries, nor echoed in JSON audit logs.
+2. PII / Banking / Medical / Dutch & International Name Blinding:
+   - IBANs, Emails, BSN/SSN/MRN IDs, plus names with Dutch/European particles (`Jan van Dijk`,
+     `Maria de Vries`, `Pieter van der Berg`), hyphens (`Jean-Luc Picard`), and apostrophes (`O'Connor`).
+3. Dual Homomorphic Encryption:
+   - 1024-bit Fixed-Point Paillier PHE for large currency sums & public percentage policy scalars.
+   - Compiled C 128-bit Lattice Security Ring-LWE BFV FHE (N=2048, q=2^54) with overflow-free
+     base-256 limb multiplication for arbitrary 32-bit products (e.g. 300 * 300 = 90,000).
 """
 
 import hashlib
@@ -24,8 +25,8 @@ import secrets
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from .bfv_fhe import BFV_T, BFVContext, SessionSecretVault
-from .homomorphic import HomomorphicEvaluator, PaillierKeypair
+from .bfv_fhe import BFVContext, SessionSecretVault
+from .homomorphic import HomomorphicEvaluator, PaillierKeypair, normalize_fhe_handle
 
 
 STOPWORD_CAPITALS = {
@@ -57,6 +58,11 @@ STOPWORD_CAPITALS = {
 
 CURRENCY_CODES = {"USD", "EUR", "GBP", "CHF", "JPY", "CAD", "AUD"}
 
+# Capitalized name token supporting apostrophes (O'Connor) and hyphens (Jean-Luc)
+NAME_WORD = r"[A-Z](?:[a-z]{1,24}|'[A-Z][a-z]{1,24})(?:-[A-Z][a-z]{1,24})?"
+# Dutch & European surname particles (only matched between strictly capitalized name words)
+NAME_PARTICLE = r"(?:van\s+der|van\s+den|van\s+de|in\s+'t|van|de|den|der|ter|ten|von|zu|du|la|le|da|di|del)"
+
 
 @dataclass
 class SpanMatch:
@@ -81,6 +87,7 @@ class BlindContext:
         self.encrypted_numbers: Dict[str, Dict[str, Any]] = {}
         self.computed_numbers: Dict[str, Dict[str, Any]] = {}
         self.primary_subject_token: str = ""
+        self.redacted_prompt: str = ""
         self.logs: List[str] = []
 
     def log(self, message: str) -> None:
@@ -111,29 +118,27 @@ class BlindTokenizer:
     def _collect_spans(self, prompt: str) -> List[SpanMatch]:
         candidates: List[SpanMatch] = []
 
-        # Priority 0: Explicit <secret>...</secret> user tags (arbitrary text/keys/passwords)
+        # Priority 0: Explicit <secret>...</secret> tags (handles empty tags safely too)
         for m in re.finditer(r"<secret>(.*?)</secret>", prompt, flags=re.DOTALL | re.IGNORECASE):
             inner = m.group(1)
-            if inner:
-                candidates.append(
-                    SpanMatch(
-                        start=m.start(),
-                        end=m.end(),
-                        category="SECRET",
-                        raw_text=m.group(0),
-                        priority=0,
-                        unseal_value=inner,
-                    )
+            candidates.append(
+                SpanMatch(
+                    start=m.start(),
+                    end=m.end(),
+                    category="SECRET",
+                    raw_text=m.group(0),
+                    priority=0,
+                    unseal_value=inner,
                 )
+            )
 
-        # Priority 1A: Labeled free-text passwords / passphrases / PINs (supports ':', '=', or 'is')
+        # Priority 1A: Labeled passwords, passphrases, PINs, and compound key phrases (supports 'is', '=', ':')
         for m in re.finditer(
-            r"""(?i:\b(?:password|passwd|pwd|passphrase|pin)\s*(?:is|=|:)\s*)(?:"([^"]+)"|'([^']+)'|([^\s,;)\]"']+))""",
+            r"""(?i:\b(?:password|passwd|pwd|passphrase|pin|secret[_\s-]+key|master[_\s-]+key|root[_\s-]+key|private[_\s-]+key|api[_\s-]+key|access[_\s-]+token|auth[_\s-]+token|secret[_\s-]+token)\s*(?:is|=|:)\s*)(?:"([^"]+)"|'([^']+)'|([^\s,;)\]"']+))""",
             prompt,
         ):
             grp_idx = 1 if m.group(1) is not None else (2 if m.group(2) is not None else 3)
             val_str = m.group(grp_idx)
-            # Strip trailing sentence period if unquoted
             end_pos = m.end(grp_idx)
             if grp_idx == 3 and val_str.endswith(".") and len(val_str) > 1:
                 val_str = val_str[:-1]
@@ -149,9 +154,9 @@ class BlindTokenizer:
                 )
             )
 
-        # Priority 1B: Labeled keys/secrets/tokens with ':' or '=' (e.g., master_key: ..., secret=..., token: ...)
+        # Priority 1B: Single-word generic secret/token/key/seed labels with ':' or '='
         for m in re.finditer(
-            r"""(?i:\b(?:secret|master[_\s-]?key|root[_\s-]?key|private[_\s-]?key|api[_\s-]?key|access[_\s-]?token|auth[_\s-]?token|secret[_\s-]?token|token|key)\s*(?:=|:)\s*)(?:"([^"]+)"|'([^']+)'|([^\s,;)\]"']+))""",
+            r"""(?i:\b(?:secret|token|key|seed)\s*(?:=|:)\s*)(?:"([^"]+)"|'([^']+)'|([^\s,;)\]"']+))""",
             prompt,
         ):
             grp_idx = 1 if m.group(1) is not None else (2 if m.group(2) is not None else 3)
@@ -206,11 +211,12 @@ class BlindTokenizer:
         for m in re.finditer(r"\b\d{3}-\d{2}-\d{4}\b", prompt):
             candidates.append(SpanMatch(m.start(), m.end(), "GOV_ID", m.group(0), priority=4))
 
-        # Priority 5: Multi-word Capitalized Names / Organizations / Locations
-        for m in re.finditer(
-            r"\b([A-Z][a-z]{1,25}(?:\s+[A-Z][a-z]{1,25})+(?:\s+(?:Corp|Inc|Ltd|BV|NV|LLC|Group|Bank|Central|Hospital|Labs))?)\b",
-            prompt,
-        ):
+        # Priority 5: Multi-word Capitalized Names / Dutch & European Particles / Organizations / Locations
+        full_name_pattern = (
+            rf"\b({NAME_WORD}(?:\s+(?:{NAME_PARTICLE}\s+)?{NAME_WORD})+"
+            rf"(?:\s+(?:Corp|Inc|Ltd|BV|NV|LLC|Group|Bank|Central|Hospital|Labs))?)\b"
+        )
+        for m in re.finditer(full_name_pattern, prompt):
             phrase = m.group(1)
             words = phrase.split()
             start_offset = m.start(1)
@@ -223,16 +229,16 @@ class BlindTokenizer:
                 cat = "LOC" if ("clinic" in prefix_ctx or "city" in prefix_ctx) else "ID"
                 candidates.append(SpanMatch(start_offset, m.end(1), cat, clean_phrase, priority=5))
 
-        # Priority 6: Single capitalized proper name preceded by role noun
+        # Priority 5B: Single hyphenated or apostrophe proper name (e.g. "Patient O'Connor") or role-prefixed name
         for m in re.finditer(
-            r"(?:employee|patient|client|vendor|recipient|user)\s+([A-Z][a-z]{2,25})\b",
+            rf"(?i:\b(?:employee|patient|client|vendor|recipient|user)\s+)({NAME_WORD})\b",
             prompt,
         ):
             word = m.group(1)
             if word not in STOPWORD_CAPITALS and word.upper() not in CURRENCY_CODES:
                 candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6))
 
-        # Priority 7: Sensitive Financial & Numerical Values (Encrypted with Paillier PHE + RLWE-BFV FHE)
+        # Priority 7: Sensitive Financial & Numerical Values (Paillier PHE + 128-bit PQ RLWE-BFV FHE)
         for m in re.finditer(
             r"(?<![A-Za-z0-9_])([\$€£])?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?(?![A-Za-z0-9_])",
             prompt,
@@ -277,11 +283,14 @@ class BlindTokenizer:
         spans = self._collect_spans(prompt)
 
         out_parts: List[str] = []
+        redacted_parts: List[str] = []
         cursor = 0
         fhe_idx = 1
 
         for sp in spans:
-            out_parts.append(prompt[cursor : sp.start])
+            prefix_slice = prompt[cursor : sp.start]
+            out_parts.append(prefix_slice)
+            redacted_parts.append(prefix_slice)
 
             if sp.category == "FHE_NUM":
                 token = f"[FHE_NUM_{fhe_idx}]"
@@ -292,13 +301,13 @@ class BlindTokenizer:
                 preview = f"{c_hex[:14]}...{c_hex[-8:]}"
                 has_dec = "." in sp.raw_text
 
-                # Also encrypt integer-compatible values in Native C Lattice RLWE-BFV R_q
-                bfv_ct: Optional[List[int]] = None
+                # Encrypt non-negative 32-bit integers into N=2048 base-256 RLWE-BFV limbs (overflow-free!)
+                bfv_limbs: Optional[List[Any]] = None
                 bfv_preview: Optional[str] = None
                 rounded_int = int(round(sp.numeric_value))
-                if not has_dec and 0 <= rounded_int < BFV_T:
-                    bfv_ct = self.bfv.encrypt_int(rounded_int)
-                    bfv_preview = self.bfv.ciphertext_preview(bfv_ct)
+                if not has_dec and 0 <= rounded_int <= 0xFFFFFFFF:
+                    bfv_limbs = self.bfv.encrypt_limbs_u32(rounded_int)
+                    bfv_preview = self.bfv.ciphertext_preview(bfv_limbs[0])
 
                 ctx.encrypted_numbers[token] = {
                     "plaintext_val": sp.numeric_value,
@@ -308,24 +317,27 @@ class BlindTokenizer:
                     "ciphertext": ciphertext,
                     "scale": scale,
                     "hex_preview": preview,
-                    "bfv_ciphertext": bfv_ct,
+                    "bfv_limbs": bfv_limbs,
                     "bfv_preview": bfv_preview,
                 }
                 ctx.token_to_plaintext[token] = sp.raw_text
                 out_parts.append(f"{token}(ENC:{preview})")
-                scheme_note = "1024-bit Paillier PHE + C RLWE-BFV FHE" if bfv_ct is not None else "1024-bit Paillier PHE"
+                redacted_parts.append(sp.raw_text)
+                scheme_note = (
+                    "1024-bit Paillier PHE + N=2048 RLWE-BFV FHE"
+                    if bfv_limbs is not None
+                    else "1024-bit Paillier PHE"
+                )
                 ctx.log(f"{scheme_note} Encrypted '{sp.raw_text}' -> {token} ({preview})")
 
             elif sp.category == "SECRET":
                 secret_plain = sp.unseal_value if sp.unseal_value is not None else sp.raw_text
-                if secret_plain in ctx.plaintext_to_token:
-                    token = ctx.plaintext_to_token[secret_plain]
-                else:
-                    token = self._hmac_token(secret_plain, prefix="SECRET")
-                    ctx.plaintext_to_token[secret_plain] = token
-                    sealed_blob = self.secret_vault.seal(secret_plain)
-                    ctx.sealed_secrets[token] = sealed_blob
+                # Deterministic HMAC token — NEVER store `secret_plain` in `plaintext_to_token` or `token_to_plaintext`!
+                token = self._hmac_token(secret_plain or "<EMPTY>", prefix="SECRET")
+                if token not in ctx.sealed_secrets:
+                    ctx.sealed_secrets[token] = self.secret_vault.seal(secret_plain)
                 out_parts.append(token)
+                redacted_parts.append(f"[REDACTED:{token}]")
                 ctx.log(
                     f"C-Enclave AES-256-CBC + HMAC Sealed SECRET -> {token} ({ctx.sealed_secrets[token]['preview']})"
                 )
@@ -342,37 +354,35 @@ class BlindTokenizer:
                     ctx.primary_subject_token = token
 
                 out_parts.append(token)
+                redacted_parts.append(sp.raw_text)
                 ctx.log(f"HMAC-SHA256 Blinded {sp.category}: '{sp.raw_text}' -> {token}")
 
             cursor = sp.end
 
-        out_parts.append(prompt[cursor:])
+        tail = prompt[cursor:]
+        out_parts.append(tail)
+        redacted_parts.append(tail)
+        ctx.redacted_prompt = "".join(redacted_parts)
         return "".join(out_parts), ctx
 
     def execute_and_decrypt_fhe(self, op_spec: Dict[str, Any], ctx: BlindContext) -> Dict[str, Any]:
-        """
-        Execute blind homomorphic evaluation on ciphertexts without secret keys:
-        - `BFV_MULTIPLY`: True Lattice RLWE-BFV non-linear ciphertext × ciphertext multiplication
-          with 4-limb gadget relinearization in compiled C (`libvaultcrypto.dylib`).
-        - `PERCENT_BONUS`, `ADD`, `MUL_SCALAR`: 1024-bit Fixed-Point Paillier PHE evaluation.
-        """
         op = op_spec.get("op", "").upper()
 
         if op in ("BFV_MULTIPLY", "MULTIPLY"):
-            ref_a = op_spec.get("ref_a", "")
-            ref_b = op_spec.get("ref_b", "")
+            ref_a = normalize_fhe_handle(op_spec.get("ref_a", ""))
+            ref_b = normalize_fhe_handle(op_spec.get("ref_b", ""))
             if ref_a not in ctx.encrypted_numbers or ref_b not in ctx.encrypted_numbers:
                 raise KeyError(f"Unknown FHE handles for BFV_MULTIPLY: {ref_a}, {ref_b}")
             ea = ctx.encrypted_numbers[ref_a]
             eb = ctx.encrypted_numbers[ref_b]
-            if ea.get("bfv_ciphertext") is None or eb.get("bfv_ciphertext") is None:
-                raise ValueError("Selected operands exceed single-ring Z_65536 RLWE-BFV integer domain.")
+            if ea.get("bfv_limbs") is None or eb.get("bfv_limbs") is None:
+                raise ValueError("Selected operands are non-integers or exceed 32-bit unsigned BFV limb domain.")
 
-            ct_prod = self.bfv.evaluator.multiply(ea["bfv_ciphertext"], eb["bfv_ciphertext"])
-            dec_int = self.bfv.decrypt_int(ct_prod)
+            prod_terms = self.bfv.evaluator.multiply_limbs(ea["bfv_limbs"], eb["bfv_limbs"])
+            dec_int = self.bfv.decrypt_limbs_product(prod_terms)
             sym = ea.get("prefix_symbol") or eb.get("prefix_symbol") or ""
             formatted = f"{sym}{dec_int:,}"
-            preview = self.bfv.ciphertext_preview(ct_prod)
+            preview = self.bfv.ciphertext_preview(prod_terms[0][1])
 
             out_token = "[FHE_COMPUTED_PRODUCT]"
             ctx.computed_numbers[out_token] = {
@@ -383,13 +393,13 @@ class BlindTokenizer:
             }
             ctx.token_to_plaintext[out_token] = formatted
             ctx.log(
-                f"Native C RLWE-BFV Product {out_token}: D(Relin({ref_a} ⊗ {ref_b})) = {formatted}"
+                f"Native C 128-bit PQ RLWE-BFV (N=2048) Product {out_token}: D(Relin({ref_a} ⊗ {ref_b})) = {formatted}"
             )
             return {
-                "engine": "Native C RLWE-BFV Lattice FHE (R_q = Z_{2^60}[X]/(X^64+1))",
+                "engine": "Native C RLWE-BFV 128-bit Lattice FHE (R_q = Z_{2^54}[X]/(X^2048+1))",
                 "op": "BFV_MULTIPLY",
-                "label": f"Lattice RLWE-BFV Ciphertext × Ciphertext Product ({ref_a} × {ref_b})",
-                "formula": f"c_prod = Relin(round((t/q) · ({ref_a} ⊗ {ref_b}))) in R_q",
+                "label": f"128-bit Lattice RLWE-BFV Ciphertext × Ciphertext Product ({ref_a} × {ref_b})",
+                "formula": f"c_prod = Relin(round((t/q) · ({ref_a} ⊗ {ref_b}))) in R_q (N=2048)",
                 "decrypted_outputs": {out_token: formatted},
                 "ciphertext_previews": {out_token: preview},
             }
@@ -397,7 +407,7 @@ class BlindTokenizer:
         eval_res = self.evaluator.evaluate_operation(op_spec, ctx.encrypted_numbers)
         decrypted_summary: Dict[str, str] = {}
 
-        ref_key = op_spec.get("ref") or op_spec.get("ref_a") or ""
+        ref_key = normalize_fhe_handle(op_spec.get("ref") or op_spec.get("ref_a") or "")
         sym = ""
         if ref_key in ctx.encrypted_numbers:
             sym = ctx.encrypted_numbers[ref_key].get("prefix_symbol", "")
@@ -435,7 +445,6 @@ class BlindTokenizer:
         """Restore local tokens, C-sealed secrets, and decrypted homomorphic handles for client display."""
         cleaned = re.sub(r"(\[FHE_NUM_\d+\])\(ENC:0x[0-9a-fA-F\.]+\)", r"\1", response_text)
 
-        # Unseal any [SECRET_XXXXXXXX] tokens present in the response via C AES-256-CBC + HMAC
         for sec_token, blob in ctx.sealed_secrets.items():
             if sec_token in cleaned:
                 unsealed_val = self.secret_vault.unseal(blob)

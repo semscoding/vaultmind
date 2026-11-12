@@ -1,13 +1,15 @@
 /*
- * VaultMind Native Cryptographic, RLWE-BFV FHE & Enclave Core (libvaultcrypto)
+ * VaultMind Native Cryptographic, 128-bit PQ Lattice RLWE-BFV FHE & Enclave Core (libvaultcrypto)
  *
- * Implements in compiled C:
+ * Implements in compiled C11:
  * 1. Constant-time, branchless, table-free arithmetic in GF(2^8) (0x11B) for Shamir's Secret Sharing.
- * 2. Zero-leak Enclave Seal & Unseal using Apple CommonCrypto (AES-256-CBC + Encrypt-then-MAC HMAC-SHA256)
- *    with guaranteed C11 memset_s() + volatile memory barrier stack zeroization.
- * 3. True Lattice Ring-LWE Brakerski-Fan-Vercauteren (BFV) Homomorphic Encryption over R_q = Z_q[X]/(X^64 + 1)
- *    supporting BOTH homomorphic addition E(m1) + E(m2) AND non-linear ciphertext-ciphertext
- *    multiplication E(m1) * E(m2) with 4-limb gadget decomposition relinearization using 128-bit integers.
+ * 2. Dual-Field Hybrid Master Key Derivation binding C-stack GF(2^8) secret shares with
+ *    RFC 3526 2048-bit Feldman VSS Z_q shares via HMAC-SHA256, plus Zero-Leak Enclave Seal/Unseal
+ *    using Apple CommonCrypto (AES-256-CBC + Encrypt-then-MAC HMAC-SHA256) and C11 memset_s().
+ * 3. Standard-Compliant 128-bit Lattice Security Ring-LWE Brakerski-Fan-Vercauteren (BFV) FHE
+ *    (HomomorphicEncryption.org Table 1: N = 2048, log2(q) = 54, ternary secret) over
+ *    R_q = Z_{2^54}[X]/(X^2048 + 1), supporting E(m1) + E(m2) AND non-linear E(m1) * E(m2)
+ *    with 4-limb base-2^14 gadget decomposition relinearization and unbiased rejection sampling.
  */
 
 #define __STDC_WANT_LIB_EXT1__ 1
@@ -21,17 +23,18 @@
 #define VAULT_IV_LEN 16
 #define VAULT_HMAC_LEN 32
 
-/* RLWE-BFV Lattice Parameters:
- * Ring degree N = 64: R_q = Z_q[X] / (X^64 + 1)
- * Ciphertext modulus Q = 2^60, Plaintext modulus T = 65536 (2^16), Delta = Q / T = 2^44
- * Gadget base B = 2^15 with L = 4 limbs (15 * 4 = 60 bits)
+/* HomomorphicEncryption.org 128-bit Lattice Security Parameter Set (Ternary Secret):
+ * Ring degree N = 2048: R_q = Z_q[X] / (X^2048 + 1)
+ * Ciphertext modulus Q = 2^54 (log2(Q) = 54 <= 54 max for 128-bit security at N = 2048)
+ * Plaintext modulus T = 65536 (2^16), Scaling factor Delta = Q / T = 2^38
+ * Gadget base B = 2^14 with L = 4 limbs (14 * 4 = 56 >= 54 bits)
  */
-#define BFV_N 64
-#define BFV_Q (1LL << 60)
-#define BFV_HALF_Q (1LL << 59)
+#define BFV_N 2048
+#define BFV_Q (1LL << 54)
+#define BFV_HALF_Q (1LL << 53)
 #define BFV_T 65536LL
 #define BFV_DELTA (BFV_Q / BFV_T)
-#define BFV_GADGET_BITS 15
+#define BFV_GADGET_BITS 14
 #define BFV_GADGET_BASE (1LL << BFV_GADGET_BITS)
 #define BFV_GADGET_MASK (BFV_GADGET_BASE - 1LL)
 #define BFV_LIMBS 4
@@ -143,19 +146,35 @@ static int reconstruct_bytes_internal(
     return 0;
 }
 
+/*
+ * Dual-field key derivation:
+ * Combines C-stack GF(2^8) secret `gf_key` with optional 32-byte RFC 3526 Feldman VSS
+ * Z_q secret component `feldman_key` via HMAC-SHA256 so BOTH polynomials are mathematically
+ * required to derive the Master Key, while `master_key` never leaves the C stack.
+ */
 static void derive_subkeys(
-    const uint8_t master_key[VAULT_KEY_LEN],
+    const uint8_t gf_key[VAULT_KEY_LEN],
+    const uint8_t *feldman_key,
     uint8_t enc_key[VAULT_KEY_LEN],
     uint8_t mac_key[VAULT_KEY_LEN],
     uint8_t key_id[VAULT_KEY_LEN]
 ) {
+    uint8_t combined_master[VAULT_KEY_LEN];
+    if (feldman_key != NULL) {
+        CCHmac(kCCHmacAlgSHA256, gf_key, VAULT_KEY_LEN, feldman_key, VAULT_KEY_LEN, combined_master);
+    } else {
+        memcpy(combined_master, gf_key, VAULT_KEY_LEN);
+    }
+
     const char *lbl_enc = "VAULTMIND_V2_AES256_ENC_KEY";
     const char *lbl_mac = "VAULTMIND_V2_HMAC_SHA256_KEY";
     const char *lbl_id  = "VAULTMIND_V2_MASTER_KEY_COMMITMENT";
 
-    CCHmac(kCCHmacAlgSHA256, master_key, VAULT_KEY_LEN, lbl_enc, strlen(lbl_enc), enc_key);
-    CCHmac(kCCHmacAlgSHA256, master_key, VAULT_KEY_LEN, lbl_mac, strlen(lbl_mac), mac_key);
-    CCHmac(kCCHmacAlgSHA256, master_key, VAULT_KEY_LEN, lbl_id,  strlen(lbl_id),  key_id);
+    CCHmac(kCCHmacAlgSHA256, combined_master, VAULT_KEY_LEN, lbl_enc, strlen(lbl_enc), enc_key);
+    CCHmac(kCCHmacAlgSHA256, combined_master, VAULT_KEY_LEN, lbl_mac, strlen(lbl_mac), mac_key);
+    CCHmac(kCCHmacAlgSHA256, combined_master, VAULT_KEY_LEN, lbl_id,  strlen(lbl_id),  key_id);
+
+    vault_secure_wipe(combined_master, sizeof(combined_master));
 }
 
 int vault_split_secret(
@@ -163,6 +182,7 @@ int vault_split_secret(
     size_t secret_len,
     uint8_t threshold_k,
     uint8_t total_n,
+    const uint8_t *feldman_component_32,
     uint8_t *out_shares_flat,
     uint8_t *out_key_commitment
 ) {
@@ -186,7 +206,7 @@ int vault_split_secret(
     if (out_key_commitment != NULL && secret_len == VAULT_KEY_LEN) {
         uint8_t dummy_enc[VAULT_KEY_LEN];
         uint8_t dummy_mac[VAULT_KEY_LEN];
-        derive_subkeys(secret, dummy_enc, dummy_mac, out_key_commitment);
+        derive_subkeys(secret, feldman_component_32, dummy_enc, dummy_mac, out_key_commitment);
         vault_secure_wipe(dummy_enc, sizeof(dummy_enc));
         vault_secure_wipe(dummy_mac, sizeof(dummy_mac));
     }
@@ -207,6 +227,7 @@ int vault_enclave_seal(
     const uint8_t *share_x,
     const uint8_t *shares_flat,
     size_t k,
+    const uint8_t *feldman_component_32,
     const uint8_t *expected_key_commitment,
     const uint8_t *plaintext,
     size_t plaintext_len,
@@ -218,16 +239,16 @@ int vault_enclave_seal(
     size_t *out_ciphertext_len,
     uint8_t *out_hmac
 ) {
-    uint8_t master_key[VAULT_KEY_LEN];
+    uint8_t gf_key[VAULT_KEY_LEN];
     uint8_t enc_key[VAULT_KEY_LEN];
     uint8_t mac_key[VAULT_KEY_LEN];
     uint8_t actual_id[VAULT_KEY_LEN];
     int rc = 0;
 
-    rc = reconstruct_bytes_internal(share_x, shares_flat, k, VAULT_KEY_LEN, master_key);
+    rc = reconstruct_bytes_internal(share_x, shares_flat, k, VAULT_KEY_LEN, gf_key);
     if (rc != 0) goto cleanup;
 
-    derive_subkeys(master_key, enc_key, mac_key, actual_id);
+    derive_subkeys(gf_key, feldman_component_32, enc_key, mac_key, actual_id);
     if (expected_key_commitment != NULL) {
         if (!vault_ct_memeq(actual_id, expected_key_commitment, VAULT_KEY_LEN)) {
             rc = -10;
@@ -268,7 +289,7 @@ int vault_enclave_seal(
     vault_secure_wipe(&hmac_ctx, sizeof(hmac_ctx));
 
 cleanup:
-    vault_secure_wipe(master_key, sizeof(master_key));
+    vault_secure_wipe(gf_key, sizeof(gf_key));
     vault_secure_wipe(enc_key, sizeof(enc_key));
     vault_secure_wipe(mac_key, sizeof(mac_key));
     vault_secure_wipe(actual_id, sizeof(actual_id));
@@ -279,6 +300,7 @@ int vault_enclave_unseal(
     const uint8_t *share_x,
     const uint8_t *shares_flat,
     size_t k,
+    const uint8_t *feldman_component_32,
     const uint8_t *aad,
     size_t aad_len,
     const uint8_t *iv,
@@ -289,17 +311,17 @@ int vault_enclave_unseal(
     size_t plaintext_buf_cap,
     size_t *out_plaintext_len
 ) {
-    uint8_t master_key[VAULT_KEY_LEN];
+    uint8_t gf_key[VAULT_KEY_LEN];
     uint8_t enc_key[VAULT_KEY_LEN];
     uint8_t mac_key[VAULT_KEY_LEN];
     uint8_t actual_id[VAULT_KEY_LEN];
     uint8_t computed_hmac[VAULT_HMAC_LEN];
     int rc = 0;
 
-    rc = reconstruct_bytes_internal(share_x, shares_flat, k, VAULT_KEY_LEN, master_key);
+    rc = reconstruct_bytes_internal(share_x, shares_flat, k, VAULT_KEY_LEN, gf_key);
     if (rc != 0) goto cleanup;
 
-    derive_subkeys(master_key, enc_key, mac_key, actual_id);
+    derive_subkeys(gf_key, feldman_component_32, enc_key, mac_key, actual_id);
 
     CCHmacContext hmac_ctx;
     CCHmacInit(&hmac_ctx, kCCHmacAlgSHA256, mac_key, VAULT_KEY_LEN);
@@ -339,7 +361,7 @@ int vault_enclave_unseal(
     }
 
 cleanup:
-    vault_secure_wipe(master_key, sizeof(master_key));
+    vault_secure_wipe(gf_key, sizeof(gf_key));
     vault_secure_wipe(enc_key, sizeof(enc_key));
     vault_secure_wipe(mac_key, sizeof(mac_key));
     vault_secure_wipe(actual_id, sizeof(actual_id));
@@ -349,7 +371,6 @@ cleanup:
 
 /*
  * Local Symmetric Secret Token Seal & Unseal (for arbitrary passwords/phrases in prompts)
- * Uses a 256-bit ephemeral session key inside C via AES-256-CBC + HMAC-SHA256.
  */
 int vault_session_seal(
     const uint8_t *session_key_32,
@@ -364,7 +385,7 @@ int vault_session_seal(
     uint8_t enc_key[VAULT_KEY_LEN];
     uint8_t mac_key[VAULT_KEY_LEN];
     uint8_t dummy_id[VAULT_KEY_LEN];
-    derive_subkeys(session_key_32, enc_key, mac_key, dummy_id);
+    derive_subkeys(session_key_32, NULL, enc_key, mac_key, dummy_id);
     arc4random_buf(out_iv_16, VAULT_IV_LEN);
 
     size_t moved = 0;
@@ -376,6 +397,7 @@ int vault_session_seal(
     if (st != kCCSuccess) {
         vault_secure_wipe(enc_key, sizeof(enc_key));
         vault_secure_wipe(mac_key, sizeof(mac_key));
+        vault_secure_wipe(dummy_id, sizeof(dummy_id));
         return -1;
     }
     *out_ct_len = moved;
@@ -407,7 +429,7 @@ int vault_session_unseal(
     uint8_t mac_key[VAULT_KEY_LEN];
     uint8_t dummy_id[VAULT_KEY_LEN];
     uint8_t actual_hmac[VAULT_HMAC_LEN];
-    derive_subkeys(session_key_32, enc_key, mac_key, dummy_id);
+    derive_subkeys(session_key_32, NULL, enc_key, mac_key, dummy_id);
 
     CCHmacContext ctx;
     CCHmacInit(&ctx, kCCHmacAlgSHA256, mac_key, VAULT_KEY_LEN);
@@ -419,6 +441,8 @@ int vault_session_unseal(
     if (!vault_ct_memeq(actual_hmac, expected_hmac_32, VAULT_HMAC_LEN)) {
         vault_secure_wipe(enc_key, sizeof(enc_key));
         vault_secure_wipe(mac_key, sizeof(mac_key));
+        vault_secure_wipe(dummy_id, sizeof(dummy_id));
+        vault_secure_wipe(actual_hmac, sizeof(actual_hmac));
         return -2;
     }
 
@@ -438,8 +462,8 @@ int vault_session_unseal(
 }
 
 /* =========================================================================
- * NATIVE C LATTICE RLWE-BFV HOMOMORPHIC ENCRYPTION ENGINE
- * Ring: R_q = Z_q[X] / (X^64 + 1), q = 2^60, t = 65536
+ * NATIVE C 128-BIT LATTICE SECURITY RLWE-BFV HOMOMORPHIC ENCRYPTION ENGINE
+ * Ring: R_q = Z_q[X] / (X^2048 + 1), q = 2^54, t = 65536
  * ========================================================================= */
 
 static inline int64_t bfv_cmod(int128_t x) {
@@ -450,56 +474,62 @@ static inline int64_t bfv_cmod(int128_t x) {
     return rem;
 }
 
-static void bfv_sample_ternary(int64_t out[BFV_N]) {
-    uint8_t rnd[BFV_N];
-    arc4random_buf(rnd, sizeof(rnd));
-    for (int i = 0; i < BFV_N; i++) {
-        /* Map byte to {-1, 0, 1} */
-        int v = rnd[i] % 3;
-        out[i] = (int64_t)(v - 1);
+/* Unbiased rejection-sampled ternary distribution over {-1, 0, 1}^N (255 = 3 * 85) */
+static void bfv_sample_ternary(int64_t *out) {
+    uint8_t buf[256];
+    int idx = 0;
+    while (idx < BFV_N) {
+        arc4random_buf(buf, sizeof(buf));
+        for (size_t k = 0; k < sizeof(buf) && idx < BFV_N; k++) {
+            if (buf[k] < 255U) {
+                out[idx++] = (int64_t)((int)(buf[k] % 3U) - 1);
+            }
+        }
     }
-    vault_secure_wipe(rnd, sizeof(rnd));
+    vault_secure_wipe(buf, sizeof(buf));
 }
 
-static void bfv_sample_uniform_q(int64_t out[BFV_N]) {
-    uint64_t rnd[BFV_N];
-    arc4random_buf(rnd, sizeof(rnd));
+static void bfv_sample_uniform_q(int64_t *out) {
+    uint64_t *rnd = (uint64_t *)calloc(BFV_N, sizeof(uint64_t));
+    if (rnd == NULL) return;
+    arc4random_buf(rnd, sizeof(uint64_t) * BFV_N);
     for (int i = 0; i < BFV_N; i++) {
         int64_t u = (int64_t)(rnd[i] & ((uint64_t)BFV_Q - 1ULL));
         if (u >= BFV_HALF_Q) u -= BFV_Q;
         out[i] = u;
     }
-    vault_secure_wipe(rnd, sizeof(rnd));
+    vault_secure_wipe(rnd, sizeof(uint64_t) * BFV_N);
+    free(rnd);
 }
 
 /* Exact negacyclic convolution in Z[X]/(X^N + 1) using 128-bit accumulators */
-static void bfv_poly_mul_exact(const int64_t a[BFV_N], const int64_t b[BFV_N], int128_t out[BFV_N]) {
-    for (int i = 0; i < BFV_N; i++) {
-        out[i] = 0;
-    }
+static void bfv_poly_mul_exact(const int64_t *a, const int64_t *b, int128_t *out) {
+    memset(out, 0, sizeof(int128_t) * BFV_N);
     for (int i = 0; i < BFV_N; i++) {
         int128_t ai = (int128_t)a[i];
-        for (int j = 0; j < BFV_N; j++) {
-            int128_t prod = ai * (int128_t)b[j];
-            if (i + j < BFV_N) {
-                out[i + j] += prod;
-            } else {
-                out[i + j - BFV_N] -= prod;
-            }
+        if (ai == 0) continue;
+        int split = BFV_N - i;
+        for (int j = 0; j < split; j++) {
+            out[i + j] += ai * (int128_t)b[j];
+        }
+        for (int j = split; j < BFV_N; j++) {
+            out[i + j - BFV_N] -= ai * (int128_t)b[j];
         }
     }
 }
 
-static void bfv_poly_mul_mod(const int64_t a[BFV_N], const int64_t b[BFV_N], int64_t out[BFV_N]) {
-    int128_t tmp[BFV_N];
+static void bfv_poly_mul_mod(const int64_t *a, const int64_t *b, int64_t *out) {
+    int128_t *tmp = (int128_t *)calloc(BFV_N, sizeof(int128_t));
+    if (tmp == NULL) return;
     bfv_poly_mul_exact(a, b, tmp);
     for (int i = 0; i < BFV_N; i++) {
         out[i] = bfv_cmod(tmp[i]);
     }
-    vault_secure_wipe(tmp, sizeof(tmp));
+    vault_secure_wipe(tmp, sizeof(int128_t) * BFV_N);
+    free(tmp);
 }
 
-static void bfv_scale_down(const int128_t exact_poly[BFV_N], int64_t out[BFV_N]) {
+static void bfv_scale_down(const int128_t *exact_poly, int64_t *out) {
     for (int i = 0; i < BFV_N; i++) {
         int128_t h = exact_poly[i];
         int128_t sign = (h >= 0) ? 1 : -1;
@@ -512,22 +542,17 @@ static void bfv_scale_down(const int128_t exact_poly[BFV_N], int64_t out[BFV_N])
     }
 }
 
-/*
- * Generate RLWE-BFV Keyset:
- * - out_sk:  64 int64 coefficients (ternary secret polynomial s)
- * - out_pk:  2 * 64 int64 coefficients (pk0, pk1)
- * - out_rlk: 4 * 2 * 64 int64 coefficients (relinearization key for s^2, gadget base 2^15)
- */
 void vault_bfv_keygen(int64_t *out_sk, int64_t *out_pk, int64_t *out_rlk) {
-    int64_t s2[BFV_N];
-    int64_t a_tmp[BFV_N];
-    int64_t e_tmp[BFV_N];
-    int64_t as_prod[BFV_N];
+    int64_t *work = (int64_t *)calloc(4 * BFV_N, sizeof(int64_t));
+    if (work == NULL) return;
+    int64_t *s2 = &work[0];
+    int64_t *a_tmp = &work[BFV_N];
+    int64_t *e_tmp = &work[2 * BFV_N];
+    int64_t *as_prod = &work[3 * BFV_N];
 
     bfv_sample_ternary(out_sk);
     bfv_poly_mul_mod(out_sk, out_sk, s2);
 
-    /* Public key: pk0 = -(a * s + e) mod q, pk1 = a */
     bfv_sample_uniform_q(a_tmp);
     bfv_sample_ternary(e_tmp);
     bfv_poly_mul_mod(a_tmp, out_sk, as_prod);
@@ -536,7 +561,6 @@ void vault_bfv_keygen(int64_t *out_sk, int64_t *out_pk, int64_t *out_rlk) {
         out_pk[BFV_N + i] = a_tmp[i];
     }
 
-    /* Relinearization keys for l = 0..3: b_l = -(a_l * s + e_l) + B^l * s^2 mod q */
     for (int l = 0; l < BFV_LIMBS; l++) {
         int128_t scale = ((int128_t)1) << (l * BFV_GADGET_BITS);
         bfv_sample_uniform_q(a_tmp);
@@ -552,21 +576,26 @@ void vault_bfv_keygen(int64_t *out_sk, int64_t *out_pk, int64_t *out_rlk) {
         }
     }
 
-    vault_secure_wipe(s2, sizeof(s2));
-    vault_secure_wipe(a_tmp, sizeof(a_tmp));
-    vault_secure_wipe(e_tmp, sizeof(e_tmp));
-    vault_secure_wipe(as_prod, sizeof(as_prod));
+    vault_secure_wipe(work, sizeof(int64_t) * 4 * BFV_N);
+    free(work);
 }
 
-/* Encrypt integer m in [0, 65535] under public key pk -> ciphertext ct (2 * 64 int64) */
 void vault_bfv_encrypt(const int64_t *pk, int64_t m, int64_t *out_ct) {
-    int64_t u[BFV_N], e1[BFV_N], e2[BFV_N], p0u[BFV_N], p1u[BFV_N];
+    int64_t *work = (int64_t *)calloc(5 * BFV_N, sizeof(int64_t));
+    if (work == NULL) return;
+    int64_t *u = &work[0];
+    int64_t *e1 = &work[BFV_N];
+    int64_t *e2 = &work[2 * BFV_N];
+    int64_t *p0u = &work[3 * BFV_N];
+    int64_t *p1u = &work[4 * BFV_N];
+
     bfv_sample_ternary(u);
     bfv_sample_ternary(e1);
     bfv_sample_ternary(e2);
 
-    bfv_poly_mul_mod(&pk[0], u, p0u);
-    bfv_poly_mul_mod(&pk[BFV_N], u, p1u);
+    /* Multiply small ternary u as first argument to exploit sparse ai == 0 skip */
+    bfv_poly_mul_mod(u, &pk[0], p0u);
+    bfv_poly_mul_mod(u, &pk[BFV_N], p1u);
 
     int64_t m_mod = ((m % BFV_T) + BFV_T) % BFV_T;
     for (int i = 0; i < BFV_N; i++) {
@@ -575,30 +604,43 @@ void vault_bfv_encrypt(const int64_t *pk, int64_t m, int64_t *out_ct) {
         out_ct[BFV_N + i] = bfv_cmod((int128_t)p1u[i] + (int128_t)e2[i]);
     }
 
-    vault_secure_wipe(u, sizeof(u));
-    vault_secure_wipe(e1, sizeof(e1));
-    vault_secure_wipe(e2, sizeof(e2));
+    vault_secure_wipe(work, sizeof(int64_t) * 5 * BFV_N);
+    free(work);
 }
 
-/* Homomorphic Addition: out_ct = ct1 + ct2 mod q */
 void vault_bfv_add(const int64_t *ct1, const int64_t *ct2, int64_t *out_ct) {
     for (int i = 0; i < 2 * BFV_N; i++) {
         out_ct[i] = bfv_cmod((int128_t)ct1[i] + (int128_t)ct2[i]);
     }
 }
 
-/*
- * Homomorphic Ciphertext × Ciphertext Multiplication with Relinearization:
- * Computes E(m1 * m2 mod t) from E(m1), E(m2), and relinearization key rlk ONLY (zero secret key!).
- */
 void vault_bfv_mul_relin(const int64_t *ct1, const int64_t *ct2, const int64_t *rlk, int64_t *out_ct) {
     const int64_t *c0 = &ct1[0];
     const int64_t *c1 = &ct1[BFV_N];
     const int64_t *d0 = &ct2[0];
     const int64_t *d1 = &ct2[BFV_N];
 
-    int128_t ex0[BFV_N], ex1a[BFV_N], ex1b[BFV_N], ex1[BFV_N], ex2[BFV_N];
-    int64_t h0[BFV_N], h1[BFV_N], h2[BFV_N];
+    int128_t *ex_work = (int128_t *)calloc(4 * BFV_N, sizeof(int128_t));
+    int64_t *i64_work = (int64_t *)calloc((7 + BFV_LIMBS) * BFV_N, sizeof(int64_t));
+    if (ex_work == NULL || i64_work == NULL) {
+        free(ex_work);
+        free(i64_work);
+        return;
+    }
+
+    int128_t *ex0  = &ex_work[0];
+    int128_t *ex1a = &ex_work[BFV_N];
+    int128_t *ex1b = &ex_work[2 * BFV_N];
+    int128_t *ex2  = &ex_work[3 * BFV_N];
+
+    int64_t *h0     = &i64_work[0];
+    int64_t *h1     = &i64_work[BFV_N];
+    int64_t *h2     = &i64_work[2 * BFV_N];
+    int64_t *out0   = &i64_work[3 * BFV_N];
+    int64_t *out1   = &i64_work[4 * BFV_N];
+    int64_t *prod_b = &i64_work[5 * BFV_N];
+    int64_t *prod_a = &i64_work[6 * BFV_N];
+    int64_t *digits = &i64_work[7 * BFV_N];
 
     bfv_poly_mul_exact(c0, d0, ex0);
     bfv_poly_mul_exact(c0, d1, ex1a);
@@ -606,15 +648,13 @@ void vault_bfv_mul_relin(const int64_t *ct1, const int64_t *ct2, const int64_t *
     bfv_poly_mul_exact(c1, d1, ex2);
 
     for (int i = 0; i < BFV_N; i++) {
-        ex1[i] = ex1a[i] + ex1b[i];
+        ex1a[i] += ex1b[i];
     }
 
     bfv_scale_down(ex0, h0);
-    bfv_scale_down(ex1, h1);
+    bfv_scale_down(ex1a, h1);
     bfv_scale_down(ex2, h2);
 
-    /* Signed gadget decomposition of h2 in base 2^15 (4 limbs) and relinearization */
-    int64_t digits[BFV_LIMBS][BFV_N];
     for (int i = 0; i < BFV_N; i++) {
         uint64_t rem = (uint64_t)h2[i] & ((uint64_t)BFV_Q - 1ULL);
         for (int l = 0; l < BFV_LIMBS; l++) {
@@ -624,33 +664,37 @@ void vault_bfv_mul_relin(const int64_t *ct1, const int64_t *ct2, const int64_t *
                 d -= BFV_GADGET_BASE;
                 rem += 1ULL;
             }
-            digits[l][i] = d;
+            digits[l * BFV_N + i] = d;
         }
     }
 
-    int64_t out0[BFV_N], out1[BFV_N], prod_b[BFV_N], prod_a[BFV_N];
-    memcpy(out0, h0, sizeof(out0));
-    memcpy(out1, h1, sizeof(out1));
+    memcpy(out0, h0, sizeof(int64_t) * BFV_N);
+    memcpy(out1, h1, sizeof(int64_t) * BFV_N);
 
     for (int l = 0; l < BFV_LIMBS; l++) {
+        const int64_t *digit_l = &digits[l * BFV_N];
         const int64_t *rlk_b = &rlk[(l * 2) * BFV_N];
         const int64_t *rlk_a = &rlk[(l * 2 + 1) * BFV_N];
-        bfv_poly_mul_mod(digits[l], rlk_b, prod_b);
-        bfv_poly_mul_mod(digits[l], rlk_a, prod_a);
+        bfv_poly_mul_mod(digit_l, rlk_b, prod_b);
+        bfv_poly_mul_mod(digit_l, rlk_a, prod_a);
         for (int i = 0; i < BFV_N; i++) {
             out0[i] = bfv_cmod((int128_t)out0[i] + (int128_t)prod_b[i]);
             out1[i] = bfv_cmod((int128_t)out1[i] + (int128_t)prod_a[i]);
         }
     }
 
-    memcpy(&out_ct[0], out0, sizeof(out0));
-    memcpy(&out_ct[BFV_N], out1, sizeof(out1));
+    memcpy(&out_ct[0], out0, sizeof(int64_t) * BFV_N);
+    memcpy(&out_ct[BFV_N], out1, sizeof(int64_t) * BFV_N);
+
+    free(ex_work);
+    free(i64_work);
 }
 
-/* Decrypt BFV ciphertext using secret key sk -> integer in [0, 65535] */
 int64_t vault_bfv_decrypt(const int64_t *sk, const int64_t *ct) {
-    int64_t c1s[BFV_N];
-    bfv_poly_mul_mod(&ct[BFV_N], sk, c1s);
+    int64_t *c1s = (int64_t *)calloc(BFV_N, sizeof(int64_t));
+    if (c1s == NULL) return 0;
+
+    bfv_poly_mul_mod(sk, &ct[BFV_N], c1s);
     int64_t v0 = bfv_cmod((int128_t)ct[0] + (int128_t)c1s[0]);
 
     int128_t q_val;
@@ -660,6 +704,7 @@ int64_t vault_bfv_decrypt(const int64_t *sk, const int64_t *ct) {
         q_val = -(((int128_t)BFV_T * (int128_t)(-v0) + (int128_t)BFV_HALF_Q) / (int128_t)BFV_Q);
     }
     int64_t res = ((int64_t)(q_val % (int128_t)BFV_T) + BFV_T) % BFV_T;
-    vault_secure_wipe(c1s, sizeof(c1s));
+    vault_secure_wipe(c1s, sizeof(int64_t) * BFV_N);
+    free(c1s);
     return res;
 }

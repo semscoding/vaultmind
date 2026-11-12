@@ -1,11 +1,12 @@
 """
-Shamir's (k, n) Threshold Secret Sharing & Feldman Verifiable Secret Sharing (VSS).
+Shamir's (k, n) Threshold Secret Sharing & Dual-Field 2048-bit Feldman VSS.
 
 Combines:
 1. Native C constant-time GF(2^8) Shamir split, Lagrange interpolation, and Zero-Leak
    AES-256-CBC + Encrypt-then-MAC HMAC-SHA256 execution (libvaultcrypto.dylib).
 2. Publicly verifiable Feldman VSS over RFC 3526 Group 14 (2048-bit MODP Safe Prime P = 2q + 1),
-   mathematically rejecting forged or corrupted shares before reconstruction.
+   mathematically bound into C-stack key derivation via K_master = HMAC-SHA256(K_GF256, SHA256(alpha_0))
+   so BOTH the 2048-bit Feldman Z_q shares AND the C-stack GF(2^8) shares are required to unseal.
 """
 
 import ctypes
@@ -57,6 +58,7 @@ def _bind_native_functions() -> ctypes.CDLL:
         ctypes.c_uint8,
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
     ]
     lib.vault_split_secret.restype = ctypes.c_int
 
@@ -75,6 +77,7 @@ def _bind_native_functions() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
@@ -90,6 +93,7 @@ def _bind_native_functions() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_uint8),
@@ -148,6 +152,26 @@ class FeldmanVSS:
 
         return lhs == rhs
 
+    def interpolate_zero(self, shares: List[Tuple[int, int]]) -> int:
+        """Lagrange interpolation at x = 0 over Z_q."""
+        k = len(shares)
+        if k == 0:
+            raise ValueError("Cannot interpolate empty Feldman share list.")
+        acc = 0
+        for j in range(k):
+            xj, yj = shares[j]
+            num = 1
+            den = 1
+            for m in range(k):
+                if m == j:
+                    continue
+                xm, _ = shares[m]
+                num = (num * (-xm)) % self.q
+                den = (den * (xj - xm)) % self.q
+            basis = (num * pow(den, -1, self.q)) % self.q
+            acc = (acc + yj * basis) % self.q
+        return acc
+
 
 class ShamirSecretSharing:
     CANARY_SECRET_BYTE = 0x2A
@@ -189,6 +213,13 @@ class ShamirSecretSharing:
             results.append({"x": target_x, "y": acc})
         return results
 
+    @staticmethod
+    def _fill_feldman_component(alpha_0: int, c_buf) -> None:
+        digest = bytearray(hashlib.sha256(alpha_0.to_bytes(256, "big")).digest())
+        for i in range(32):
+            c_buf[i] = digest[i]
+        secure_zero(digest)
+
     def generate_and_split_master_key(
         self,
         threshold_k: int = 3,
@@ -198,27 +229,29 @@ class ShamirSecretSharing:
         if not (1 <= threshold_k <= total_n <= 255):
             raise ValueError("Require 1 <= threshold_k <= total_n <= 255.")
 
-        with NativeBufferGuard(32) as master_buf:
+        with NativeBufferGuard(32) as gf_buf, NativeBufferGuard(32) as feldman_buf:
             raw_source = bytearray(seed_bytes if seed_bytes is not None else os.urandom(32))
             if len(raw_source) != 32:
                 secure_zero(raw_source)
-                raise ValueError("Master key must be exactly 32 bytes (256 bits).")
+                raise ValueError("GF(2^8) key share seed must be 32 bytes (256 bits).")
 
             for i in range(32):
-                master_buf[i] = raw_source[i]
-
-            vss_scalar = secrets.randbits(256)
-            vss_bundle = self.vss.split_verifiable(vss_scalar, threshold_k, total_n)
+                gf_buf[i] = raw_source[i]
             secure_zero(raw_source)
+
+            vss_alpha0 = secrets.randbelow(self.vss.q - 1) + 1
+            vss_bundle = self.vss.split_verifiable(vss_alpha0, threshold_k, total_n)
+            self._fill_feldman_component(vss_alpha0, feldman_buf)
 
             shares_flat = (ctypes.c_uint8 * (total_n * 32))()
             key_commitment = (ctypes.c_uint8 * 32)()
 
             rc = self.lib.vault_split_secret(
-                master_buf,
+                gf_buf,
                 32,
                 threshold_k,
                 total_n,
+                feldman_buf,
                 shares_flat,
                 key_commitment,
             )
@@ -227,7 +260,7 @@ class ShamirSecretSharing:
 
         canary_in = (ctypes.c_uint8 * 1)(self.CANARY_SECRET_BYTE)
         canary_out = (ctypes.c_uint8 * total_n)()
-        rc_c = self.lib.vault_split_secret(canary_in, 1, threshold_k, total_n, canary_out, None)
+        rc_c = self.lib.vault_split_secret(canary_in, 1, threshold_k, total_n, None, canary_out, None)
         if rc_c != 0:
             raise RuntimeError(f"Canary vault_split_secret failed with code {rc_c}")
 
@@ -312,51 +345,58 @@ class ShamirSecretSharing:
         share_x = (ctypes.c_uint8 * k)(*[int(s["x"]) for s in quorum_shards])
         shares_flat = (ctypes.c_uint8 * (k * 32))()
 
-        try:
-            for idx, s in enumerate(quorum_shards):
-                raw_share = bytes.fromhex(s["gf256_share_hex"])
-                for b_i in range(32):
-                    shares_flat[idx * 32 + b_i] = raw_share[b_i]
+        with NativeBufferGuard(32) as feldman_buf:
+            try:
+                feld_pts: List[Tuple[int, int]] = []
+                for idx, s in enumerate(quorum_shards):
+                    raw_share = bytes.fromhex(s["gf256_share_hex"])
+                    for b_i in range(32):
+                        shares_flat[idx * 32 + b_i] = raw_share[b_i]
+                    feld_pts.append((int(s["x"]), int(s["feldman_y_hex"], 16)))
 
-            comm_bytes = bytes.fromhex(key_commitment_hex)
-            c_comm = (ctypes.c_uint8 * 32)(*comm_bytes)
+                alpha_0 = self.vss.interpolate_zero(feld_pts)
+                self._fill_feldman_component(alpha_0, feldman_buf)
 
-            c_pt = (ctypes.c_uint8 * max(1, len(plaintext_bytes)))(*plaintext_bytes)
-            c_aad = (ctypes.c_uint8 * max(1, len(aad_bytes)))(*aad_bytes)
+                comm_bytes = bytes.fromhex(key_commitment_hex)
+                c_comm = (ctypes.c_uint8 * 32)(*comm_bytes)
 
-            c_iv = (ctypes.c_uint8 * 16)()
-            ct_cap = len(plaintext_bytes) + 32
-            c_ct = (ctypes.c_uint8 * ct_cap)()
-            c_ct_len = ctypes.c_size_t(0)
-            c_hmac = (ctypes.c_uint8 * 32)()
+                c_pt = (ctypes.c_uint8 * max(1, len(plaintext_bytes)))(*plaintext_bytes)
+                c_aad = (ctypes.c_uint8 * max(1, len(aad_bytes)))(*aad_bytes)
 
-            rc = self.lib.vault_enclave_seal(
-                share_x,
-                shares_flat,
-                k,
-                c_comm,
-                c_pt,
-                len(plaintext_bytes),
-                c_aad if len(aad_bytes) > 0 else None,
-                len(aad_bytes),
-                c_iv,
-                c_ct,
-                ct_cap,
-                ctypes.byref(c_ct_len),
-                c_hmac,
-            )
-            if rc == -10:
-                raise ValueError("Native C Enclave aborted: reconstructed key failed commitment check!")
-            if rc != 0:
-                raise RuntimeError(f"Native C vault_enclave_seal error: {rc}")
+                c_iv = (ctypes.c_uint8 * 16)()
+                ct_cap = len(plaintext_bytes) + 32
+                c_ct = (ctypes.c_uint8 * ct_cap)()
+                c_ct_len = ctypes.c_size_t(0)
+                c_hmac = (ctypes.c_uint8 * 32)()
 
-            return {
-                "iv_hex": bytes(c_iv).hex(),
-                "ciphertext_hex": bytes(c_ct[: c_ct_len.value]).hex(),
-                "hmac_hex": bytes(c_hmac).hex(),
-            }
-        finally:
-            secure_zero(shares_flat)
+                rc = self.lib.vault_enclave_seal(
+                    share_x,
+                    shares_flat,
+                    k,
+                    feldman_buf,
+                    c_comm,
+                    c_pt,
+                    len(plaintext_bytes),
+                    c_aad if len(aad_bytes) > 0 else None,
+                    len(aad_bytes),
+                    c_iv,
+                    c_ct,
+                    ct_cap,
+                    ctypes.byref(c_ct_len),
+                    c_hmac,
+                )
+                if rc == -10:
+                    raise ValueError("Native C Enclave aborted: reconstructed dual-field key failed commitment check!")
+                if rc != 0:
+                    raise RuntimeError(f"Native C vault_enclave_seal error: {rc}")
+
+                return {
+                    "iv_hex": bytes(c_iv).hex(),
+                    "ciphertext_hex": bytes(c_ct[: c_ct_len.value]).hex(),
+                    "hmac_hex": bytes(c_hmac).hex(),
+                }
+            finally:
+                secure_zero(shares_flat)
 
     def enclave_unseal_record(
         self,
@@ -370,46 +410,53 @@ class ShamirSecretSharing:
         share_x = (ctypes.c_uint8 * k)(*[int(s["x"]) for s in quorum_shards])
         shares_flat = (ctypes.c_uint8 * (k * 32))()
 
-        try:
-            for idx, s in enumerate(quorum_shards):
-                raw_share = bytes.fromhex(s["gf256_share_hex"])
-                for b_i in range(32):
-                    shares_flat[idx * 32 + b_i] = raw_share[b_i]
+        with NativeBufferGuard(32) as feldman_buf:
+            try:
+                feld_pts: List[Tuple[int, int]] = []
+                for idx, s in enumerate(quorum_shards):
+                    raw_share = bytes.fromhex(s["gf256_share_hex"])
+                    for b_i in range(32):
+                        shares_flat[idx * 32 + b_i] = raw_share[b_i]
+                    feld_pts.append((int(s["x"]), int(s["feldman_y_hex"], 16)))
 
-            iv_b = bytes.fromhex(iv_hex)
-            ct_b = bytes.fromhex(ciphertext_hex)
-            mac_b = bytes.fromhex(hmac_hex)
+                alpha_0 = self.vss.interpolate_zero(feld_pts)
+                self._fill_feldman_component(alpha_0, feldman_buf)
 
-            c_iv = (ctypes.c_uint8 * 16)(*iv_b)
-            c_ct = (ctypes.c_uint8 * max(1, len(ct_b)))(*ct_b)
-            c_mac = (ctypes.c_uint8 * 32)(*mac_b)
-            c_aad = (ctypes.c_uint8 * max(1, len(aad_bytes)))(*aad_bytes)
+                iv_b = bytes.fromhex(iv_hex)
+                ct_b = bytes.fromhex(ciphertext_hex)
+                mac_b = bytes.fromhex(hmac_hex)
 
-            pt_cap = len(ct_b) + 16
-            c_pt = (ctypes.c_uint8 * pt_cap)()
-            c_pt_len = ctypes.c_size_t(0)
+                c_iv = (ctypes.c_uint8 * 16)(*iv_b)
+                c_ct = (ctypes.c_uint8 * max(1, len(ct_b)))(*ct_b)
+                c_mac = (ctypes.c_uint8 * 32)(*mac_b)
+                c_aad = (ctypes.c_uint8 * max(1, len(aad_bytes)))(*aad_bytes)
 
-            rc = self.lib.vault_enclave_unseal(
-                share_x,
-                shares_flat,
-                k,
-                c_aad if len(aad_bytes) > 0 else None,
-                len(aad_bytes),
-                c_iv,
-                c_ct,
-                len(ct_b),
-                c_mac,
-                c_pt,
-                pt_cap,
-                ctypes.byref(c_pt_len),
-            )
-            if rc == -20:
-                raise ValueError("HMAC-SHA256 authentication tag verification failed (tampered ciphertext)!")
-            if rc != 0:
-                raise RuntimeError(f"Native C vault_enclave_unseal error: {rc}")
+                pt_cap = len(ct_b) + 16
+                c_pt = (ctypes.c_uint8 * pt_cap)()
+                c_pt_len = ctypes.c_size_t(0)
 
-            out = bytes(c_pt[: c_pt_len.value])
-            secure_zero(c_pt)
-            return out
-        finally:
-            secure_zero(shares_flat)
+                rc = self.lib.vault_enclave_unseal(
+                    share_x,
+                    shares_flat,
+                    k,
+                    feldman_buf,
+                    c_aad if len(aad_bytes) > 0 else None,
+                    len(aad_bytes),
+                    c_iv,
+                    c_ct,
+                    len(ct_b),
+                    c_mac,
+                    c_pt,
+                    pt_cap,
+                    ctypes.byref(c_pt_len),
+                )
+                if rc == -20:
+                    raise ValueError("HMAC-SHA256 authentication tag verification failed (tampered ciphertext)!")
+                if rc != 0:
+                    raise RuntimeError(f"Native C vault_enclave_unseal error: {rc}")
+
+                out = bytes(c_pt[: c_pt_len.value])
+                secure_zero(c_pt)
+                return out
+            finally:
+                secure_zero(shares_flat)

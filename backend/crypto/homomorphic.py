@@ -5,17 +5,24 @@ Mathematical properties over Z_{n^2}^*:
 - Additive Homomorphism (PHE): D(E(m1) * E(m2) mod n^2) = (m1 + m2) mod n
 - Scalar Multiplication (PHE): D(E(m1)^k mod n^2) = (k * m1) mod n
 
-Note on Homomorphic Depth:
-- Paillier is an Additive / Partially Homomorphic Encryption (PHE) scheme ideal for
-  exact 1024-bit fixed-point financial sums and public percentage policy scalars.
-- For non-linear ciphertext × ciphertext multiplication E(m1) * E(m2), VaultMind pairs
-  Paillier with Native C Lattice Ring-LWE BFV (Brakerski-Fan-Vercauteren) FHE in `bfv_fhe.py`.
+For non-linear ciphertext × ciphertext multiplication E(m1) * E(m2), VaultMind pairs
+Paillier with Native C 128-bit Lattice Security Ring-LWE BFV FHE in `bfv_fhe.py`.
 """
 
 import math
+import re
 import secrets
 from typing import Any, Dict, Tuple
 from sympy import isprime
+
+
+def normalize_fhe_handle(raw_ref: Any) -> str:
+    """
+    Strip inline `(ENC:0x...)` previews that live LLMs (Gemini / OpenAI / Bedrock)
+    occasionally include when copying `[FHE_NUM_1](ENC:0x...)` from the wire prompt.
+    """
+    text = str(raw_ref or "").strip()
+    return re.sub(r"\(ENC:0x[0-9a-fA-F\.]+\)", "", text)
 
 
 def generate_prime(bits: int = 512) -> int:
@@ -45,15 +52,12 @@ class PaillierKeypair:
         self.bits = bits
         self.n = p * q
         self.n_sq = self.n * self.n
-        # Carmichael's totient: lambda(n) = lcm(p - 1, q - 1)
         self.lambd = lcm(p - 1, q - 1)
-        # Generator g = n + 1 yields L(g^lambda mod n^2) = lambda mod n
         self.g = self.n + 1
         self.mu = pow(self.lambd % self.n, -1, self.n)
 
     @classmethod
     def generate(cls, bits: int = 1024) -> "PaillierKeypair":
-        """Generate a 1024-bit (or higher) Paillier public/private keypair."""
         if bits < 512:
             raise ValueError("Minimum secure Paillier modulus size is 512 bits (1024+ recommended).")
         half = bits // 2
@@ -64,12 +68,8 @@ class PaillierKeypair:
         return cls(p, q, bits=bits)
 
     def encrypt_int(self, m: int) -> int:
-        """
-        Encrypt signed integer m in (-n/2, n/2) into Z_{n^2}^*:
-            c = (1 + m * n) * r^n mod n^2
-        """
         if abs(m) >= self.n // 2:
-            raise ValueError("Plaintext magnitude exceeds Paillier message space.")
+            raise ValueError("Plaintext magnitude exceeds 1024-bit Paillier message space.")
         m_mod = m % self.n
 
         while True:
@@ -82,10 +82,6 @@ class PaillierKeypair:
         return (gm * rn) % self.n_sq
 
     def decrypt_int(self, c: int) -> int:
-        """
-        Decrypt ciphertext c in Z_{n^2}^*:
-            m = L(c^lambda mod n^2) * mu mod n
-        """
         u = pow(c, self.lambd, self.n_sq)
         l_u = (u - 1) // self.n
         m = (l_u * self.mu) % self.n
@@ -94,21 +90,19 @@ class PaillierKeypair:
         return m
 
     def encrypt_fixed(self, value: float, scale: int = DEFAULT_SCALE) -> Tuple[int, int]:
-        """Encrypt a float/decimal value using exact fixed-point integer scaling."""
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError("Numeric value cannot be NaN or Infinity.")
         scaled_int = int(round(value * scale))
         return self.encrypt_int(scaled_int), scale
 
     def decrypt_fixed(self, ciphertext: int, scale: int = DEFAULT_SCALE) -> float:
-        """Decrypt a fixed-point ciphertext and restore its decimal scale."""
         raw_int = self.decrypt_int(ciphertext)
         return raw_int / float(scale)
 
     def homomorphic_add(self, c1: int, c2: int) -> int:
-        """Compute E(m1 + m2) = (c1 * c2) mod n^2 without decryption."""
         return (c1 * c2) % self.n_sq
 
     def homomorphic_multiply_scalar(self, c: int, scalar: int) -> int:
-        """Compute E(scalar * m) = c^scalar mod n^2 without decryption."""
         if scalar < 0:
             c_inv = pow(c, -1, self.n_sq)
             return pow(c_inv, -scalar, self.n_sq)
@@ -128,7 +122,6 @@ class PaillierKeypair:
 class HomomorphicEvaluator:
     """
     Executes algebraic expressions on Paillier ciphertexts using ONLY the public key (n, n^2).
-    Never accesses p, q, lambda, or mu!
     """
 
     def __init__(self, n: int):
@@ -136,7 +129,6 @@ class HomomorphicEvaluator:
         self.n_sq = n * n
 
     def add_scaled(self, c1: int, scale1: int, c2: int, scale2: int) -> Tuple[int, int]:
-        """Align fixed-point scales homomorphically and multiply ciphertexts mod n^2."""
         target_scale = lcm(scale1, scale2)
         if scale1 != target_scale:
             factor1 = target_scale // scale1
@@ -147,10 +139,6 @@ class HomomorphicEvaluator:
         return (c1 * c2) % self.n_sq, target_scale
 
     def percentage_of(self, c: int, scale: int, percent_int: int) -> Tuple[int, int]:
-        """
-        Compute `percent_int`% of encrypted value `c` without decrypting:
-            c_out = c^(percent_int) mod n^2, new_scale = scale * 100
-        """
         if percent_int < 0:
             raise ValueError("Percentage must be non-negative.")
         c_out = pow(c, percent_int, self.n_sq)
@@ -159,16 +147,10 @@ class HomomorphicEvaluator:
     def evaluate_operation(
         self, op_spec: Dict[str, Any], encrypted_handles: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """
-        Evaluate a structured Paillier PHE operation emitted by the LLM agent:
-        - {"op": "PERCENT_BONUS", "ref": "[FHE_NUM_1]", "percent": 15}
-        - {"op": "ADD", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"}
-        - {"op": "MUL_SCALAR", "ref": "[FHE_NUM_1]", "scalar": 12}
-        """
         op = op_spec.get("op", "").upper()
 
         if op == "PERCENT_BONUS":
-            ref = op_spec.get("ref", "")
+            ref = normalize_fhe_handle(op_spec.get("ref", ""))
             pct = int(op_spec.get("percent", 15))
             if ref not in encrypted_handles:
                 raise KeyError(f"Unknown homomorphic handle: {ref}")
@@ -187,8 +169,8 @@ class HomomorphicEvaluator:
             }
 
         if op == "ADD":
-            ref_a = op_spec.get("ref_a", "")
-            ref_b = op_spec.get("ref_b", "")
+            ref_a = normalize_fhe_handle(op_spec.get("ref_a", ""))
+            ref_b = normalize_fhe_handle(op_spec.get("ref_b", ""))
             if ref_a not in encrypted_handles or ref_b not in encrypted_handles:
                 raise KeyError(f"Unknown homomorphic handles for ADD: {ref_a}, {ref_b}")
             ea = encrypted_handles[ref_a]
@@ -205,7 +187,7 @@ class HomomorphicEvaluator:
             }
 
         if op == "MUL_SCALAR":
-            ref = op_spec.get("ref", "")
+            ref = normalize_fhe_handle(op_spec.get("ref", ""))
             scalar = int(op_spec.get("scalar", 1))
             if ref not in encrypted_handles:
                 raise KeyError(f"Unknown homomorphic handle: {ref}")

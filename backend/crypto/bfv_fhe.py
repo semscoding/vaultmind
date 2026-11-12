@@ -1,27 +1,30 @@
 """
-Native C Lattice RLWE-BFV Homomorphic Encryption & Ephemeral Session Secret Vault.
+Native C 128-bit Lattice Security RLWE-BFV Homomorphic Encryption & Session Secret Vault.
 
-1. RLWE-BFV Scheme (Brakerski-Fan-Vercauteren) over cyclotomic ring R_q = Z_q[X]/(X^64 + 1):
-   - Ciphertext modulus q = 2^60, plaintext modulus t = 65536 (2^16), scaling factor Delta = 2^44.
-   - Supports BOTH homomorphic addition E(m1) + E(m2) AND non-linear ciphertext-ciphertext
-     multiplication E(m1) * E(m2) with 4-limb base-2^15 gadget decomposition relinearization
-     executed in compiled C using 128-bit integer arithmetic (__int128).
+1. RLWE-BFV Scheme (Brakerski-Fan-Vercauteren) over cyclotomic ring R_q = Z_q[X]/(X^2048 + 1):
+   - Parameterized per the HomomorphicEncryption.org 128-bit Lattice Security Standard (Table 1):
+     Ring degree N = 2048, Ciphertext modulus q = 2^54 (log2(q) = 54), Plaintext modulus t = 65536,
+     Scaling factor Delta = 2^38, 4-limb base-2^14 gadget relinearization, unbiased rejection sampling.
+   - Supports BOTH single-ring Z_65536 homomorphic addition/multiplication AND overflow-free
+     base-256 multi-limb homomorphic multiplication for arbitrary 32-bit integers (e.g. 300 * 300 = 90,000)
+     using ONLY public relinearization keys `rlk`!
 2. SessionSecretVault:
    - Seals arbitrary free-text passwords, passphrases, and <secret>...</secret> spans locally
-     via C CommonCrypto AES-256-CBC + HMAC-SHA256 so raw secrets are not left in plaintext dicts.
+     via C CommonCrypto AES-256-CBC + HMAC-SHA256 so raw secrets never sit in plaintext dicts.
 """
 
 import ctypes
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .zeroize import load_native_lib, secure_zero
 
-BFV_N = 64
+BFV_N = 2048
 BFV_PK_LEN = 2 * BFV_N
 BFV_CT_LEN = 2 * BFV_N
 BFV_RLK_LEN = 4 * 2 * BFV_N
 BFV_T = 65536
+BFV_LIMB_BASE = 256
 
 
 def _bind_bfv_and_session_functions() -> ctypes.CDLL:
@@ -93,11 +96,6 @@ _LIB = _bind_bfv_and_session_functions()
 
 
 class SessionSecretVault:
-    """
-    Encrypts arbitrary prompt secrets (passwords, JWTs, <secret>...</secret>) inside native C
-    using AES-256-CBC + HMAC-SHA256 under a mutable ctypes session buffer wiped via memset_s().
-    """
-
     def __init__(self):
         self._key = (ctypes.c_uint8 * 32).from_buffer_copy(os.urandom(32))
 
@@ -173,45 +171,57 @@ class SessionSecretVault:
 
 class BFVEvaluator:
     """
-    Untrusted Cloud / Blind Evaluator for RLWE-BFV ciphertexts.
+    Untrusted Cloud / Blind Evaluator for N=2048 RLWE-BFV ciphertexts.
     Holds ONLY the public relinearization key `rlk` — ZERO access to ternary secret key `s`.
     """
 
-    def __init__(self, rlk_coeffs: List[int]):
-        if len(rlk_coeffs) != BFV_RLK_LEN:
-            raise ValueError(f"Invalid BFV relinearization key length: {len(rlk_coeffs)}")
-        self._rlk = (ctypes.c_int64 * BFV_RLK_LEN)(*rlk_coeffs)
+    def __init__(self, rlk_array):
+        if len(rlk_array) != BFV_RLK_LEN:
+            raise ValueError(f"Invalid BFV relinearization key length: {len(rlk_array)}")
+        if isinstance(rlk_array, ctypes.Array):
+            self._rlk = (ctypes.c_int64 * BFV_RLK_LEN).from_buffer_copy(rlk_array)
+        else:
+            self._rlk = (ctypes.c_int64 * BFV_RLK_LEN)(*rlk_array)
 
     @staticmethod
-    def _to_c_ct(ct: List[int]):
+    def _as_c_ct(ct):
+        if isinstance(ct, ctypes.Array) and len(ct) == BFV_CT_LEN:
+            return ct
         if len(ct) != BFV_CT_LEN:
             raise ValueError(f"Invalid BFV ciphertext length: {len(ct)}")
         return (ctypes.c_int64 * BFV_CT_LEN)(*ct)
 
-    def add(self, ct1: List[int], ct2: List[int]) -> List[int]:
-        """Compute E(m1 + m2 mod 65536) in R_q."""
-        c1 = self._to_c_ct(ct1)
-        c2 = self._to_c_ct(ct2)
+    def add(self, ct1, ct2):
+        c1 = self._as_c_ct(ct1)
+        c2 = self._as_c_ct(ct2)
         out = (ctypes.c_int64 * BFV_CT_LEN)()
         _LIB.vault_bfv_add(c1, c2, out)
-        return list(out)
+        return out
 
-    def multiply(self, ct1: List[int], ct2: List[int]) -> List[int]:
-        """
-        Compute non-linear ciphertext × ciphertext product E(m1 * m2 mod 65536)
-        using tensor product scaling round((t/q) * (c1 (x) c2)) + 4-limb gadget relinearization.
-        """
-        c1 = self._to_c_ct(ct1)
-        c2 = self._to_c_ct(ct2)
+    def multiply(self, ct1, ct2):
+        c1 = self._as_c_ct(ct1)
+        c2 = self._as_c_ct(ct2)
         out = (ctypes.c_int64 * BFV_CT_LEN)()
         _LIB.vault_bfv_mul_relin(c1, c2, self._rlk, out)
-        return list(out)
+        return out
+
+    def multiply_limbs(self, limbs_a: List[Any], limbs_b: List[Any]) -> List[Tuple[int, Any]]:
+        """
+        Overflow-free homomorphic schoolbook multiplication over base-256 limbs!
+        Each limb m_i in [0, 255] satisfies m_i * m_j <= 65025 < 65536 = t, guaranteeing
+        ZERO modular wraparound for arbitrary 32-bit / 64-bit integer products!
+        """
+        terms: List[Tuple[int, Any]] = []
+        for i, ca in enumerate(limbs_a):
+            for j, cb in enumerate(limbs_b):
+                terms.append((i + j, self.multiply(ca, cb)))
+        return terms
 
 
 class BFVContext:
     """
-    Trusted Local Client Context for Ring-LWE BFV Homomorphic Encryption.
-    Ring: R_q = Z_{2^60}[X] / (X^64 + 1), Plaintext space Z_{65536}.
+    Trusted Local Client Context for 128-bit Lattice Security Ring-LWE BFV FHE.
+    Ring: R_q = Z_{2^54}[X] / (X^2048 + 1), Plaintext space Z_{65536}.
     """
 
     def __init__(self):
@@ -219,36 +229,56 @@ class BFVContext:
         self._pk = (ctypes.c_int64 * BFV_PK_LEN)()
         self._rlk = (ctypes.c_int64 * BFV_RLK_LEN)()
         _LIB.vault_bfv_keygen(self._sk, self._pk, self._rlk)
-        self.evaluator = BFVEvaluator(list(self._rlk))
+        self.evaluator = BFVEvaluator(self._rlk)
 
-    def encrypt_int(self, m: int) -> List[int]:
+    def encrypt_int(self, m: int):
         if not (0 <= m < BFV_T):
-            raise ValueError(f"BFV integer plaintext must be in [0, {BFV_T - 1}], got {m}.")
+            raise ValueError(f"BFV single-ring plaintext must be in [0, {BFV_T - 1}], got {m}.")
         out = (ctypes.c_int64 * BFV_CT_LEN)()
         _LIB.vault_bfv_encrypt(self._pk, ctypes.c_int64(m), out)
-        return list(out)
+        return out
 
-    def decrypt_int(self, ct: List[int]) -> int:
-        c_ct = (ctypes.c_int64 * BFV_CT_LEN)(*ct)
+    def decrypt_int(self, ct) -> int:
+        c_ct = BFVEvaluator._as_c_ct(ct)
         return int(_LIB.vault_bfv_decrypt(self._sk, c_ct))
 
+    def encrypt_limbs_u32(self, value: int) -> List[Any]:
+        """Decompose non-negative integer into base-256 limbs in [0, 255] and BFV-encrypt each limb."""
+        if value < 0 or value > 0xFFFFFFFF:
+            raise ValueError(f"BFV u32 value must be in [0, 2^32 - 1], got {value}.")
+        if value == 0:
+            return [self.encrypt_int(0)]
+        limbs = []
+        rem = value
+        while rem > 0:
+            limbs.append(self.encrypt_int(rem & 0xFF))
+            rem >>= 8
+        return limbs
+
+    def decrypt_limbs_product(self, product_terms: List[Tuple[int, Any]]) -> int:
+        total = 0
+        for deg, ct in product_terms:
+            limb_prod = self.decrypt_int(ct)
+            total += limb_prod * (BFV_LIMB_BASE ** deg)
+        return total
+
     @staticmethod
-    def ciphertext_preview(ct: List[int]) -> str:
-        c0_hex = hex(ct[0] & ((1 << 64) - 1))
-        c1_hex = hex(ct[BFV_N] & ((1 << 64) - 1))
+    def ciphertext_preview(ct) -> str:
+        c0_hex = hex(int(ct[0]) & ((1 << 64) - 1))
+        c1_hex = hex(int(ct[BFV_N]) & ((1 << 64) - 1))
         return f"R_q[{c0_hex[:10]}..,{c1_hex[:10]}..]"
 
     @property
     def parameters_dict(self) -> Dict[str, Any]:
         return {
-            "scheme": "RLWE-BFV (Brakerski-Fan-Vercauteren)",
-            "ring": "Z_{2^60}[X] / (X^64 + 1)",
+            "scheme": "RLWE-BFV (128-bit Lattice Security Standard)",
+            "ring": "Z_{2^54}[X] / (X^2048 + 1)",
             "ring_degree_n": BFV_N,
-            "ciphertext_modulus_bits": 60,
+            "ciphertext_modulus_bits": 54,
             "plaintext_modulus_t": BFV_T,
             "gadget_limbs": 4,
-            "gadget_base_bits": 15,
-            "execution": "Compiled C11 (__int128 negacyclic convolution)",
+            "gadget_base_bits": 14,
+            "security_standard": "HomomorphicEncryption.org Table 1 (N=2048, log2(q)=54)",
         }
 
     def close(self) -> None:

@@ -1,6 +1,7 @@
 """
-Pipeline Service: Orchestrates Blinding, C AES-256 Secret Sealing, Cloud/ZK LLM Reasoning,
-1024-bit Paillier PHE + Native C RLWE-BFV FHE Math, Enclave Sealing, and Security Telemetry.
+Pipeline Service: Orchestrates Blinding, Zero-Retention C AES-256 Secret Sealing,
+Cloud/ZK LLM Reasoning, 1024-bit Paillier PHE + 128-bit PQ Lattice RLWE-BFV FHE Math,
+Dual-Field Enclave Sealing, and Security Telemetry.
 """
 
 import time
@@ -45,7 +46,7 @@ class AgentPipeline:
             "provider_mode": provider,
             "transmitted_prompt": blinded_text,
             "paillier_phe_modulus_bits": self.tokenizer.paillier.n.bit_length(),
-            "bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)",
+            "bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]",
             "contains_master_key": False,
             "contains_raw_pii": False,
             "contains_raw_secrets": False,
@@ -76,7 +77,6 @@ class AgentPipeline:
         hmac_map = {
             k: v for k, v in ctx.token_to_plaintext.items() if not k.startswith("[FHE_")
         }
-        # Include C-sealed secret tokens in token table WITHOUT leaking plaintext secrets
         for sec_tok, blob in ctx.sealed_secrets.items():
             hmac_map[sec_tok] = f"[C-AES256 Sealed: {blob['preview']}]"
 
@@ -85,7 +85,7 @@ class AgentPipeline:
                 "phase": "PHASE_1_BLINDING",
                 "name": "Local Cryptographic Masking, C Secret Sealing & Dual PHE/FHE",
                 "details": {
-                    "original_input": user_prompt,
+                    "original_input": ctx.redacted_prompt,
                     "blinded_output": blinded_text,
                     "hmac_tokens": hmac_map,
                     "sealed_secret_count": len(ctx.sealed_secrets),
@@ -132,7 +132,7 @@ class AgentPipeline:
         audit_trail.append(
             {
                 "phase": "PHASE_4_ENCLAVE_SSS",
-                "name": "2048-bit Feldman VSS & Native C Enclave Execution",
+                "name": "Dual-Field 2048-bit Feldman VSS & Native C Enclave Execution",
                 "details": {
                     "executed": bool(enclave_result and enclave_result.get("success")),
                     "enclave_result": enclave_result,
@@ -181,7 +181,7 @@ class AgentPipeline:
             "provider_used": llm_result.get("provider"),
             "is_live_cloud": llm_result.get("is_live_cloud", False),
             "duration_ms": duration_ms,
-            "original_prompt": user_prompt,
+            "original_prompt": ctx.redacted_prompt,
             "blinded_prompt": blinded_text,
             "cloud_wire_payload": wire_payload,
             "fhe_computation": fhe_computation_report,

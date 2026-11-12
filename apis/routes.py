@@ -1,8 +1,8 @@
 """
 API Router Module (`apis/routes.py`).
 Exposes REST endpoints for Zero-Knowledge Pipeline execution, Host LLM Config detection,
-2048-bit Feldman VSS shard inspection/tampering, 1024-bit Paillier PHE math,
-Native C Lattice RLWE-BFV FHE ciphertext × ciphertext multiplication,
+Dual-Field 2048-bit Feldman VSS shard inspection/tampering, 1024-bit Paillier PHE math,
+128-bit Lattice Security Native C RLWE-BFV FHE (N=2048) multiplication,
 SQLite HMAC verification, and real-time Security Telemetry Monitoring.
 """
 
@@ -91,10 +91,13 @@ async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
     paillier = pipeline.tokenizer.paillier
     evaluator = pipeline.tokenizer.evaluator
 
-    c1, s1 = paillier.encrypt_fixed(req.val1)
-    c2, s2 = paillier.encrypt_fixed(req.val2)
-    c_sum, s_sum = evaluator.add_scaled(c1, s1, c2, s2)
-    decrypted_sum = paillier.decrypt_fixed(c_sum, s_sum)
+    try:
+        c1, s1 = paillier.encrypt_fixed(req.val1)
+        c2, s2 = paillier.encrypt_fixed(req.val2)
+        c_sum, s_sum = evaluator.add_scaled(c1, s1, c2, s2)
+        decrypted_sum = paillier.decrypt_fixed(c_sum, s_sum)
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     pipeline.monitor.total_fhe_computations += 1
     pipeline.monitor.record_event(
@@ -120,47 +123,49 @@ async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
 @router.post("/bfv-fhe-calc")
 async def bfv_fhe_calc_endpoint(req: BFVCalcRequest):
     """
-    True Lattice RLWE-BFV Homomorphic Encryption in Native C (`libvaultcrypto.dylib`)
-    over R_q = Z_{2^60}[X] / (X^64 + 1), computing BOTH E(m1) + E(m2) AND non-linear
-    ciphertext × ciphertext multiplication E(m1) * E(m2) with 4-limb gadget relinearization.
+    128-bit Lattice Security Ring-LWE BFV FHE in Native C (`libvaultcrypto.dylib`)
+    over R_q = Z_{2^54}[X] / (X^2048 + 1) (HomomorphicEncryption.org Table 1).
+    Uses overflow-free base-256 limb multiplication for arbitrary 32-bit integers [0, 2^32 - 1].
     """
-    if not (0 <= req.m1 < BFV_T and 0 <= req.m2 < BFV_T):
+    if not (0 <= req.m1 <= 0xFFFFFFFF and 0 <= req.m2 <= 0xFFFFFFFF):
         raise HTTPException(
             status_code=400,
-            detail=f"BFV plaintext integers must lie in Z_{BFV_T} [0, {BFV_T - 1}].",
+            detail="BFV plaintext integers must be non-negative 32-bit integers [0, 4294967295].",
         )
 
     bfv = pipeline.tokenizer.bfv
-    ct1 = bfv.encrypt_int(req.m1)
-    ct2 = bfv.encrypt_int(req.m2)
+    limbs1 = bfv.encrypt_limbs_u32(req.m1)
+    limbs2 = bfv.encrypt_limbs_u32(req.m2)
+    prod_terms = bfv.evaluator.multiply_limbs(limbs1, limbs2)
+    dec_mul_exact = bfv.decrypt_limbs_product(prod_terms)
 
-    ct_add = bfv.evaluator.add(ct1, ct2)
-    ct_mul = bfv.evaluator.multiply(ct1, ct2)
-
+    # Also compute single-ring Z_65536 addition on mod-65536 projections
+    ct1_single = bfv.encrypt_int(req.m1 % BFV_T)
+    ct2_single = bfv.encrypt_int(req.m2 % BFV_T)
+    ct_add = bfv.evaluator.add(ct1_single, ct2_single)
     dec_add = bfv.decrypt_int(ct_add)
-    dec_mul = bfv.decrypt_int(ct_mul)
 
     pipeline.monitor.total_fhe_computations += 1
     pipeline.monitor.record_event(
         "INFO",
         "bfv_lattice_fhe",
-        f"Evaluated Native C RLWE-BFV ciphertext × ciphertext product & relinearization ({req.m1} * {req.m2} mod 65536).",
+        f"Evaluated N=2048 128-bit PQ RLWE-BFV ciphertext × ciphertext product ({req.m1} * {req.m2} = {dec_mul_exact}).",
     )
 
     return {
-        "scheme": "Native C Ring-LWE BFV Lattice FHE",
-        "ring": "R_q = Z_{2^60}[X] / (X^64 + 1), t = 65536",
+        "scheme": "Native C 128-bit Lattice Security Ring-LWE BFV FHE",
+        "ring": "R_q = Z_{2^54}[X] / (X^2048 + 1), t = 65536",
         "m1": req.m1,
         "m2": req.m2,
-        "ct1_preview": bfv.ciphertext_preview(ct1),
-        "ct2_preview": bfv.ciphertext_preview(ct2),
-        "ct_mul_preview": bfv.ciphertext_preview(ct_mul),
+        "ct1_preview": bfv.ciphertext_preview(limbs1[0]),
+        "ct2_preview": bfv.ciphertext_preview(limbs2[0]),
+        "ct_mul_preview": bfv.ciphertext_preview(prod_terms[0][1]),
         "decrypted_sum_mod_t": dec_add,
-        "decrypted_product_mod_t": dec_mul,
-        "exact_integer_no_wrap": (req.m1 * req.m2) < BFV_T,
+        "decrypted_product_exact": dec_mul_exact,
+        "decrypted_product_mod_t": dec_mul_exact % BFV_T,
         "mathematical_proof": (
-            f"D(Relin(E({req.m1}) ⊗ E({req.m2}))) = {dec_mul}  |  "
-            f"D(E({req.m1}) ⊕ E({req.m2})) = {dec_add}  (mod 65536)"
+            f"D(Relin(E({req.m1}) ⊗ E({req.m2}))) = {dec_mul_exact:,} (exact, 0 overflow)  |  "
+            f"D(E({req.m1 % BFV_T}) ⊕ E({req.m2 % BFV_T})) = {dec_add} (mod 65536)"
         ),
     }
 
@@ -178,7 +183,7 @@ async def get_monitoring_health():
         "native_c_enclave": "ACTIVE",
         "quorum_healthy": vault_st["quorum_healthy"],
         "paillier_phe_modulus_bits": pipeline.tokenizer.paillier.n.bit_length(),
-        "bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)",
+        "bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]",
         "llm_env": LLMClient.get_env_config(),
         "telemetry": pipeline.monitor.snapshot(),
     }
