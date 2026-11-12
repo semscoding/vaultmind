@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VaultMind v2 | Native C Enclave &amp; Zero-Knowledge AI Pipeline</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="header-left">
+            <div class="logo-mark">
+                <span class="logo-icon">🛡️</span>
+                <div class="logo-text">
+                    <h1>VaultMind <span class="v-tag">v2</span></h1>
+                    <span class="sub-badge">Native C Enclave • 2048-bit VSS • 1024-bit FHE</span>
+                </div>
+            </div>
+            <div class="enclave-badge">
+                <span class="pulse-dot"></span>
+                <span>127.0.0.1:8000 • libvaultcrypto.dylib ACTIVE</span>
+            </div>
+        </div>
+
+        <div class="header-right">
+            <div class="model-select-wrapper">
+                <label for="providerSelect">LLM Engine:</label>
+                <select id="providerSelect">
+                    <option value="simulation" selected>⚡ Offline Deterministic ZK Engine</option>
+                    <option value="gemini">✨ Google Gemini 2.5 Flash (Live API)</option>
+                    <option value="openai">🤖 OpenAI GPT-4o-mini (Live API)</option>
+                </select>
+            </div>
+            <input type="password" id="apiKeyInput" placeholder="API Key (required for Live Cloud)">
+        </div>
+    </header>
+
+    <section class="telemetry-bar">
+        <div class="telemetry-card">
+            <span class="label">MASTER KEY IN PYTHON RAM</span>
+            <span class="value green">0 BYTES (C-STACK ONLY)</span>
+        </div>
+        <div class="telemetry-card">
+            <span class="label">VERIFIABLE SECRET SHARING</span>
+            <span class="value purple" id="quorumText">k=3 of n=5 (2048-bit Feldman VSS)</span>
+        </div>
+        <div class="telemetry-card">
+            <span class="label">HOMOMORPHIC ENGINE</span>
+            <span class="value cyan" id="paillierBitsText">Paillier 1024-bit Fixed-Point</span>
+        </div>
+        <div class="telemetry-card">
+            <span class="label">HARDWARE / OS ZEROIZE</span>
+            <span class="value green">C11 memset_s() + CommonCrypto</span>
+        </div>
+    </section>
+
+    <div class="scenario-bar">
+        <span class="scenario-title">Verified Scenarios:</span>
+        <button class="chip" onclick="loadScenario('salary')">💼 15% Bonus FHE Calculation &amp; DB Seal</button>
+        <button class="chip" onclick="loadScenario('health')">🏥 Patient BSN &amp; Biomarker EHR Update</button>
+        <button class="chip" onclick="loadScenario('finance')">💳 Executive IBAN Wire Transfer Auth</button>
+        <button class="chip" onclick="loadScenario('xss')">🧪 XSS &amp; Secret Leak Stress Test</button>
+    </div>
+
+    <main class="workspace-grid">
+        <!-- COLUMN 1: Local Client -->
+        <div class="column-panel client-panel">
+            <div class="panel-header">
+                <span class="panel-tag tag-client">LOCAL CLIENT (TRUSTED)</span>
+                <h3>Plaintext Input &amp; Decrypted Verdict</h3>
+            </div>
+
+            <div class="input-container">
+                <label for="promptInput">Confidential Enterprise Prompt:</label>
+                <textarea id="promptInput" rows="5"></textarea>
+
+                <div class="action-row">
+                    <button id="runBtn" class="btn-primary" onclick="runPipeline()">
+                        <span class="btn-icon">⚡</span> Execute Zero-Trust Pipeline
+                    </button>
+                    <span id="latencyBadge" class="latency-badge hidden">-- ms</span>
+                </div>
+            </div>
+
+            <div id="fheAgentBanner" class="fhe-inline-banner hidden"></div>
+
+            <div class="result-box">
+                <div class="box-title">
+                    <span>Unblinded Local Output</span>
+                    <span id="providerUsedTag" class="secure-tag">Ready</span>
+                </div>
+                <div id="decryptedOutput" class="content-output placeholder">
+                    Click "Execute Zero-Trust Pipeline" to run blind reasoning, FHE math, and native C enclave sealing...
+                </div>
+            </div>
+        </div>
+
+        <!-- COLUMN 2: Cloud Network Wire -->
+        <div class="column-panel wire-panel">
+            <div class="panel-header">
+                <span class="panel-tag tag-wire">EXTERNAL CLOUD WIRE</span>
+                <h3>What Host Provider (Gemini/OpenAI) Sees</h3>
+            </div>
+
+            <div class="wire-box">
+                <div class="wire-header">
+                    <span>TRANSMITTED PAYLOAD</span>
+                    <span class="wire-lock">🔒 ZERO PLAINTEXT PII / KEYS</span>
+                </div>
+                <div id="wireOutput" class="wire-code-block placeholder">
+                    Awaiting transmission...
+                </div>
+            </div>
+
+            <div class="crypto-meta-box">
+                <div class="box-title">
+                    <span>Local Ephemeral Blinding &amp; 1024-bit Ciphertext Map</span>
+                </div>
+                <div id="mappingTokens" class="tokens-list">
+                    <p class="empty-state">No active session tokens.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- COLUMN 3: Native C Enclave & Feldman VSS -->
+        <div class="column-panel vault-panel">
+            <div class="panel-header">
+                <div class="header-split">
+                    <div>
+                        <span class="panel-tag tag-vault">NATIVE C ENCLAVE &amp; FELDMAN VSS</span>
+                        <h3>Distributed Shard Quorum (k=3, n=5)</h3>
+                    </div>
+                    <button class="btn-restore" onclick="restoreShards()" title="Restore clean shard files">↺ Restore Shards</button>
+                </div>
+            </div>
+
+            <div class="vault-nodes-container">
+                <span class="sub-label">Isolated Disk Shards — click <strong>Corrupt</strong> to test live 2048-bit Feldman VSS defense:</span>
+                <div class="nodes-grid" id="nodesGrid"></div>
+            </div>
+
+            <div class="chart-wrapper">
+                <div class="box-title">
+                    <span>Live GF(2⁸) Canary Polynomial f(x) vs. Disk Shards</span>
+                    <span class="secure-tag">f(0) = 42</span>
+                </div>
+                <div class="chart-canvas-box">
+                    <canvas id="shamirChart"></canvas>
+                </div>
+            </div>
+
+            <div class="receipt-box">
+                <div class="box-title">
+                    <span>Native C Enclave Seal Receipt</span>
+                </div>
+                <div id="receiptOutput" class="receipt-content placeholder">
+                    Awaiting authenticated ActionPlan...
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Bottom Dual Section: Interactive FHE Math + Encrypted SQLite Ledger -->
+    <section class="bottom-grid">
+        <div class="fhe-drawer">
+            <div class="fhe-header">
+                <h3>🧮 1024-bit Paillier Homomorphic Math Playground</h3>
+                <span class="fhe-formula">D(E(m₁) · E(m₂) mod n²) = m₁ + m₂</span>
+            </div>
+            <div class="fhe-controls">
+                <div class="input-pair">
+                    <label for="fheVal1">m₁:</label>
+                    <input type="number" step="0.01" id="fheVal1" value="130000.50">
+                </div>
+                <div class="plus-sign">+</div>
+                <div class="input-pair">
+                    <label for="fheVal2">m₂:</label>
+                    <input type="number" step="0.01" id="fheVal2" value="19500.25">
+                </div>
+                <button class="btn-secondary" onclick="calcHomomorphic()">Multiply Ciphertexts (mod n²)</button>
+            </div>
+            <div id="fheResult" class="fhe-result-box hidden"></div>
+        </div>
+
+        <div class="ledger-drawer">
+            <div class="fhe-header">
+                <h3>🗄️ Encrypted SQLite Audit Ledger (AES-256 + HMAC-SHA256)</h3>
+                <button class="btn-secondary" onclick="verifyLedger()">✔ Verify HMACs in C Enclave</button>
+            </div>
+            <div id="ledgerStatusBanner" class="ledger-banner hidden"></div>
+            <div id="ledgerTableWrap" class="ledger-table-wrap">
+                <p class="placeholder">Loading sealed SQLite records...</p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="app-footer">
+        <p>Built for <strong>Mathematics for Systems Security Hackathon</strong> • Track: <em>AI Pipeline Secret Sharing</em></p>
+        <p>Native C Constant-Time GF(2⁸) Shamir + memset_s() • RFC 3526 2048-bit Feldman VSS • 1024-bit Fixed-Point Paillier FHE</p>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

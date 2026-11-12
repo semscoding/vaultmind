@@ -1,0 +1,22 @@
+# Python virtual environments & bytecode
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled native C artifacts (rebuilt automatically on launch or via backend/native/build.py)
+*.dylib
+*.so
+*.o
+
+# Ephemeral runtime secrets, shards & local SQLite ledgers
+database/runtime/
+vault_data/
+*.db
+*.db-journal
+*.bak
+
+# Environment credentials & OS files
+.env
+.DS_Store
