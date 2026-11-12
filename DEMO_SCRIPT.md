@@ -89,7 +89,7 @@ Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payl
 
 ## Scene 7: Tests and close (2:30 – 2:45)
 
-**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 31 tests` and `OK`.
+**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 34 tests` and `OK`.
 
 **Say:**
-> "Thirty-one tests cover the field arithmetic, uniform sharing, the AAD length field, shard failover, ledger tampering, BFV at depth one, provider errors and the leak check. The known limitations are listed in the README. Thanks for watching."
+> "Thirty-four tests cover the field arithmetic, uniform sharing, the AAD length field, shard failover, concurrent ledger writes, BFV at depth one, provider errors, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."

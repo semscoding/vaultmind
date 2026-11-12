@@ -116,7 +116,7 @@ cd /Users/sem/.gemini/antigravity/scratch/vaultmind
 ./venv/bin/python3 backend/native/build.py
 nm -u backend/native/libvaultcrypto.dylib | grep memset_s
 
-# 2. Full test suite: 31 tests
+# 2. Full test suite: 34 tests
 ./venv/bin/python3 -m unittest discover -s tests -v
 
 # 3. Smoke-test the TUI
@@ -142,7 +142,16 @@ Follow-up to the Victory Audit (vault: `Victory Audit (Claude — 12-11-2026).md
 - Shares and $\alpha_0$ pass through Python; reading shard files in C would make the key claim stronger.
 - BFV error distribution is uniform ternary; no lattice-estimator run. The `ai == 0` skip in BFV is not constant-time.
 - Ledger truncation of the newest rows and unauthenticated `created_at` / `quorum_nodes`.
-- `parse_warning` from `LLMClient` is not copied into the pipeline response or audit phase 3, so the UI's parse-warning line never fires for it (only `llm_output_warnings` does). Small fix in `services/pipeline_service.py`.
-- Feldman higher coefficients are drawn from [1, q−1] instead of [0, q−1] (negligible, 1/q).
+- Feldman secret $\alpha_0$ is drawn from $[1, q-1]$ while higher polynomial coefficients are uniform over $[0, q-1]$ (`backend/crypto/shamir.py:140, 247`; negligible $1/q$ difference on $\alpha_0$).
 - Tests `test_06`, `test_09`, `test_10` and `test_process_route_returns_502_on_provider_failure` use the app singleton backed by `database/runtime/`; `test_06` adds ledger rows there.
-- Live runs with real Gemini/OpenAI/Bedrock keys, a browser check of the dashboard, and making the repo public (or inviting the jury).
+- Live runs with real Gemini/OpenAI/Bedrock keys, VoiceOver screen-reader check, and making the repo public (or inviting the jury).
+
+---
+
+## 7. Audit round 4 (Antigravity, 13 Nov 2026)
+
+Peer-review verification (`T-378`) + follow-up fixes on `claude/victory-audit-fixes`:
+- **M-R1 (Tokenizer false positives on business prose):** removed generic prose words (`sleutel`, `geheim`, `pin`) from natural-language `_GAP + is/was` sealing (kept under explicit `=`/`:` and numeric/quoted PIN rules), added guards against policy meta-nouns (`password policy was...`) and indefinite/auxiliary reminders (`a password is never...`), excluded storage/power/era/country units (`2048 MB`, `1024 GB`, `1500 MW`, `2026 AD`) from NL postcode matching, excluded standard/protocol/fiscal codes (`ISO27001`, `SOC2TYPE2`, `Q4FY2026`, `OAUTH2`, `RFC3526`, `PYTHON3`) from alphanumeric `GOV_ID`, and prioritized role-prefixed subjects (`employee Marcus Vance`) over Title-Case business nouns (`Annual Bonus`, `Balance Sheet`).
+- **M-R2 (TUI LLM warnings):** `frontend/tui.py` now renders `llm_output_warnings` (including `parse_warning` and non-object `fhe_compute`/`action_intent` warnings) alongside the web UI.
+- **M-R3 (Docs & Vault sync):** corrected `HANDOVER.md` notes on `parse_warning` and Feldman coefficient sampling, and synchronized the Obsidian project `README.md`.
+- **S-R1..S-R4 (UX & Concurrency polish):** `app.js` renders the scrubbed `wire_request` even on HTTP 502 provider errors; ledger verification banner reports `chain_length` and `chain_errors` when older rows outside the 15-row preview fail; `SecureEnclave.execute_privileged_intent` retries `LedgerChainConflict` under concurrent writes and `EncryptedLedger` uses `time.time_ns()` for legacy table migration names; `#apiKeyInput` widened (`min-width: 14.5rem`) so its placeholder no longer clips on `1440x900`.

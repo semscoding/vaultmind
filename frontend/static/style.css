@@ -165,6 +165,10 @@ select:focus, input:focus, textarea:focus {
     box-shadow: 0 0 10px var(--cyan-glow);
 }
 
+#apiKeyInput {
+    min-width: 14.5rem;
+}
+
 .telemetry-bar {
     display: grid;
     grid-template-columns: repeat(4, 1fr);

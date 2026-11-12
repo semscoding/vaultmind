@@ -67,11 +67,43 @@ STOPWORD_CAPITALS = {
 CURRENCY_CODES = {"USD", "EUR", "GBP", "CHF", "JPY", "CAD", "AUD"}
 _CUR_ALT = "|".join(sorted(CURRENCY_CODES))
 
-# Technical identifiers that look like mixed alphanumeric IDs but are not personal data.
+# Technical identifiers, standards and fiscal/version codes that look like mixed alphanumeric IDs
+# but are public domain terminology rather than personal identifiers (M-R1).
 ALNUM_STOPLIST = {
-    "AES128", "AES256", "SHA256", "SHA384", "SHA512", "SHA3", "X25519", "ED25519",
-    "RSA2048", "RSA4096", "HMACSHA256", "UTF16", "BASE64", "IPV4", "IPV6", "H264",
-    "PKCS7", "PKCS11", "CHACHA20", "POLY1305", "GF256", "BFV2048",
+    "AES128", "AES192", "AES256", "SHA224", "SHA256", "SHA384", "SHA512", "SHA3", "X25519", "ED25519",
+    "RSA1024", "RSA2048", "RSA3072", "RSA4096", "HMACSHA256", "UTF8", "UTF16", "UTF32", "BASE64",
+    "IPV4", "IPV6", "H264", "H265", "PKCS1", "PKCS7", "PKCS8", "PKCS11", "PKCS12",
+    "CHACHA20", "POLY1305", "GF256", "BFV2048", "CRC32", "INT32", "INT64", "INT128",
+    "UINT32", "UINT64", "UINT128", "FLOAT32", "FLOAT64", "ARM64", "X8664", "AMD64",
+}
+_TECH_CODE_RE = re.compile(
+    r"^(?:ISO\d+|SOC\d[A-Z0-9]*|RFC\d+|IEEE\d+[A-Z0-9]*|NIST[A-Z0-9]*|GDPR\d*|HIPAA\d*"
+    r"|PCI[A-Z0-9]*|WCAG\d*[A-Z0-9]*|OWASP\d*|CVE\d+|CWE\d+|TLS\d+|SSL\d+|SSH\d*|HTTP\d+"
+    r"|OAUTH\d*|COVID\d+|ICD\d+[A-Z0-9]*|DSM\d+[A-Z0-9]*|Q[1-4](?:FY)?\d{2,4}|H[12](?:FY)?\d{2,4}"
+    r"|FY\d{2,4}|ERC\d+|BIP\d+|EIP\d+|[A-Z]{4,}\d{1,2})$"
+)
+
+# Two-letter suffixes after 4 digits that denote units, eras, timezones or country/IT codes rather
+# than Dutch postcodes (1000 AA .. 9999 ZZ; SA/SD/SS are also invalid NL postcodes).
+POSTCODE_UNIT_STOPLIST = {
+    "AM", "PM", "AD", "BC", "CE", "KB", "MB", "GB", "TB", "PB", "EB", "KI", "MI", "GI",
+    "KW", "MW", "GW", "TW", "WH", "HZ", "DB", "PX", "PT", "EM", "MS", "NS", "US", "PS",
+    "SA", "SD", "SS", "EU", "UK", "NL", "DE", "FR", "BE", "ES", "IT", "CH", "AT", "SE",
+    "NO", "DK", "FI", "PL", "JP", "CN", "CA", "AU", "HR", "PR", "AI", "ML", "QA", "UI",
+    "UX", "ID", "IP", "OS", "VM", "IO", "TV", "PC",
+}
+
+# Capitalised business/document nouns: a Title-Case phrase made ONLY of these words (e.g.
+# "Annual Bonus", "Balance Sheet") is business terminology, not a person's name (M-R1).
+BUSINESS_CAPITAL_NOUNS = {
+    "Annual", "Bonus", "Balance", "Sheet", "Executive", "Summary", "Retention", "Quarterly",
+    "Monthly", "Weekly", "Daily", "Report", "Financial", "Statement", "Operating", "Income",
+    "Cash", "Flow", "Service", "Level", "Agreement", "Master", "Root", "Key", "Credentials",
+    "Clinical", "Trial", "Budget", "Cloud", "Reserve", "Target", "Earnout", "Pool", "Project",
+    "Audit", "Ledger", "Database", "System", "Security", "Policy", "Compliance", "Invoice",
+    "Product", "Salary", "Contract", "Subsidy", "Adjustment", "Escalation", "Notice",
+    "Confidential", "Patient", "Record", "Transfer", "Authorization", "Account", " Fiscal",
+    "Quarter", "Year", "Revenue", "Profit", "Margin", "Tax", "Credit", "Debit", "Total", "Cost",
 }
 
 
@@ -93,17 +125,34 @@ NAME_WORD = (
 # Dutch & European surname particles (only matched between strictly capitalized name words)
 NAME_PARTICLE = r"(?:van\s+der|van\s+den|van\s+de|in\s+'t|van|de|den|der|ter|ten|von|zu|du|la|le|da|di|del)"
 
-# Labels that introduce a secret value (English + Dutch). Used with "is"/"was"/"luidt"/"="/":".
+# Labels that introduce a secret value (English + Dutch) with "is"/"was"/"luidt"/"="/":".
+# Generic prose words like "sleutel", "geheim" and "pin" are handled in Priority 1B (`=`/`:`)
+# or dedicated numeric-PIN pattern so ordinary Dutch/English prose ("De sleutel tot succes is...",
+# "Het geheim van groei is...", "The pin on the map is red") is not sealed as a secret (M-R1).
 SECRET_LABELS = (
     r"(?:aws[_\s-]+secret[_\s-]+access[_\s-]+key|secret[_\s-]+access[_\s-]+key|"
     r"secret[_\s-]+key|master[_\s-]+key|root[_\s-]+key|private[_\s-]+key|api[_\s-]+key|"
     r"access[_\s-]+key|access[_\s-]+token|auth[_\s-]+token|secret[_\s-]+token|client[_\s-]+secret|"
-    r"password|passwd|pwd|passphrase|pass\s?code|pincode|pin|"
-    r"wachtwoord|wachtzin|toegangscode|geheime\s+(?:code|sleutel)|geheim|sleutel)"
+    r"password|passwd|pwd|passphrase|pass\s?code|pincode|"
+    r"wachtwoord|wachtzin|toegangscode|geheime\s+(?:code|sleutel)|"
+    r"(?:api|master|root|priv[eé])[_\s-]+sleutel)"
+)
+# Words immediately after "password"/"wachtwoord" that describe policy/metadata rather than a secret.
+_META_NOUN_GUARD = (
+    r"(?!(?:\s+(?:policy|policies|reset|rotation|rules?|requirements?|strength|complexity|"
+    r"length|manager|field|fields|prompt|hash|hashes|aging|expiration|expiry|history|"
+    r"beleid|regels|eisen|lengte|verloop|wijziging|herstel|veld))\b)"
 )
 # Up to four words between label and separator: "password for the database is X".
 _GAP = r"(?:\s+[^\s,;:=.!?()\[\]\"'<>]{1,30}){0,4}?"
-_SEP = r"\s*(?:\bis\b|\bwas\b|\bluidt\b|=|:)\s*"
+_SEP_EQ = r"\s*(?:=|:)\s*"
+_SEP_PROSE = r"\s*(?:\bis\b|\bwas\b|\bluidt\b)\s*"
+# Prose auxiliaries/adjectives that follow "a password is ..." in policy reminders rather than values.
+_PROSE_PREDICATE_GUARD = (
+    r"(?!(?:never|not|always|required|mandatory|optional|updated|changed|expired|reset|"
+    r"needed|missing|empty|recommended|enforced|stored|hashed|encrypted|"
+    r"nooit|niet|altijd|verplicht|optioneel|gewijzigd|verlopen|nodig|leeg|versleuteld)\b)"
+)
 # Value rule (documented choice): a quoted value is taken exactly. An UNQUOTED value runs to the end
 # of its clause: the next `,` `;` `)` `]` or newline, or a `.`/`!`/`?` followed by whitespace or the
 # end of the prompt. This over-blinds ("password is abc and commit" seals "abc and commit") rather
@@ -111,6 +160,10 @@ _SEP = r"\s*(?:\bis\b|\bwas\b|\bluidt\b|=|:)\s*"
 _VALUE = (
     r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
     r"|([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+)
+_PROSE_VALUE = (
+    r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
+    r"|" + _PROSE_PREDICATE_GUARD + r"([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
 )
 # Digits in the NL format "1.234,56", multiple dot groups "1.234.567", EN "130,000.50",
 # NL decimal "14,2", or plain "4.9". `1.234` alone is ambiguous and parsed as EN decimal.
@@ -139,6 +192,7 @@ class SpanMatch:
     prefix_symbol: str = ""
     unseal_value: Optional[str] = None
     has_decimals: bool = False
+    is_role_subject: bool = False
 
 
 class BlindContext:
@@ -263,12 +317,27 @@ class BlindTokenizer:
         ):
             candidates.append(SpanMatch(m.start(), m.end(), "SECRET", m.group(0), priority=0, unseal_value=m.group(0)))
 
-        # Priority 1A: Labelled passwords/PINs/keys (EN + NL), up to 4 words between label and separator
-        for m in re.finditer(rf"(?i:\b{SECRET_LABELS}{_GAP}{_SEP})" + _VALUE, prompt):
+        # Priority 1A: Labelled passwords/PINs/keys (EN + NL):
+        #   - Explicit '=' or ':' accepts any value up to end of clause.
+        #   - Natural-language 'is'/'was'/'luidt' rejects indefinite articles ("a password is never...")
+        #     and policy nouns ("password policy was updated...") to avoid sealing normal prose (M-R1).
+        for m in re.finditer(rf"(?i:\b{SECRET_LABELS}{_META_NOUN_GUARD}{_GAP}{_SEP_EQ})" + _VALUE, prompt):
+            candidates.append(self._labelled_value_span(m, 1, priority=1))
+        for m in re.finditer(
+            rf"(?i:(?<!\ba\s)(?<!\ban\s)(?<!\been\s)\b{SECRET_LABELS}{_META_NOUN_GUARD}{_GAP}{_SEP_PROSE})"
+            + _PROSE_VALUE,
+            prompt,
+        ):
             candidates.append(self._labelled_value_span(m, 1, priority=1))
 
-        # Priority 1B: Single-word generic labels with ':' or '='
-        for m in re.finditer(r"(?i:\b(?:secret|token|key|seed|geheim|sleutel)\s*(?:=|:)\s*)" + _VALUE, prompt):
+        # Priority 1B: Single-word generic labels with ':' or '=', plus numeric/quoted PIN in prose
+        for m in re.finditer(r"(?i:\b(?:secret|token|key|seed|pin|geheim|sleutel)\s*(?:=|:)\s*)" + _VALUE, prompt):
+            candidates.append(self._labelled_value_span(m, 1, priority=1))
+        for m in re.finditer(
+            rf"(?i:\bpin(?:\s+(?:code|number|nr|(?:for|van|voor)(?:\s+[\w-]+){{1,3}}))?{_SEP_PROSE})"
+            r"(?:\"([^\"\n]+)\"|'([^'\n]+)'|(\d{3,12})\b)",
+            prompt,
+        ):
             candidates.append(self._labelled_value_span(m, 1, priority=1))
 
         # Priority 1C: "password X" without separator, when X contains a digit or symbol
@@ -335,9 +404,9 @@ class BlindTokenizer:
         for m in re.finditer(r"\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", prompt):
             candidates.append(SpanMatch(m.start(), m.end(), "GOV_ID", m.group(0), priority=4))
 
-        # Priority 4: Dutch postcode (2511AB / 2511 AB)
+        # Priority 4: Dutch postcode (2511AB / 2511 AB), excluding storage/power/date units (M-R1)
         for m in re.finditer(r"\b[1-9]\d{3}\s?[A-Z]{2}\b", prompt):
-            if m.group(0)[-2:] not in {"AM", "PM"}:
+            if m.group(0)[-2:] not in POSTCODE_UNIT_STOPLIST:
                 candidates.append(SpanMatch(m.start(), m.end(), "LOC", m.group(0), priority=4))
 
         # Priority 5: Mixed alphanumeric IDs (passport NX4K2P881, A123456): upper-case letters + digits
@@ -345,13 +414,18 @@ class BlindTokenizer:
             r"(?<![\w-])(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,20}(?![\w-])", prompt
         ):
             tok = m.group(0)
-            if tok in ALNUM_STOPLIST:
+            if tok in ALNUM_STOPLIST or _TECH_CODE_RE.fullmatch(tok):
                 continue
             if re.fullmatch(rf"\d+(?:{_CUR_ALT})|(?:{_CUR_ALT})\d+", tok):
                 continue  # 5000EUR / EUR5000: handled as an encrypted amount below
             candidates.append(SpanMatch(m.start(), m.end(), "GOV_ID", tok, priority=5))
 
         # Priority 5: Multi-word Capitalized Names / Dutch & European Particles / Organizations / Locations
+        role_prefix_re = re.compile(
+            r"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|customer|lead|recipient|user|"
+            r"medewerker|werknemer|leverancier|subject|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)$"
+        )
+        org_suffixes = {"Corp", "Inc", "Ltd", "BV", "NV", "LLC", "Group", "Bank", "Central", "Hospital", "Labs"}
         full_name_pattern = (
             rf"\b({NAME_WORD}(?:\s+(?:{NAME_PARTICLE}\s+)?{NAME_WORD})+"
             rf"(?:\s+(?:Corp|Inc|Ltd|BV|NV|LLC|Group|Bank|Central|Hospital|Labs))?)\b"
@@ -365,19 +439,37 @@ class BlindTokenizer:
                 start_offset = prompt.index(words[0], start_offset + len(removed)) if words else start_offset
             if len(words) >= 2:
                 clean_phrase = prompt[start_offset : m.end(1)]
-                prefix_ctx = prompt[max(0, start_offset - 16) : start_offset].lower()
+                prefix_window = prompt[max(0, start_offset - 24) : start_offset]
+                prefix_ctx = prefix_window.lower()
+                has_role = role_prefix_re.search(prefix_window) is not None
+                has_org = words[-1] in org_suffixes
+                if not has_role and not has_org and all(w in BUSINESS_CAPITAL_NOUNS for w in words):
+                    continue
                 cat = "LOC" if ("clinic" in prefix_ctx or "city" in prefix_ctx) else "ID"
-                candidates.append(SpanMatch(start_offset, m.end(1), cat, clean_phrase, priority=5))
+                candidates.append(
+                    SpanMatch(
+                        start_offset,
+                        m.end(1),
+                        cat,
+                        clean_phrase,
+                        priority=5,
+                        is_role_subject=(cat == "ID" and has_role),
+                    )
+                )
 
         # Priority 6: Single proper name after a role/title word (e.g. "patient O'Connor", "dhr. Müller")
         for m in re.finditer(
-            rf"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|recipient|user|medewerker|werknemer|"
+            rf"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|customer|lead|recipient|user|medewerker|werknemer|"
             rf"leverancier|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)({NAME_WORD})\b",
             prompt,
         ):
             word = m.group(1)
-            if word not in STOPWORD_CAPITALS and word.upper() not in CURRENCY_CODES:
-                candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6))
+            if (
+                word not in STOPWORD_CAPITALS
+                and word not in BUSINESS_CAPITAL_NOUNS
+                and word.upper() not in CURRENCY_CODES
+            ):
+                candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6, is_role_subject=True))
 
         # Priority 7: Sensitive amounts (Paillier PHE; non-negative 32-bit integers also RLWE-BFV)
         for m in NUM_RE.finditer(prompt):
@@ -436,7 +528,16 @@ class BlindTokenizer:
                 inner = re.sub(r"</?secret>", "", union_text, flags=re.IGNORECASE)
                 merged.append(SpanMatch(start, end, "SECRET", union_text, rep.priority, unseal_value=inner))
             else:
-                merged.append(SpanMatch(start, end, rep.category, union_text, rep.priority))
+                merged.append(
+                    SpanMatch(
+                        start,
+                        end,
+                        rep.category,
+                        union_text,
+                        rep.priority,
+                        is_role_subject=any(s.is_role_subject for s in grp),
+                    )
+                )
         return merged
 
     def blind_prompt(self, prompt: str) -> Tuple[str, BlindContext]:
@@ -447,6 +548,7 @@ class BlindTokenizer:
         out_parts: List[str] = []
         redacted_parts: List[str] = []
         secret_values_for_scan: List[str] = []  # local only; discarded when this call returns
+        primary_role_selected = False
         cursor = 0
         fhe_idx = 1
 
@@ -517,8 +619,12 @@ class BlindTokenizer:
                     ctx.plaintext_to_token[sp.raw_text] = token
                     ctx.token_to_plaintext[token] = sp.raw_text
 
-                if sp.category == "ID" and not ctx.primary_subject_token:
-                    ctx.primary_subject_token = token
+                if sp.category == "ID":
+                    if sp.is_role_subject and not primary_role_selected:
+                        ctx.primary_subject_token = token
+                        primary_role_selected = True
+                    elif not ctx.primary_subject_token:
+                        ctx.primary_subject_token = token
 
                 ctx.detected_pii_values.append(sp.raw_text)
                 out_parts.append(token)

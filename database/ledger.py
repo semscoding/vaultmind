@@ -52,7 +52,7 @@ class EncryptedLedger:
                 # Pre-chain ledger: its rows were sealed with AAD "action:target" and can
                 # never verify under the chained AAD. Keep them (renamed) instead of
                 # crashing or silently mixing schemes; start a fresh chained table.
-                legacy = f"sealed_transactions_legacy_{int(time.time())}"
+                legacy = f"sealed_transactions_legacy_{time.time_ns()}"
                 conn.execute(f"ALTER TABLE sealed_transactions RENAME TO {legacy}")
                 self.migration_note = (
                     f"Pre-hash-chain ledger moved to table '{legacy}'; a new chained ledger was started."

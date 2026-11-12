@@ -358,6 +358,105 @@ class TestPipelineRegressions(unittest.TestCase):
         self.assertEqual(outs["[FHE_COMPUTED_BONUS]"], "$16,250.00")
         self.assertEqual(outs["[FHE_COMPUTED_TOTAL]"], "$146,250.00")
 
+    def test_ordinary_business_prose_avoids_false_positives(self):
+        """M-R1: ordinary business/technical prose must not seal clauses as SECRET or misclassify units/standards."""
+        tok: BlindTokenizer = self.pipe.tokenizer
+
+        prose_cases = [
+            "De sleutel tot succes is goede samenwerking met onze klanten.",
+            "Het geheim van ons kwartaalresultaat is focus op kwaliteit, en niet op korting.",
+            "The pin on the map is red, while the badge on the door is green.",
+            "The password policy was updated last Tuesday; please check the handbook.",
+            "Remember that a password is never requested by support staff.",
+            "Our platform completed ISO27001 and SOC2TYPE2 audits in Q4FY2026.",
+        ]
+        for sentence in prose_cases:
+            with self.subTest(sentence=sentence):
+                blinded, ctx = tok.blind_prompt(sentence)
+                self.assertEqual(blinded, sentence)
+                self.assertEqual(len(ctx.sealed_secrets), 0)
+
+        # Storage/power/era suffixes must not be mistaken for Dutch postcodes
+        tech_blinded, tech_ctx = tok.blind_prompt(
+            "Upgrade protocol to OAUTH2 and RFC3526 using PYTHON3 with 2048 MB of RAM and 1024 GB disk."
+        )
+        self.assertNotIn("[LOC_", tech_blinded)
+        self.assertNotIn("[GOV_ID_", tech_blinded)
+        self.assertEqual(len(tech_ctx.sealed_secrets), 0)
+
+        # Real Dutch postcodes and real PINs/sleutel= still get blinded/sealed
+        nl_blinded, nl_ctx = tok.blind_prompt("Ship to 2511 AB; pin for the card is 4829, sleutel: TopGeheim99.")
+        self.assertNotIn("2511 AB", nl_blinded)
+        self.assertNotIn("4829", nl_blinded)
+        self.assertNotIn("TopGeheim99", nl_blinded)
+        self.assertEqual(len(nl_ctx.sealed_secrets), 2)
+
+        # Role-prefixed subject wins over Title-Case business nouns
+        _, subj_ctx = tok.blind_prompt("Review Annual Bonus and Balance Sheet for employee Marcus Vance today.")
+        self.assertEqual(subj_ctx.token_to_plaintext[subj_ctx.primary_subject_token], "Marcus Vance")
+        self.assertNotIn("Annual Bonus", subj_ctx.plaintext_to_token)
+        self.assertNotIn("Balance Sheet", subj_ctx.plaintext_to_token)
+
+
+class TestConcurrencyAndMigrationRegressions(unittest.TestCase):
+    def test_concurrent_enclave_seals_succeed_with_valid_hash_chain(self):
+        """S-R3: concurrent threads sealing intents retry cleanly on LedgerChainConflict."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            enclave = SecureEnclave(storage_dir=tmp, threshold=3, total_shares=5)
+            barrier = threading.Barrier(4)
+            results = []
+
+            def worker(idx: int):
+                barrier.wait()
+                results.append(
+                    enclave.execute_privileged_intent({"action": "DB_WRITE_RECORD", "target": f"[ID_{idx:08X}]"})
+                )
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(len(results), 4)
+            self.assertTrue(all(r.get("success") for r in results), results)
+            ver = enclave.verify_ledger_entries()
+            self.assertTrue(ver["verified"], ver)
+            self.assertEqual(ver["chain_length"], 4)
+
+    def test_legacy_ledger_double_migration_never_collides(self):
+        """S-R3: migrating a pre-chain table twice within the same millisecond uses distinct ns names."""
+        import sqlite3
+        from database.ledger import EncryptedLedger
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy.db")
+            for round_idx in range(2):
+                conn = sqlite3.connect(db_path)
+                conn.execute("DROP TABLE IF EXISTS sealed_transactions")
+                conn.execute(
+                    "CREATE TABLE sealed_transactions (id INTEGER PRIMARY KEY, action TEXT, target_token TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO sealed_transactions (action, target_token) VALUES (?, ?)",
+                    (f"OLD_{round_idx}", "SUBJ"),
+                )
+                conn.commit()
+                conn.close()
+                EncryptedLedger(db_path)
+
+            conn = sqlite3.connect(db_path)
+            legacy_tables = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sealed_transactions_legacy_%'"
+                ).fetchall()
+            ]
+            conn.close()
+            self.assertEqual(len(legacy_tables), 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

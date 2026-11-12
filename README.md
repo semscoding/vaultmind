@@ -193,8 +193,10 @@ All commands run from the repository root with the venv active. Test names refer
 | Provider failures become HTTP 502, key not echoed | `test_gemini_without_candidates_raises_provider_error`, `test_gemini_timeout_raises_provider_error`, `test_process_route_returns_502_on_provider_failure` |
 | Malformed LLM plan does not crash | `test_action_intent_as_string_does_not_raise`, `test_action_intent_string_from_llm_is_ignored_with_warning` |
 | Non-integer percentages are not truncated | `test_offline_engine_keeps_decimal_percent` |
+| Ordinary business prose avoids false-positive sealing | `test_ordinary_business_prose_avoids_false_positives` |
+| Concurrent ledger writes preserve hash-chain integrity | `test_concurrent_enclave_seals_succeed_with_valid_hash_chain` |
 | Dashboard makes no external requests | `grep -nE "https?://" frontend/static/index.html` → no output (Chart.js is in `frontend/static/vendor/`) |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 31 tests, OK |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 34 tests, OK |
 
 ---
 
@@ -229,7 +231,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (31 tests)
+# Run the test suite (34 tests)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -256,5 +258,5 @@ vaultmind/
 ├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / offline engine)
 ├── services/      # pipeline_service.py and enclave_service.py
 ├── monitoring/    # telemetry.py
-└── tests/         # test_security_audit.py and test_audit_regressions.py (31 tests)
+└── tests/         # test_security_audit.py and test_audit_regressions.py (34 tests)
 ```

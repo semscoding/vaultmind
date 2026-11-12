@@ -222,9 +222,18 @@ async def main_loop():
         phase3 = next(
             (p for p in result.get("audit_trail", []) if str(p.get("phase", "")).startswith("PHASE_3")), None
         )
+        warnings_seen = []
+        raw_warnings = list(result.get("llm_output_warnings") or [])
+        p3_warnings = ((phase3 or {}).get("details") or {}).get("llm_output_warnings") or []
+        for w in [*raw_warnings, *p3_warnings]:
+            w_str = str(w)
+            if w_str and w_str not in warnings_seen:
+                warnings_seen.append(w_str)
         parse_warning = ((phase3 or {}).get("details") or {}).get("parse_warning") or result.get("parse_warning")
-        if parse_warning:
-            fhe_line += f"\n[yellow]⚠ LLM output parse warning: {escape(str(parse_warning))}[/yellow]"
+        if parse_warning and str(parse_warning) not in warnings_seen:
+            warnings_seen.append(str(parse_warning))
+        for w_str in warnings_seen:
+            fhe_line += f"\n[yellow]⚠ LLM output warning: {escape(w_str)}[/yellow]"
 
         client_markup = (
             f"[bold green]Decrypted Client Verdict:[/bold green]\n\n"

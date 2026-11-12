@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.crypto.shamir import ShamirSecretSharing
-from database.ledger import EncryptedLedger
+from database.ledger import EncryptedLedger, LedgerChainConflict
 
 
 ALLOWED_ACTIONS = {
@@ -363,35 +363,44 @@ class SecureEnclave:
             }
 
         quorum: List[Dict[str, Any]] = []
+        max_chain_attempts = 5
         try:
-            seq, prev_hash = self.ledger.next_chain_position()
-            aad_bytes = self._ledger_aad(seq, prev_hash, action_name, target)
-            record_payload = json.dumps(
-                {
-                    "seq": seq,
-                    "action": action_name,
-                    "target": target,
-                    "params": params,
-                    "sealed_at": time.time(),
-                },
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
+            for attempt in range(max_chain_attempts):
+                quorum.clear()
+                seq, prev_hash = self.ledger.next_chain_position()
+                aad_bytes = self._ledger_aad(seq, prev_hash, action_name, target)
+                record_payload = json.dumps(
+                    {
+                        "seq": seq,
+                        "action": action_name,
+                        "target": target,
+                        "params": params,
+                        "sealed_at": time.time(),
+                    },
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
 
-            sealed, quorum, rejected_combos = self._seal_with_quorum_failover(
-                valid_shards, record_payload, aad_bytes
-            )
-            quorum_ids = [s["node_id"] for s in quorum]
-            row_id = self.ledger.append_sealed_entry(
-                action=action_name,
-                target_token=target,
-                quorum_nodes=quorum_ids,
-                iv_hex=sealed["iv_hex"],
-                ciphertext_hex=sealed["ciphertext_hex"],
-                hmac_hex=sealed["hmac_hex"],
-                seq=seq,
-                prev_hash=prev_hash,
-            )
+                sealed, quorum, rejected_combos = self._seal_with_quorum_failover(
+                    valid_shards, record_payload, aad_bytes
+                )
+                quorum_ids = [s["node_id"] for s in quorum]
+                try:
+                    row_id = self.ledger.append_sealed_entry(
+                        action=action_name,
+                        target_token=target,
+                        quorum_nodes=quorum_ids,
+                        iv_hex=sealed["iv_hex"],
+                        ciphertext_hex=sealed["ciphertext_hex"],
+                        hmac_hex=sealed["hmac_hex"],
+                        seq=seq,
+                        prev_hash=prev_hash,
+                    )
+                    break
+                except LedgerChainConflict:
+                    if attempt == max_chain_attempts - 1:
+                        raise
+                    continue
 
             receipt = {
                 "status": "SEALED_IN_SQLITE",
@@ -411,6 +420,8 @@ class SecureEnclave:
                 "timestamp": time.time(),
             }
             return {"success": True, "receipt": receipt}
+        except LedgerChainConflict as exc:
+            return {"success": False, "error": f"Ledger Concurrency Conflict: {exc}"}
         except Exception as exc:
             return {"success": False, "error": f"Native C Enclave Error: {exc}"}
         finally:

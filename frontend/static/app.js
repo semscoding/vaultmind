@@ -461,6 +461,9 @@ async function runPipeline() {
             }
             const e = new Error(msg);
             e.status = res.status;
+            if (payload && typeof payload === "object" && payload.wire_request) {
+                e.wireRequest = payload.wire_request;
+            }
             throw e;
         }
         if (!payload || typeof payload !== "object") {
@@ -587,10 +590,18 @@ async function runPipeline() {
         decryptedOutput.textContent = `❌ ${err.message}`;
         providerUsedTag.textContent = "Error";
         latencyBadge.classList.add("hidden");
-        wireOutput.className = "wire-code-block placeholder";
-        wireOutput.textContent = err.status === 502
-            ? "The provider returned an error, so no answer was used. Nothing was sealed."
-            : "No request completed.";
+        if (err.wireRequest && typeof err.wireRequest === "object") {
+            wireOutput.className = "wire-code-block";
+            wireOutput.textContent =
+                `// Provider returned HTTP ${err.status || 502}: no answer was used and nothing was sealed.\n` +
+                `// Actual outbound request transmitted (API key redacted):\n\n` +
+                JSON.stringify(err.wireRequest, null, 2);
+        } else {
+            wireOutput.className = "wire-code-block placeholder";
+            wireOutput.textContent = err.status === 502
+                ? "The provider returned an error, so no answer was used. Nothing was sealed."
+                : "No request completed.";
+        }
         resetLeakCheck("Leak check: no result");
     } finally {
         restoreRunButton(runBtn);
@@ -674,11 +685,18 @@ async function verifyLedger(showBanner = true) {
         if (showBanner) {
             banner.classList.remove("hidden");
             banner.classList.toggle("banner-bad", !data.verified);
+            const totalChecked = data.chain_length ?? (data.entries || []).length;
             if (data.verified) {
                 banner.textContent =
-                    `✔ C Enclave Constant-Time HMAC-SHA256 Verified across ${(data.entries || []).length} row(s) using quorum [${(data.quorum_used || []).join(", ")}].`;
+                    `✔ C Enclave Constant-Time HMAC-SHA256 Verified across ${totalChecked} row(s) using quorum [${(data.quorum_used || []).join(", ")}].`;
             } else {
-                banner.textContent = `❌ Ledger Verification Failed: ${data.error || "HMAC mismatch detected!"}`;
+                let failDetail = data.error;
+                if (!failDetail && Array.isArray(data.chain_errors) && data.chain_errors.length > 0) {
+                    const firstErr = data.chain_errors[0];
+                    const reasons = Array.isArray(firstErr.reasons) ? firstErr.reasons.join("; ") : String(firstErr.reasons || "");
+                    failDetail = `Row #${firstErr.id} (${reasons || "chain/HMAC mismatch"})`;
+                }
+                banner.textContent = `❌ Ledger Verification Failed: ${failDetail || "HMAC mismatch detected!"}`;
             }
         }
 
