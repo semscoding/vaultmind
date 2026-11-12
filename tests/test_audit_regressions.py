@@ -397,6 +397,62 @@ class TestPipelineRegressions(unittest.TestCase):
         self.assertNotIn("Annual Bonus", subj_ctx.plaintext_to_token)
         self.assertNotIn("Balance Sheet", subj_ctx.plaintext_to_token)
 
+    def test_credential_like_values_are_sealed_despite_prose_guards(self):
+        """B-R4: the prose guards must never let a credential-like value through (fail closed)."""
+        tok: BlindTokenizer = self.pipe.tokenizer
+        cases = [
+            ("Password reset: TempPass123!", ["TempPass123"]),
+            ("Password field: hunter2x", ["hunter2x"]),
+            ("wachtwoord veld = Geheim!23", ["Geheim"]),
+            ("The password is never-gonna-give-you-up", ["never-gonna", "give-you-up"]),
+            ("password is not-my-real-one!", ["not-my-real-one"]),
+            ("Het wachtwoord is niet-te-raden-99", ["niet-te-raden"]),
+            ("password hash is $2b$12$KIXQ4f8zR9vW", ["KIXQ4f8zR9vW", "$2b$"]),
+            ("Create the account; a password is Zomer2026x", ["Zomer2026x"]),
+            ("Er is een wachtwoord is Zomer2026x ingesteld", ["Zomer2026x"]),
+            ("De sleutel van de kluis is Kluis#4815", ["Kluis#", "4815"]),
+            ("Het geheim is Tulp-Molen-88", ["Tulp-Molen"]),
+            ("The pin is AB12CD", ["AB12CD"]),
+        ]
+        for prompt, forbidden in cases:
+            with self.subTest(prompt=prompt):
+                blinded, ctx = tok.blind_prompt(prompt)
+                for piece in forbidden:
+                    self.assertNotIn(piece, blinded)
+                self.assertGreaterEqual(len(ctx.sealed_secrets), 1)
+
+    def test_identifiers_and_surnames_are_not_exempted_as_business_terms(self):
+        """M-R4: only explicit standard codes are exempt; IDs and surnames after a role word are blinded."""
+        tok: BlindTokenizer = self.pipe.tokenizer
+        cases = [
+            ("policy number POLICY12 for the claim", ["POLICY12"]),
+            ("login SMITH42 and badge KLANT07", ["SMITH42", "KLANT07"]),
+            ("customer Q12345 and member H21987", ["Q12345", "H21987"]),
+            ("reference NISTX99812 and PCI4471902", ["NISTX99812", "PCI4471902"]),
+            ("ABCD12 arrived", ["ABCD12"]),
+            ("patient Cash and dr. Pool met employee Key", ["Cash", "Pool", "Key"]),
+            ("Send the file to Mr. Root", ["Root"]),
+            ("Stuur naar 3011 AD Rotterdam", ["3011 AD"]),
+        ]
+        for prompt, forbidden in cases:
+            with self.subTest(prompt=prompt):
+                blinded, _ = tok.blind_prompt(prompt)
+                for piece in forbidden:
+                    self.assertNotIn(piece, blinded)
+
+        # The explicit standard codes and business phrases stay untouched.
+        for sentence in [
+            "Our platform completed ISO27001 and SOC2TYPE2 audits in Q4FY2026.",
+            "Review Fiscal Year and Fiscal Quarter results.",
+            "We need 2048 MB of RAM for the build.",
+        ]:
+            with self.subTest(sentence=sentence):
+                blinded, ctx = tok.blind_prompt(sentence)
+                self.assertNotIn("[GOV_ID_", blinded)
+                self.assertNotIn("[ID_", blinded)
+                self.assertNotIn("[LOC_", blinded)
+                self.assertEqual(len(ctx.sealed_secrets), 0)
+
 
 class TestConcurrencyAndMigrationRegressions(unittest.TestCase):
     def test_concurrent_enclave_seals_succeed_with_valid_hash_chain(self):

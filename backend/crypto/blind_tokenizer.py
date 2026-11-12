@@ -75,12 +75,17 @@ ALNUM_STOPLIST = {
     "IPV4", "IPV6", "H264", "H265", "PKCS1", "PKCS7", "PKCS8", "PKCS11", "PKCS12",
     "CHACHA20", "POLY1305", "GF256", "BFV2048", "CRC32", "INT32", "INT64", "INT128",
     "UINT32", "UINT64", "UINT128", "FLOAT32", "FLOAT64", "ARM64", "X8664", "AMD64",
+    "PYTHON2", "PYTHON3", "OAUTH2", "HTTP11", "WEB3", "COVID19", "PCIDSS", "TLS12", "TLS13",
+    "LOG4J", "LOG4J2", "ARGON2", "ARGON2ID", "BCRYPT2", "SCRYPT2", "ECDSA256", "ECDSA384",
 }
+# Only explicit, well-known shapes are exempt (M-R4). A generic "letters + 1-2 digits" rule would
+# also exempt real identifiers such as POLICY12, SMITH42 or KLANT07, so there is none.
 _TECH_CODE_RE = re.compile(
-    r"^(?:ISO\d+|SOC\d[A-Z0-9]*|RFC\d+|IEEE\d+[A-Z0-9]*|NIST[A-Z0-9]*|GDPR\d*|HIPAA\d*"
-    r"|PCI[A-Z0-9]*|WCAG\d*[A-Z0-9]*|OWASP\d*|CVE\d+|CWE\d+|TLS\d+|SSL\d+|SSH\d*|HTTP\d+"
-    r"|OAUTH\d*|COVID\d+|ICD\d+[A-Z0-9]*|DSM\d+[A-Z0-9]*|Q[1-4](?:FY)?\d{2,4}|H[12](?:FY)?\d{2,4}"
-    r"|FY\d{2,4}|ERC\d+|BIP\d+|EIP\d+|[A-Z]{4,}\d{1,2})$"
+    r"^(?:ISO\d{3,6}|SOC[123](?:TYPE[12])?|RFC\d{3,5}|IEEE\d{3,5}[A-Z]{0,3}|NIST(?:SP)?\d{3}(?:R\d)?"
+    r"|GDPR\d{0,4}|HIPAA\d{0,4}|PCIDSS\d{0,2}|WCAG2[012]?A{0,3}|OWASP\d{0,4}|CVE\d{4,}|CWE\d{1,4}"
+    r"|TLS\d{1,2}|SSL\d{1,2}|SSH\d?|HTTP\d{1,2}|OAUTH\d?|ICD(?:9|10|11)(?:CM|PCS)?|DSM[45](?:TR)?"
+    r"|Q[1-4](?:FY)?(?:\d{2}|20\d{2})|H[12](?:FY)?(?:\d{2}|20\d{2})|FY(?:\d{2}|20\d{2})"
+    r"|ERC\d{2,4}|BIP\d{1,3}|EIP\d{1,4})$"
 )
 
 # Two-letter suffixes after 4 digits that denote units, eras, timezones or country/IT codes rather
@@ -102,9 +107,15 @@ BUSINESS_CAPITAL_NOUNS = {
     "Clinical", "Trial", "Budget", "Cloud", "Reserve", "Target", "Earnout", "Pool", "Project",
     "Audit", "Ledger", "Database", "System", "Security", "Policy", "Compliance", "Invoice",
     "Product", "Salary", "Contract", "Subsidy", "Adjustment", "Escalation", "Notice",
-    "Confidential", "Patient", "Record", "Transfer", "Authorization", "Account", " Fiscal",
+    "Confidential", "Patient", "Record", "Transfer", "Authorization", "Account", "Fiscal",
     "Quarter", "Year", "Revenue", "Profit", "Margin", "Tax", "Credit", "Debit", "Total", "Cost",
 }
+
+
+# Words from the list above that are also common surnames. After a role word ("patient Cash",
+# "employee Key") they are treated as a name, not as business terminology (M-R4).
+SURNAME_CAPABLE_NOUNS = {"Cash", "Key", "Pool", "Root"}
+_TITLE_PREFIX_RE = re.compile(r"(?i:\b(?:mr|mrs|ms|dr|dhr|mevr)\.?\s+)$")
 
 
 def _char_class(pred) -> str:
@@ -164,6 +175,29 @@ _VALUE = (
 _PROSE_VALUE = (
     r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
     r"|" + _PROSE_PREDICATE_GUARD + r"([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+)
+# Fail-closed override (B-R4): a value whose FIRST token looks like a credential rather than a word
+# is always sealed, whatever the prose guards above say. "Credential-like" means: it mixes a digit
+# with another character, or contains a typical credential symbol, or has `!`/`?` inside the token,
+# or consists of three or more hyphen-joined parts (never-gonna-give-you-up).
+_TOK = r"[^\s,;)\]\"']"
+_STRONG_FIRST = (
+    rf"(?=(?:{_TOK}*\d{_TOK}*[^\s\d,;)\]\"'.!?]{_TOK}*"
+    rf"|{_TOK}*[^\s\d,;)\]\"']{_TOK}*\d{_TOK}*"
+    rf"|{_TOK}*[@#$%^&*_+~=/\\|]{_TOK}*"
+    rf"|{_TOK}*[!?]{_TOK}*[^\W_]{_TOK}*"
+    r"|[^\s,;)\]\"'-]+(?:-[^\s,;)\]\"'-]+){2,}))"
+)
+_STRONG_VALUE = (
+    r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
+    r"|" + _STRONG_FIRST + r"([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+)
+# One credential-like token after a generic word in prose ("De sleutel van de kluis is Kluis#4815"):
+# at least 4 characters and either digit+letter mixed or a credential symbol. Pure numbers are left
+# to the amount detector; plain words ("...is goede samenwerking") are left alone.
+_GENERIC_STRONG_TOKEN = (
+    rf"((?={_TOK}{{4,}})(?:{_TOK}*\d{_TOK}*[^\W\d_]{_TOK}*|{_TOK}*[^\W\d_]{_TOK}*\d{_TOK}*"
+    rf"|{_TOK}*[@#$%^&*_+~=/\\|]{_TOK}*))"
 )
 # Digits in the NL format "1.234,56", multiple dot groups "1.234.567", EN "130,000.50",
 # NL decimal "14,2", or plain "4.9". `1.234` alone is ambiguous and parsed as EN decimal.
@@ -330,6 +364,24 @@ class BlindTokenizer:
         ):
             candidates.append(self._labelled_value_span(m, 1, priority=1))
 
+        # Fail-closed overrides (B-R4): a credential-like value is sealed even after a policy noun
+        # ("Password reset: TempPass123!"), a prose predicate ("password is not-my-real-one!") or an
+        # indefinite article ("a password is Zomer2026x").
+        for m in re.finditer(
+            rf"(?i:\b{SECRET_LABELS}{_GAP}(?:{_SEP_EQ}|{_SEP_PROSE}))" + _STRONG_VALUE, prompt
+        ):
+            candidates.append(self._labelled_value_span(m, 1, priority=1))
+        for m in re.finditer(
+            rf"(?i:\b(?:sleutel|geheim|pin|secret|key|token|seed){_GAP}{_SEP_PROSE})" + _GENERIC_STRONG_TOKEN,
+            prompt,
+        ):
+            val, end = m.group(1), m.end(1)
+            while len(val) > 1 and val[-1] in ".!?" and (end >= len(prompt) or prompt[end].isspace()):
+                val, end = val[:-1], end - 1
+            if val.upper() in ALNUM_STOPLIST or _TECH_CODE_RE.fullmatch(val.upper()):
+                continue
+            candidates.append(SpanMatch(m.start(1), end, "SECRET", val, priority=1, unseal_value=val))
+
         # Priority 1B: Single-word generic labels with ':' or '=', plus numeric/quoted PIN in prose
         for m in re.finditer(r"(?i:\b(?:secret|token|key|seed|pin|geheim|sleutel)\s*(?:=|:)\s*)" + _VALUE, prompt):
             candidates.append(self._labelled_value_span(m, 1, priority=1))
@@ -405,9 +457,19 @@ class BlindTokenizer:
             candidates.append(SpanMatch(m.start(), m.end(), "GOV_ID", m.group(0), priority=4))
 
         # Priority 4: Dutch postcode (2511AB / 2511 AB), excluding storage/power/date units (M-R1)
+        # A unit-like suffix is still a postcode when a capitalised place name follows ("3011 AD
+        # Rotterdam") or an address word precedes it ("adres ... 2595 BE") (S-R7).
         for m in re.finditer(r"\b[1-9]\d{3}\s?[A-Z]{2}\b", prompt):
-            if m.group(0)[-2:] not in POSTCODE_UNIT_STOPLIST:
-                candidates.append(SpanMatch(m.start(), m.end(), "LOC", m.group(0), priority=4))
+            is_unit = m.group(0)[-2:] in POSTCODE_UNIT_STOPLIST
+            if is_unit:
+                followed_by_place = re.match(rf"\s+[{_UP}][{_LO}]{{2,}}", prompt[m.end():]) is not None
+                address_cue = re.search(
+                    r"(?i:\b(?:postcode|zip|adres|address|straat|street|woont|lives)\b)",
+                    prompt[max(0, m.start() - 40) : m.start()],
+                ) is not None
+                if not (followed_by_place or address_cue):
+                    continue
+            candidates.append(SpanMatch(m.start(), m.end(), "LOC", m.group(0), priority=4))
 
         # Priority 5: Mixed alphanumeric IDs (passport NX4K2P881, A123456): upper-case letters + digits
         for m in re.finditer(
@@ -464,9 +526,13 @@ class BlindTokenizer:
             prompt,
         ):
             word = m.group(1)
+            # After a personal title (mr/dr/dhr/mevr) the next capitalised word is always a name.
+            # After a role noun, business nouns are skipped unless they are also common surnames.
+            after_title = _TITLE_PREFIX_RE.search(prompt[: m.start(1)]) is not None
+            is_business_noun = word in BUSINESS_CAPITAL_NOUNS and word not in SURNAME_CAPABLE_NOUNS
             if (
                 word not in STOPWORD_CAPITALS
-                and word not in BUSINESS_CAPITAL_NOUNS
+                and (after_title or not is_business_noun)
                 and word.upper() not in CURRENCY_CODES
             ):
                 candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6, is_role_subject=True))

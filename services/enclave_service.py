@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import json
 import os
+import random
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -400,6 +401,8 @@ class SecureEnclave:
                 except LedgerChainConflict:
                     if attempt == max_chain_attempts - 1:
                         raise
+                    # Short randomised backoff so concurrent writers stop colliding on the same head.
+                    time.sleep(random.uniform(0.002, 0.02) * (attempt + 1))
                     continue
 
             receipt = {

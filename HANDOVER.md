@@ -116,7 +116,7 @@ cd /Users/sem/.gemini/antigravity/scratch/vaultmind
 ./venv/bin/python3 backend/native/build.py
 nm -u backend/native/libvaultcrypto.dylib | grep memset_s
 
-# 2. Full test suite: 34 tests
+# 2. Full test suite: 36 tests
 ./venv/bin/python3 -m unittest discover -s tests -v
 
 # 3. Smoke-test the TUI
