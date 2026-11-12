@@ -6,7 +6,14 @@
 
     --text-primary: #F8FAFC;
     --text-secondary: #94A3B8;
-    --text-muted: #64748B;
+    /* was #64748B (3.8:1 on cards); raised to >= 5:1 for WCAG AA */
+    --text-muted: #7C8BA1;
+
+    /* System font stacks: no external font requests (M10) */
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+    --focus-ring: #67E8F9;
 
     --green-accent: #10B981;
     --green-glow: rgba(16, 185, 129, 0.25);
@@ -16,6 +23,9 @@
 
     --purple-accent: #8B5CF6;
     --purple-glow: rgba(139, 92, 246, 0.25);
+    /* Text-only purple/red: the accents fall below 4.5:1 on tinted backgrounds */
+    --purple-text: #A78BFA;
+    --red-text: #FCA5A5;
 
     --red-accent: #EF4444;
     --red-glow: rgba(239, 68, 68, 0.3);
@@ -30,7 +40,7 @@
 }
 
 body {
-    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: var(--font-sans);
     background-color: var(--bg-main);
     color: var(--text-primary);
     line-height: 1.5;
@@ -80,7 +90,7 @@ body {
 }
 
 .v-tag {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
     color: var(--cyan-accent);
     background: rgba(6, 182, 212, 0.15);
@@ -94,7 +104,7 @@ body {
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: var(--purple-accent);
+    color: var(--purple-text);
 }
 
 .enclave-badge {
@@ -105,7 +115,7 @@ body {
     border-radius: 9999px;
     background: rgba(16, 185, 129, 0.1);
     border: 1px solid rgba(16, 185, 129, 0.3);
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
     color: var(--green-accent);
 }
@@ -183,13 +193,13 @@ select:focus, input:focus, textarea:focus {
 }
 
 .telemetry-card .value {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.88rem;
     font-weight: 600;
 }
 
 .value.green { color: var(--green-accent); }
-.value.purple { color: var(--purple-accent); }
+.value.purple { color: var(--purple-text); }
 .value.cyan { color: var(--cyan-accent); }
 
 .scenario-bar {
@@ -256,7 +266,7 @@ select:focus, input:focus, textarea:focus {
     gap: 0.5rem;
 }
 
-.panel-header h3 {
+.panel-header h2 {
     font-size: 1rem;
     font-weight: 700;
     color: #FFF;
@@ -264,7 +274,7 @@ select:focus, input:focus, textarea:focus {
 }
 
 .panel-tag {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.64rem;
     font-weight: 700;
     text-transform: uppercase;
@@ -276,7 +286,7 @@ select:focus, input:focus, textarea:focus {
 
 .tag-client { background: rgba(16, 185, 129, 0.15); color: var(--green-accent); border: 1px solid rgba(16, 185, 129, 0.3); }
 .tag-wire { background: rgba(6, 182, 212, 0.15); color: var(--cyan-accent); border: 1px solid rgba(6, 182, 212, 0.3); }
-.tag-vault { background: rgba(139, 92, 246, 0.15); color: var(--purple-accent); border: 1px solid rgba(139, 92, 246, 0.3); }
+.tag-vault { background: rgba(139, 92, 246, 0.15); color: var(--purple-text); border: 1px solid rgba(139, 92, 246, 0.3); }
 
 .input-container {
     display: flex;
@@ -306,7 +316,7 @@ textarea#promptInput {
 }
 
 .btn-primary {
-    background: linear-gradient(135deg, #10B981, #059669);
+    background: linear-gradient(135deg, #047857, #065F46); /* darker for 5.5:1 white text */
     border: none;
     border-radius: 8px;
     color: #FFF;
@@ -342,7 +352,7 @@ textarea#promptInput {
 }
 
 .latency-badge {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.74rem;
     background: rgba(16, 185, 129, 0.1);
     color: var(--green-accent);
@@ -358,7 +368,7 @@ textarea#promptInput {
     border: 1px solid rgba(6, 182, 212, 0.35);
     border-radius: 8px;
     padding: 0.65rem 0.8rem;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.74rem;
     color: #A5F3FC;
     line-height: 1.45;
@@ -386,7 +396,7 @@ textarea#promptInput {
 .secure-tag {
     font-size: 0.65rem;
     color: var(--green-accent);
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
 }
 
 .content-output {
@@ -413,11 +423,11 @@ textarea#promptInput {
     font-size: 0.68rem;
     font-weight: 700;
     color: var(--cyan-accent);
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
 }
 
 .wire-code-block {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.78rem;
     color: #CFFAFE;
     background: rgba(6, 182, 212, 0.05);
@@ -460,7 +470,7 @@ textarea#promptInput {
     justify-content: space-between;
     align-items: center;
     gap: 0.5rem;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
     padding: 0.3rem 0.5rem;
     background: rgba(255, 255, 255, 0.03);
@@ -491,7 +501,7 @@ textarea#promptInput {
     flex-direction: column;
     align-items: center;
     gap: 0.22rem;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.62rem;
     transition: all 0.25s;
 }
@@ -523,7 +533,7 @@ textarea#promptInput {
     background: rgba(239, 68, 68, 0.16);
     border: 1px solid rgba(239, 68, 68, 0.45);
     color: #FCA5A5;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.58rem;
     padding: 0.14rem 0.32rem;
     border-radius: 4px;
@@ -542,7 +552,7 @@ textarea#promptInput {
 }
 
 .receipt-content {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
     color: #CBD5E1;
     line-height: 1.45;
@@ -575,14 +585,14 @@ textarea#promptInput {
     flex-wrap: wrap;
 }
 
-.fhe-header h3 {
+.fhe-header h2 {
     font-size: 0.95rem;
     font-weight: 700;
     color: var(--cyan-accent);
 }
 
 .fhe-formula {
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.74rem;
     color: var(--text-secondary);
     background: rgba(6, 182, 212, 0.1);
@@ -638,7 +648,7 @@ textarea#promptInput {
     border: 1px solid rgba(6, 182, 212, 0.3);
     border-radius: 8px;
     padding: 0.65rem 0.9rem;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
     color: #A5F3FC;
     line-height: 1.55;
@@ -652,7 +662,7 @@ textarea#promptInput {
 .ledger-table {
     width: 100%;
     border-collapse: collapse;
-    font-family: 'Fira Code', monospace;
+    font-family: var(--font-mono);
     font-size: 0.7rem;
 }
 
@@ -680,4 +690,115 @@ textarea#promptInput {
     .workspace-grid, .bottom-grid, .telemetry-bar {
         grid-template-columns: 1fr;
     }
+}
+
+/* ---- Accessibility & honesty additions (audit B1, M3, S13) ---- */
+.visually-hidden {
+    position: absolute !important;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.app-main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+}
+
+:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+}
+
+select:focus-visible, input:focus-visible, textarea:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+}
+
+.btn-primary:disabled {
+    cursor: progress;
+    opacity: 0.85;
+}
+
+.input-hint {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    line-height: 1.4;
+}
+
+.input-hint code {
+    font-family: var(--font-mono);
+    color: var(--amber-accent);
+}
+
+.wire-lock.leak-ok { color: var(--green-accent); }
+.wire-lock.leak-bad { color: var(--red-text); }
+.wire-lock.leak-unknown { color: var(--text-secondary); }
+
+.leak-status {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    border-radius: 6px;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+
+.leak-status strong { font-weight: 700; }
+
+.leak-status.leak-ok {
+    border-color: rgba(16, 185, 129, 0.35);
+    background: rgba(16, 185, 129, 0.08);
+}
+.leak-status.leak-ok strong { color: var(--green-accent); }
+
+.leak-status.leak-bad {
+    border-color: rgba(239, 68, 68, 0.5);
+    background: rgba(239, 68, 68, 0.12);
+}
+.leak-status.leak-bad strong { color: var(--red-text); }
+
+.wire-section-label {
+    color: var(--cyan-accent);
+    font-weight: 700;
+}
+
+.wire-local-only {
+    color: var(--green-accent);
+    font-weight: 700;
+}
+
+.parse-warning {
+    font-size: 0.74rem;
+    color: #FCD34D;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 6px;
+    padding: 0.45rem 0.6rem;
+    white-space: pre-wrap;
+}
+
+.ledger-banner.banner-bad {
+    border-color: rgba(239, 68, 68, 0.5);
+    color: var(--red-text);
+}
+
+.ledger-reason {
+    display: block;
+    color: var(--red-text);
+    font-size: 0.66rem;
+    white-space: normal;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .pulse-dot { animation: none; }
+    * { transition: none !important; }
 }

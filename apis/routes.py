@@ -1,16 +1,21 @@
 """
 API Router Module (`apis/routes.py`).
 Exposes REST endpoints for Zero-Knowledge Pipeline execution, Host LLM Config detection,
-Dual-Field 2048-bit Feldman VSS shard inspection/tampering, 1024-bit Paillier PHE math,
-128-bit Lattice Security Native C RLWE-BFV FHE (N=2048) multiplication,
-SQLite HMAC verification, and real-time Security Telemetry Monitoring.
+Dual-Field 2048-bit Feldman VSS shard inspection/tampering, Paillier additive HE math,
+Native C RLWE-BFV (leveled, depth 1; N=2048, log q=54) multiplication,
+hash-chained SQLite HMAC verification, and real-time Security Telemetry Monitoring.
+
+Error contract for /api/process: missing API key / bad input -> 400,
+cloud provider failure -> 502, anything else -> 500. `detail` is always a string;
+502 adds `error`, `provider_status_code` and `wire_request` (credential redacted).
 """
 
 from typing import Optional
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from apis.llm_client import LLMClient
+from apis.llm_client import LLMClient, LLMProviderError
 from backend.crypto.bfv_fhe import BFV_T
 from services.pipeline_service import AgentPipeline
 
@@ -81,13 +86,36 @@ async def process_prompt_endpoint(req: ProcessPromptRequest):
             provider=req.provider or "auto",
             api_key=req.api_key,
         )
-    except (ValueError, RuntimeError) as exc:
+    except LLMProviderError as exc:
+        pipeline.monitor.record_event("WARNING", "llm_provider", f"Cloud provider call failed: {exc}"[:300])
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": str(exc),
+                "error": "LLM_PROVIDER_ERROR",
+                "provider_status_code": exc.status_code,
+                "wire_request": exc.wire_request,
+            },
+        )
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001 - last-resort net: never a bare 500
+        pipeline.monitor.record_event(
+            "CRITICAL", "pipeline", f"Unhandled pipeline error ({type(exc).__name__})."
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": f"Local pipeline error ({type(exc).__name__}); details withheld to avoid echoing plaintext.",
+                "error": "PIPELINE_INTERNAL_ERROR",
+                "type": type(exc).__name__,
+            },
+        )
 
 
 @router.post("/homomorphic-calc")
 async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
-    """1024-bit Paillier Additive Homomorphic Encryption (PHE) over Z_{n^2}^*."""
+    """Paillier Additive Homomorphic Encryption (PHE) over Z_{n^2}^* (modulus size: see `modulus_bits`)."""
     paillier = pipeline.tokenizer.paillier
     evaluator = pipeline.tokenizer.evaluator
 
@@ -99,22 +127,21 @@ async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
     except (ValueError, OverflowError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pipeline.monitor.total_fhe_computations += 1
-    pipeline.monitor.record_event(
-        "INFO",
+    n_bits = paillier.n.bit_length()
+    pipeline.monitor.record_homomorphic_computation(
         "paillier_phe",
-        f"Evaluated 1024-bit Paillier PHE ciphertext addition ({paillier.n.bit_length()} bits).",
+        f"Evaluated {n_bits}-bit Paillier PHE ciphertext addition (operands not logged).",
     )
 
     return {
-        "scheme": "1024-bit Paillier Additive Homomorphic Encryption (PHE)",
+        "scheme": f"{n_bits}-bit Paillier Additive Homomorphic Encryption (PHE)",
         "modulus_bits": paillier.n.bit_length(),
         "val1": req.val1,
         "val2": req.val2,
         "c1_hex": f"{hex(c1)[:20]}...{hex(c1)[-8:]}",
         "c2_hex": f"{hex(c2)[:20]}...{hex(c2)[-8:]}",
         "c_sum_hex": f"{hex(c_sum)[:20]}...{hex(c_sum)[-8:]}",
-        "operation": "c_sum = (c1 · c2) mod n^2  [1024-bit Paillier PHE]",
+        "operation": f"c_sum = (c1 · c2) mod n^2  [{n_bits}-bit Paillier PHE]",
         "decrypted_sum": round(decrypted_sum, 4),
         "mathematical_proof": f"D(E({req.val1}) · E({req.val2}) mod n^2) = {decrypted_sum:g}",
     }
@@ -123,8 +150,9 @@ async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
 @router.post("/bfv-fhe-calc")
 async def bfv_fhe_calc_endpoint(req: BFVCalcRequest):
     """
-    128-bit Lattice Security Ring-LWE BFV FHE in Native C (`libvaultcrypto.dylib`)
-    over R_q = Z_{2^54}[X] / (X^2048 + 1) (HomomorphicEncryption.org Table 1).
+    RLWE-BFV (leveled, depth 1) in Native C (`libvaultcrypto.dylib`)
+    over R_q = Z_{2^54}[X] / (X^2048 + 1): N=2048, log q=54 (HE-standard classical-128
+    size row), ternary errors.
     Uses overflow-free base-256 limb multiplication for arbitrary 32-bit integers [0, 2^32 - 1].
     """
     if not (0 <= req.m1 <= 0xFFFFFFFF and 0 <= req.m2 <= 0xFFFFFFFF):
@@ -145,15 +173,13 @@ async def bfv_fhe_calc_endpoint(req: BFVCalcRequest):
     ct_add = bfv.evaluator.add(ct1_single, ct2_single)
     dec_add = bfv.decrypt_int(ct_add)
 
-    pipeline.monitor.total_fhe_computations += 1
-    pipeline.monitor.record_event(
-        "INFO",
-        "bfv_lattice_fhe",
-        f"Evaluated N=2048 128-bit PQ RLWE-BFV ciphertext × ciphertext product ({req.m1} * {req.m2} = {dec_mul_exact}).",
+    pipeline.monitor.record_homomorphic_computation(
+        "bfv_rlwe",
+        "Evaluated N=2048 RLWE-BFV (leveled, depth 1) ciphertext × ciphertext product (operands not logged).",
     )
 
     return {
-        "scheme": "Native C 128-bit Lattice Security Ring-LWE BFV FHE",
+        "scheme": "Native C RLWE-BFV (leveled, depth 1)",
         "ring": "R_q = Z_{2^54}[X] / (X^2048 + 1), t = 65536",
         "m1": req.m1,
         "m2": req.m2,
@@ -183,7 +209,10 @@ async def get_monitoring_health():
         "native_c_enclave": "ACTIVE",
         "quorum_healthy": vault_st["quorum_healthy"],
         "paillier_phe_modulus_bits": pipeline.tokenizer.paillier.n.bit_length(),
-        "bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]",
+        "bfv_fhe_ring": (
+            "Z_{2^54}[X]/(X^2048 + 1) [RLWE-BFV (leveled, depth 1); N=2048, log q=54, "
+            "HE-standard classical-128 size row, ternary errors]"
+        ),
         "llm_env": LLMClient.get_env_config(),
         "telemetry": pipeline.monitor.snapshot(),
     }

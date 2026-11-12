@@ -2,8 +2,15 @@
 External Cloud LLM API Connectors:
 - Google Gemini 2.5 Flash (`GEMINI_API_KEY`)
 - OpenAI GPT-4o-mini (`OPENAI_API_KEY`)
-- AWS Bedrock Converse API (`AWS_BEARER_TOKEN_BEDROCK`)
+- AWS Bedrock Converse API (`AWS_BEARER_TOKEN_BEDROCK`); default model
+  `amazon.nova-lite-v1:0` (Amazon Nova Lite), override with `AWS_BEDROCK_MODEL_ID`
+  (e.g. a Claude model ID enabled in your Bedrock account)
 - Offline Deterministic Zero-Knowledge Engine (air-gapped fallback / CI testing)
+
+Every result carries `wire_request`: the request that actually left this machine
+(method, URL, headers with the credential redacted, exact JSON body incl. system prompt).
+All provider failures (network, HTTP status, malformed/blocked responses) raise
+`LLMProviderError`, whose message never contains the API key.
 
 Automatically loads project-root `.env` on import without external dependencies.
 """
@@ -11,8 +18,28 @@ Automatically loads project-root `.env` on import without external dependencies.
 import json
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import httpx
+
+
+class LLMProviderError(RuntimeError):
+    """A cloud LLM provider call failed (network, HTTP status, or unusable response)."""
+
+    def __init__(self, message: str, wire_request: Optional[Dict[str, Any]] = None,
+                 status_code: Optional[int] = None):
+        super().__init__(message)
+        self.wire_request = wire_request
+        self.status_code = status_code
+
+
+OFFLINE_WIRE_REQUEST: Dict[str, Any] = {
+    "method": None,
+    "url": None,
+    "body": None,
+    "note": "Offline deterministic engine: nothing left this machine.",
+}
+
+HTTP_TIMEOUT_SECONDS = 30.0
 
 
 def load_dotenv_if_present(dotenv_path: Optional[str] = None) -> None:
@@ -42,7 +69,7 @@ load_dotenv_if_present()
 SYSTEM_PROMPT = """You are VaultMind Zero-Knowledge Autonomous Agent.
 SECURITY INVARIANTS:
 1. Sensitive identifiers and secrets are blinded tokens: [ID_XXXX], [IBAN_XXXX], [GOV_ID_XXXX], [EMAIL_XXXX], [LOC_XXXX], [SECRET_XXXX].
-2. Sensitive numbers are encrypted ciphertexts: [FHE_NUM_1], [FHE_NUM_2], etc. (1024-bit Paillier PHE + Lattice RLWE-BFV FHE).
+2. Sensitive numbers are encrypted ciphertexts: [FHE_NUM_1], [FHE_NUM_2], etc. (Paillier additive HE + RLWE-BFV, leveled, depth 1).
 3. You hold ZERO shares of any master key and cannot access plaintext PII, passwords, or numbers.
 
 INSTRUCTIONS:
@@ -141,7 +168,86 @@ class LLMClient:
 
         return self._run_deterministic_engine(blinded_prompt)
 
+    # ------------------------------------------------------------------
+    # Provider transport
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wire_request(url: str, headers: Dict[str, str], payload: Dict[str, Any],
+                      secret_header: str) -> Dict[str, Any]:
+        redacted = {
+            k: ("<redacted>" if k.lower() == secret_header.lower() else v) for k, v in headers.items()
+        }
+        return {"method": "POST", "url": url, "headers_redacted": redacted, "body": payload}
+
+    @staticmethod
+    def _scrub(text: str, secret: str) -> str:
+        text = str(text)
+        if secret:
+            text = text.replace(secret, "<redacted>")
+        return text
+
+    async def _post_json(self, label: str, url: str, headers: Dict[str, str],
+                         payload: Dict[str, Any], secret: str,
+                         wire: Dict[str, Any]) -> Any:
+        """POST `payload`; return parsed JSON or raise LLMProviderError (never leaks `secret`)."""
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+                res = await client.post(url, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            raise LLMProviderError(
+                f"{label}: request timed out after {HTTP_TIMEOUT_SECONDS:.0f}s ({type(exc).__name__}).",
+                wire_request=wire,
+            ) from None
+        except httpx.HTTPError as exc:
+            raise LLMProviderError(
+                f"{label}: network error ({type(exc).__name__}: {self._scrub(exc, secret)[:200]}).",
+                wire_request=wire,
+            ) from None
+
+        if res.status_code != 200:
+            hint = " (rate limited / quota exceeded)" if res.status_code == 429 else ""
+            raise LLMProviderError(
+                f"{label} API error (HTTP {res.status_code}){hint}: {self._scrub(res.text, secret)[:240]}",
+                wire_request=wire,
+                status_code=res.status_code,
+            )
+        try:
+            return res.json()
+        except ValueError:
+            raise LLMProviderError(
+                f"{label}: response body is not valid JSON: {self._scrub(res.text, secret)[:160]}",
+                wire_request=wire,
+                status_code=res.status_code,
+            ) from None
+
+    @staticmethod
+    def _extract_gemini_text(data: Any) -> str:
+        if not isinstance(data, dict):
+            raise LLMProviderError("Gemini 2.5 Flash: response is not a JSON object.")
+        candidates = data.get("candidates")
+        feedback = data.get("promptFeedback") or {}
+        if not candidates:
+            block = feedback.get("blockReason") if isinstance(feedback, dict) else None
+            if block:
+                raise LLMProviderError(f"Gemini 2.5 Flash blocked the prompt (promptFeedback.blockReason={block}).")
+            raise LLMProviderError("Gemini 2.5 Flash returned no candidates.")
+        try:
+            cand = candidates[0]
+            finish = cand.get("finishReason")
+            parts = (cand.get("content") or {}).get("parts") or []
+            texts = [p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise LLMProviderError(f"Gemini 2.5 Flash: unexpected response shape ({type(exc).__name__}).") from None
+        text = "".join(texts)
+        if not text.strip():
+            if finish and finish != "STOP":
+                why = " (blocked by Gemini safety filters)" if finish in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII") else ""
+                raise LLMProviderError(f"Gemini 2.5 Flash returned no text: finishReason={finish}{why}.")
+            raise LLMProviderError("Gemini 2.5 Flash returned an empty candidate (no content.parts text).")
+        return text
+
     async def _call_gemini(self, blinded_prompt: str, api_key: str) -> Dict[str, Any]:
+        label = "Gemini 2.5 Flash"
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         payload = {
@@ -149,19 +255,21 @@ class LLMClient:
             "contents": [{"role": "user", "parts": [{"text": blinded_prompt}]}],
             "generationConfig": {"temperature": 0.1},
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(url, headers=headers, json=payload)
-            if res.status_code != 200:
-                raise RuntimeError(
-                    f"Gemini 2.5 Flash API error (HTTP {res.status_code}): {res.text[:240]}"
-                )
-            data = res.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return self._parse_structured_output(
-                text, provider_label="Google Gemini 2.5 Flash (Live Cloud API)", is_live=True
-            )
+        wire = self._wire_request(url, headers, payload, "x-goog-api-key")
+        data = await self._post_json(label, url, headers, payload, api_key, wire)
+        try:
+            text = self._extract_gemini_text(data)
+        except LLMProviderError as exc:
+            exc.wire_request = wire
+            raise
+        result = self._parse_structured_output(
+            text, provider_label="Google Gemini 2.5 Flash (Live Cloud API)", is_live=True
+        )
+        result["wire_request"] = wire
+        return result
 
     async def _call_openai(self, blinded_prompt: str, api_key: str) -> Dict[str, Any]:
+        label = "OpenAI GPT-4o-mini"
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {
@@ -172,21 +280,28 @@ class LLMClient:
                 {"role": "user", "content": blinded_prompt},
             ],
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(url, headers=headers, json=payload)
-            if res.status_code != 200:
-                raise RuntimeError(
-                    f"OpenAI API error (HTTP {res.status_code}): {res.text[:240]}"
-                )
-            data = res.json()
-            text = data["choices"][0]["message"]["content"]
-            return self._parse_structured_output(
-                text, provider_label="OpenAI GPT-4o-mini (Live Cloud API)", is_live=True
-            )
+        wire = self._wire_request(url, headers, payload, "Authorization")
+        data = await self._post_json(label, url, headers, payload, api_key, wire)
+        try:
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
+            if not isinstance(text, str) or not text.strip():
+                raise TypeError(f"empty content (finish_reason={choice.get('finish_reason')})")
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise LLMProviderError(
+                f"{label}: unusable response ({type(exc).__name__}: {self._scrub(exc, api_key)[:160]}).",
+                wire_request=wire,
+            ) from None
+        result = self._parse_structured_output(
+            text, provider_label="OpenAI GPT-4o-mini (Live Cloud API)", is_live=True
+        )
+        result["wire_request"] = wire
+        return result
 
     async def _call_bedrock(self, blinded_prompt: str, bearer_token: str) -> Dict[str, Any]:
         region = os.getenv("AWS_REGION", "us-east-1").strip()
         model_id = os.getenv("AWS_BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0").strip()
+        label = f"AWS Bedrock ({model_id})"
         url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
         headers = {"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"}
         payload = {
@@ -194,17 +309,23 @@ class LLMClient:
             "messages": [{"role": "user", "content": [{"text": blinded_prompt}]}],
             "inferenceConfig": {"temperature": 0.1},
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(url, headers=headers, json=payload)
-            if res.status_code != 200:
-                raise RuntimeError(
-                    f"AWS Bedrock API error (HTTP {res.status_code}): {res.text[:240]}"
-                )
-            data = res.json()
-            text = data["output"]["message"]["content"][0]["text"]
-            return self._parse_structured_output(
-                text, provider_label=f"AWS Bedrock ({model_id} Live Cloud API)", is_live=True
-            )
+        wire = self._wire_request(url, headers, payload, "Authorization")
+        data = await self._post_json(label, url, headers, payload, bearer_token, wire)
+        try:
+            blocks = data["output"]["message"]["content"]
+            text = "".join(b["text"] for b in blocks if isinstance(b, dict) and "text" in b)
+            if not text.strip():
+                raise TypeError(f"empty content (stopReason={data.get('stopReason')})")
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise LLMProviderError(
+                f"{label}: unusable response ({type(exc).__name__}: {self._scrub(exc, bearer_token)[:160]}).",
+                wire_request=wire,
+            ) from None
+        result = self._parse_structured_output(
+            text, provider_label=f"AWS Bedrock ({model_id} Live Cloud API)", is_live=True
+        )
+        result["wire_request"] = wire
+        return result
 
     def _run_deterministic_engine(self, blinded_prompt: str) -> Dict[str, Any]:
         lower = blinded_prompt.lower()
@@ -219,9 +340,14 @@ class LLMClient:
         primary_target = person_or_org or iban_tok or gov_tok or "[SYSTEM_RECORD]"
 
         fhe_compute: Optional[Dict[str, Any]] = None
-        pct_match = re.search(r"\b(\d{1,3})%(?!\w)", blinded_prompt)
+        # Accepts integer and decimal percentages ("15%", "12.5%", "12,5%"); the evaluator
+        # takes non-integer percents, so the value is passed as a number, not truncated.
+        pct_match = re.search(r"(?<![\d.,])(\d{1,3}(?:[.,]\d{1,4})?)\s?%(?!\w)", blinded_prompt)
         if "bonus" in lower and fhe_tokens:
-            pct = int(pct_match.group(1)) if pct_match else 15
+            pct: Any = 15
+            if pct_match:
+                pct_text = pct_match.group(1).replace(",", ".")
+                pct = float(pct_text) if "." in pct_text else int(pct_text)
             fhe_compute = {"op": "PERCENT_BONUS", "ref": fhe_tokens[0], "percent": pct}
         elif len(fhe_tokens) >= 2 and any(
             w in lower for w in ["multiply", "product", "invoice", "hours", "units", "rate"]
@@ -274,17 +400,17 @@ class LLMClient:
         lines = [f"Zero-Knowledge reasoning completed for subject {primary_target}."]
         if fhe_compute and fhe_compute["op"] == "PERCENT_BONUS":
             lines.append(
-                f"- 1024-bit Paillier PHE Policy Calculation ({fhe_compute['percent']}% on {fhe_compute['ref']}): "
+                f"- Paillier PHE Policy Calculation ({fhe_compute['percent']}% on {fhe_compute['ref']}): "
                 f"Bonus = [FHE_COMPUTED_BONUS], New Total Compensation = [FHE_COMPUTED_TOTAL]."
             )
         elif fhe_compute and fhe_compute["op"] == "BFV_MULTIPLY":
             lines.append(
-                f"- Native C Lattice RLWE-BFV Non-Linear Product ({fhe_compute['ref_a']} × {fhe_compute['ref_b']} in R_q): "
+                f"- Native C RLWE-BFV (leveled, depth 1) Product ({fhe_compute['ref_a']} × {fhe_compute['ref_b']} in R_q): "
                 f"Product = [FHE_COMPUTED_PRODUCT]."
             )
         elif fhe_compute and fhe_compute["op"] == "ADD":
             lines.append(
-                f"- 1024-bit Paillier PHE Aggregation ({fhe_compute['ref_a']} + {fhe_compute['ref_b']}): "
+                f"- Paillier PHE Aggregation ({fhe_compute['ref_a']} + {fhe_compute['ref_b']}): "
                 f"Sum = [FHE_COMPUTED_SUM]."
             )
         elif fhe_tokens:
@@ -313,24 +439,88 @@ class LLMClient:
             "raw_response": "\n".join(lines),
             "fhe_compute": fhe_compute,
             "action_intent": action_intent,
+            "parse_warning": None,
+            "wire_request": dict(OFFLINE_WIRE_REQUEST),
         }
+
+    _FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_-]*)[ \t]*\r?\n?(.*?)```", re.DOTALL)
+
+    @staticmethod
+    def _trailing_json_object(text: str) -> Optional[Tuple[int, Any]]:
+        """Find a JSON object that ends the text without a fence; return (start, obj)."""
+        decoder = json.JSONDecoder()
+        stripped_len = len(text.rstrip())
+        for start in [m.start() for m in re.finditer(r"\{", text)]:
+            try:
+                obj, end = decoder.raw_decode(text, start)
+            except ValueError:
+                continue
+            if end == stripped_len and isinstance(obj, dict):
+                return start, obj
+        return None
 
     def _parse_structured_output(
         self, text: str, provider_label: str, is_live: bool
     ) -> Dict[str, Any]:
-        fhe_compute = None
-        action_intent = None
-        clean_text = text
+        """
+        Accepts ```json / ```JSON / bare ``` fences, or a bare JSON object at the end.
+        Never silently drops unusable JSON: returns `parse_warning` instead.
+        Only dicts are accepted for `fhe_compute` / `action_intent`.
+        """
+        fhe_compute: Any = None
+        action_intent: Any = None
+        clean_text = text if isinstance(text, str) else str(text)
+        warnings: List[str] = []
 
-        match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-        if match:
+        parsed: Any = None
+        span: Optional[Tuple[int, int]] = None
+        fence_errors: List[str] = []
+        fences = [
+            m for m in self._FENCE_RE.finditer(clean_text)
+            if m.group(1).lower() in ("", "json", "json5", "jsonc")
+        ]
+        for m in reversed(fences):  # the schema asks for the block at the end
+            body = m.group(2).strip()
+            if not body.startswith(("{", "[")):
+                continue
             try:
-                parsed = json.loads(match.group(1))
-                fhe_compute = parsed.get("fhe_compute")
-                action_intent = parsed.get("action_intent")
-                clean_text = (text[: match.start()] + text[match.end() :]).strip()
-            except Exception:
-                pass
+                parsed = json.loads(body)
+                span = (m.start(), m.end())
+                break
+            except ValueError as exc:
+                fence_errors.append(f"{exc.msg} at line {exc.lineno} col {exc.colno}")
+
+        if span is None:
+            tail = self._trailing_json_object(clean_text)
+            if tail is not None:
+                parsed = tail[1]
+                span = (tail[0], len(clean_text))
+
+        if span is None:
+            if fence_errors:
+                warnings.append(
+                    f"Structured JSON block is invalid ({fence_errors[0]}); no computation or action was executed."
+                )
+            else:
+                warnings.append("No structured JSON block found in model output; no computation or action was executed.")
+        elif not isinstance(parsed, dict):
+            warnings.append(
+                f"Structured JSON is a {type(parsed).__name__}, expected an object; ignored."
+            )
+        else:
+            clean_text = (clean_text[: span[0]] + clean_text[span[1] :]).strip()
+            fhe_compute = parsed.get("fhe_compute")
+            action_intent = parsed.get("action_intent")
+            if fhe_compute is not None and not isinstance(fhe_compute, dict):
+                warnings.append(
+                    f"fhe_compute ignored: expected an object, got {type(fhe_compute).__name__}."
+                )
+                fhe_compute = None
+            if action_intent is not None and not isinstance(action_intent, dict):
+                warnings.append(
+                    f"action_intent ignored: expected an object, got {type(action_intent).__name__}."
+                )
+                action_intent = None
 
         return {
             "provider": provider_label,
@@ -338,4 +528,5 @@ class LLMClient:
             "raw_response": clean_text,
             "fhe_compute": fhe_compute,
             "action_intent": action_intent,
+            "parse_warning": " ".join(warnings) if warnings else None,
         }

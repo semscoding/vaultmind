@@ -5,9 +5,9 @@ and C-stack AES-256-CBC + HMAC-SHA256 sealing into the encrypted SQLite ledger.
 """
 
 import hashlib
+import itertools
 import json
 import os
-import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,6 +67,14 @@ class SecureEnclave:
     def _backup_file(self, x: int) -> str:
         return os.path.join(self.backup_dir, f"node_0{x}.json.bak")
 
+    @staticmethod
+    def _write_private_json(path: str, obj: Any) -> None:
+        """Write JSON to `path` with owner-only (0600) permissions from the first byte."""
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        os.chmod(path, 0o600)
+
     def _provision_fresh_vault(self) -> None:
         bundle = self.sss.generate_and_split_master_key(
             threshold_k=self.threshold,
@@ -77,11 +85,8 @@ class SecureEnclave:
             x = int(shard["x"])
             s_path = self._shard_file(x)
             b_path = self._backup_file(x)
-            with open(s_path, "w", encoding="utf-8") as f:
-                json.dump(shard, f, indent=2)
-            os.chmod(s_path, 0o600)
-            shutil.copyfile(s_path, b_path)
-            os.chmod(b_path, 0o600)
+            self._write_private_json(s_path, shard)
+            self._write_private_json(b_path, shard)
 
         public_manifest = {
             "threshold_k": bundle["threshold_k"],
@@ -91,8 +96,7 @@ class SecureEnclave:
             "share_digests": {str(k): v for k, v in bundle["share_digests"].items()},
             "canary_expected_secret": bundle["canary_expected_secret"],
         }
-        with open(self.manifest_path, "w", encoding="utf-8") as f:
-            json.dump(public_manifest, f, indent=2)
+        self._write_private_json(self.manifest_path, public_manifest)
 
         bundle["shards"].clear()
 
@@ -127,17 +131,35 @@ class SecureEnclave:
                 )
                 continue
 
-            with open(path, "r", encoding="utf-8") as f:
-                shard = json.load(f)
-
-            ok, reason = self.sss.verify_shard_integrity(
-                shard,
-                self.feldman_commitments_hex,
-                self.share_digests.get(x),
-                self.key_commitment_hex,
-            )
-            fp = hashlib.sha256(shard.get("gf256_share_hex", "").encode("utf-8")).hexdigest()[:8]
-            c_y = int(shard.get("canary_y", 0))
+            # M2: every read and field access of an on-disk shard sits inside one try.
+            # Any malformed file (empty, truncated, JSON list, non-numeric fields) is
+            # treated exactly like a cryptographic tamper: TAMPER_REJECTED + failover.
+            shard: Any = None
+            fp = "UNREADABLE"
+            c_y = 0
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    shard = json.load(f)
+                if not isinstance(shard, dict):
+                    raise TypeError(f"shard file holds a JSON {type(shard).__name__}, expected an object")
+                ok, reason = self.sss.verify_shard_integrity(
+                    shard,
+                    self.feldman_commitments_hex,
+                    self.share_digests.get(x),
+                    self.key_commitment_hex,
+                )
+                gf_hex = shard.get("gf256_share_hex", "")
+                if not isinstance(gf_hex, str):
+                    raise TypeError("gf256_share_hex is not a string")
+                fp = hashlib.sha256(gf_hex.encode("utf-8")).hexdigest()[:8]
+                c_y = int(shard.get("canary_y", 0))
+                if ok and int(shard.get("x", -1)) != x:
+                    ok, reason = False, f"Shard index mismatch (file node_0{x} claims x={shard.get('x')})"
+            except Exception as exc:  # noqa: BLE001 - any parse failure == tamper
+                ok = False
+                reason = f"Unreadable or malformed shard file ({type(exc).__name__}: {exc})"[:240]
+                shard = None
+                c_y = 0
             observed_canary_points.append({"x": x, "y": c_y, "valid": ok, "node_id": node_id})
 
             if ok:
@@ -209,19 +231,22 @@ class SecureEnclave:
             raise ValueError(f"Node index must be between 1 and {self.total_shares}.")
 
         path = self._shard_file(node_index)
-        with open(path, "r", encoding="utf-8") as f:
-            shard = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                shard = json.load(f)
+            corrupted_feldman = int(shard["feldman_y_hex"], 16) ^ 0xDEADBEEF1337
+            raw_gf = bytearray(bytes.fromhex(shard["gf256_share_hex"]))
+            raw_gf[0] ^= 0xFF
+            shard["feldman_y_hex"] = hex(corrupted_feldman)
+            shard["gf256_share_hex"] = bytes(raw_gf).hex()
+            shard["canary_y"] = (int(shard["canary_y"]) ^ 0x55) & 0xFF
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"Shard node_0{node_index} is missing or already unreadable ({type(exc).__name__}); "
+                "use restore-nodes first."
+            ) from None
 
-        corrupted_feldman = int(shard["feldman_y_hex"], 16) ^ 0xDEADBEEF1337
-        raw_gf = bytearray(bytes.fromhex(shard["gf256_share_hex"]))
-        raw_gf[0] ^= 0xFF
-        shard["feldman_y_hex"] = hex(corrupted_feldman)
-        shard["gf256_share_hex"] = bytes(raw_gf).hex()
-        shard["canary_y"] = (int(shard["canary_y"]) ^ 0x55) & 0xFF
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(shard, f, indent=2)
-
+        self._write_private_json(path, shard)
         return self.get_public_vault_status()
 
     def restore_all_shards(self) -> Dict[str, Any]:
@@ -229,14 +254,94 @@ class SecureEnclave:
             b_path = self._backup_file(x)
             s_path = self._shard_file(x)
             if os.path.exists(b_path):
-                shutil.copyfile(b_path, s_path)
+                with open(b_path, "rb") as src:
+                    raw = src.read()
+                fd = os.open(s_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as dst:
+                    dst.write(raw)
                 os.chmod(s_path, 0o600)
         return self.get_public_vault_status()
 
+    # ------------------------------------------------------------------
+    # S4: quorum failover over all k-subsets of the Feldman-valid shards
+    # ------------------------------------------------------------------
+    def _quorum_candidates(self, valid_shards: List[Dict[str, Any]]):
+        """All k-subsets of the valid shards, first k first (C(5,3) = 10 at most)."""
+        return itertools.combinations(valid_shards, self.threshold)
+
+    def _seal_with_quorum_failover(
+        self,
+        valid_shards: List[Dict[str, Any]],
+        plaintext_bytes: bytes,
+        aad_bytes: bytes,
+    ) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[List[str]]]:
+        """
+        Seal with the first k valid shards. If the C enclave rejects the reconstructed
+        key on the key-commitment check (ValueError, rc -10) and more than k valid
+        shards exist, retry every other k-combination before giving up.
+        Returns (sealed, quorum_used, rejected_combinations).
+        """
+        rejected_combos: List[List[str]] = []
+        last_exc: Optional[Exception] = None
+        for combo in self._quorum_candidates(valid_shards):
+            quorum = list(combo)
+            try:
+                sealed = self.sss.enclave_seal_record(
+                    quorum_shards=quorum,
+                    key_commitment_hex=self.key_commitment_hex,
+                    plaintext_bytes=plaintext_bytes,
+                    aad_bytes=aad_bytes,
+                )
+                return sealed, quorum, rejected_combos
+            except ValueError as exc:
+                last_exc = exc
+                rejected_combos.append([str(s.get("node_id", f"x={s.get('x')}")) for s in quorum])
+                quorum.clear()
+                continue
+        raise ValueError(
+            f"Key-commitment check failed for all {len(rejected_combos)} k={self.threshold} "
+            f"combinations of the {len(valid_shards)} Feldman-valid shards ({last_exc})."
+        )
+
+    def _select_verified_quorum(
+        self, valid_shards: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[List[str]]]:
+        """
+        Unseal has no key-commitment check of its own, so a wrong quorum would look like
+        a tampered row. Pick a quorum by sealing a throw-away probe (which does check the
+        commitment in C) and reuse that quorum for unsealing.
+        """
+        _, quorum, rejected = self._seal_with_quorum_failover(
+            valid_shards, b"vaultmind-quorum-probe", b"quorum-probe"
+        )
+        return quorum, rejected
+
+    @staticmethod
+    def _ledger_aad(seq: int, prev_hash: str, action: str, target: str) -> bytes:
+        return f"{seq}:{prev_hash}:{action}:{target}".encode("utf-8")
+
     def execute_privileged_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(intent, dict):
+            return {
+                "success": False,
+                "error": (
+                    "Enclave Policy Violation: action_intent must be a JSON object, "
+                    f"got {type(intent).__name__}."
+                ),
+            }
+        params = intent.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {
+                "success": False,
+                "error": (
+                    "Enclave Policy Violation: action_intent.params must be a JSON object, "
+                    f"got {type(params).__name__}."
+                ),
+            }
         action_name = str(intent.get("action", "UNKNOWN")).upper()
         target = str(intent.get("target", "[SYSTEM]"))
-        params = intent.get("params", {})
 
         if action_name not in ALLOWED_ACTIONS:
             return {
@@ -246,36 +351,37 @@ class SecureEnclave:
 
         valid_shards, rejected_nodes, _, _ = self._inspect_shards_on_disk()
         if len(valid_shards) < self.threshold:
+            n_valid = len(valid_shards)
             valid_shards.clear()
             return {
                 "success": False,
                 "error": (
-                    f"Threshold Quorum Failed: Only {len(valid_shards)} valid shards available "
+                    f"Threshold Quorum Failed: Only {n_valid} valid shards available "
                     f"(need k={self.threshold}). Rejected nodes: {[r['node_id'] for r in rejected_nodes]}"
                 ),
                 "rejected_nodes": rejected_nodes,
             }
 
-        quorum = valid_shards[: self.threshold]
-        quorum_ids = [s["node_id"] for s in quorum]
-        aad_bytes = f"{action_name}:{target}".encode("utf-8")
-        record_payload = json.dumps(
-            {
-                "action": action_name,
-                "target": target,
-                "params": params,
-                "sealed_at": time.time(),
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-
+        quorum: List[Dict[str, Any]] = []
         try:
-            sealed = self.sss.enclave_seal_record(
-                quorum_shards=quorum,
-                key_commitment_hex=self.key_commitment_hex,
-                plaintext_bytes=record_payload,
-                aad_bytes=aad_bytes,
+            seq, prev_hash = self.ledger.next_chain_position()
+            aad_bytes = self._ledger_aad(seq, prev_hash, action_name, target)
+            record_payload = json.dumps(
+                {
+                    "seq": seq,
+                    "action": action_name,
+                    "target": target,
+                    "params": params,
+                    "sealed_at": time.time(),
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+
+            sealed, quorum, rejected_combos = self._seal_with_quorum_failover(
+                valid_shards, record_payload, aad_bytes
             )
+            quorum_ids = [s["node_id"] for s in quorum]
             row_id = self.ledger.append_sealed_entry(
                 action=action_name,
                 target_token=target,
@@ -283,18 +389,25 @@ class SecureEnclave:
                 iv_hex=sealed["iv_hex"],
                 ciphertext_hex=sealed["ciphertext_hex"],
                 hmac_hex=sealed["hmac_hex"],
+                seq=seq,
+                prev_hash=prev_hash,
             )
 
             receipt = {
                 "status": "SEALED_IN_SQLITE",
                 "ledger_row_id": row_id,
+                "ledger_prev_hash": prev_hash,
                 "action": action_name,
                 "target": target,
                 "hmac_sha256_tag": sealed["hmac_hex"][:24] + "...",
                 "aes256_ciphertext_preview": sealed["ciphertext_hex"][:24] + "...",
                 "quorum_nodes": quorum_ids,
                 "rejected_tampered_nodes": [r["node_id"] for r in rejected_nodes],
-                "c_enclave_zeroize": "VERIFIED (C11 memset_s + compiler barrier)",
+                "rejected_quorum_combinations": rejected_combos,
+                "c_enclave_zeroize": (
+                    "Key buffers wiped in C via memset_s after use "
+                    "(volatile-loop fallback where memset_s is unavailable); not runtime-verified."
+                ),
                 "timestamp": time.time(),
             }
             return {"success": True, "receipt": receipt}
@@ -305,23 +418,55 @@ class SecureEnclave:
             quorum.clear()
 
     def verify_ledger_entries(self, limit: int = 15) -> Dict[str, Any]:
-        entries = self.ledger.list_entries(limit=limit)
+        """
+        S5: verify the FULL hash chain from row 1 (not only the displayed rows).
+        Each row is checked for (a) contiguous sequence id, (b) prev_hash == SHA-256 of
+        the previous row, (c) HMAC over AAD = "seq:prev_hash:action:target".
+        Returns the newest `limit` rows for display, plus chain-wide findings.
+        """
+        all_rows = self.ledger.list_all_entries_ascending()
+        display_ids = {r["id"] for r in all_rows[-limit:]} if limit and limit > 0 else set()
         valid_shards, rejected_nodes, _, _ = self._inspect_shards_on_disk()
         if len(valid_shards) < self.threshold:
             valid_shards.clear()
             return {
                 "verified": False,
                 "error": f"Cannot verify ledger: fewer than k={self.threshold} valid shards.",
-                "entries": entries,
+                "entries": self.ledger.list_entries(limit=limit),
             }
 
-        quorum = valid_shards[: self.threshold]
+        quorum: List[Dict[str, Any]] = []
         verified_rows: List[Dict[str, Any]] = []
+        chain_errors: List[Dict[str, Any]] = []
         all_ok = True
 
         try:
-            for row in entries:
-                aad_bytes = f"{row['action']}:{row['target_token']}".encode("utf-8")
+            try:
+                quorum, rejected_combos = self._select_verified_quorum(valid_shards)
+            except Exception as exc:
+                return {
+                    "verified": False,
+                    "error": f"Cannot verify ledger: no valid quorum ({exc}).",
+                    "entries": self.ledger.list_entries(limit=limit),
+                }
+
+            expected_prev = self.ledger.GENESIS_HASH
+            expected_seq = 1
+            for row in all_rows:
+                reasons: List[str] = []
+                if row["id"] != expected_seq:
+                    if row["id"] > expected_seq:
+                        reasons.append(
+                            f"Sequence gap: expected row {expected_seq}, found {row['id']} "
+                            f"({row['id'] - expected_seq} row(s) deleted)"
+                        )
+                    else:
+                        reasons.append(f"Sequence out of order: expected row {expected_seq}, found {row['id']}")
+                if row["prev_hash"] != expected_prev:
+                    reasons.append("Hash-chain break: prev_hash does not match SHA-256 of the previous row")
+                chain_ok = not reasons
+
+                aad_bytes = self._ledger_aad(row["id"], row["prev_hash"], row["action"], row["target_token"])
                 try:
                     self.sss.enclave_unseal_record(
                         quorum_shards=quorum,
@@ -330,17 +475,47 @@ class SecureEnclave:
                         hmac_hex=row["hmac_hex"],
                         aad_bytes=aad_bytes,
                     )
-                    row_ok = True
+                    hmac_ok = True
                 except Exception:
-                    row_ok = False
-                    all_ok = False
+                    hmac_ok = False
+                    reasons.append(
+                        "HMAC-SHA256 failed over AAD (seq, prev_hash, action, target): "
+                        "row altered, duplicated or moved"
+                    )
 
-                verified_rows.append({**row, "hmac_verified": row_ok})
+                row_ok = chain_ok and hmac_ok
+                if not row_ok:
+                    all_ok = False
+                    chain_errors.append({"id": row["id"], "reasons": reasons})
+
+                if row["id"] in display_ids:
+                    verified_rows.append(
+                        {
+                            **row,
+                            "hmac_verified": row_ok,
+                            "hmac_tag_valid": hmac_ok,
+                            "chain_link_valid": chain_ok,
+                            "verification_reason": "; ".join(reasons) if reasons else "OK",
+                        }
+                    )
+
+                expected_prev = self.ledger.row_hash(row)
+                expected_seq = row["id"] + 1
+
+            verified_rows.reverse()  # newest first, like list_entries()
             return {
                 "verified": all_ok,
                 "quorum_used": [s["node_id"] for s in quorum],
                 "rejected_nodes": [r["node_id"] for r in rejected_nodes],
+                "rejected_quorum_combinations": rejected_combos,
                 "entries": verified_rows,
+                "chain_length": len(all_rows),
+                "chain_head_hash": expected_prev,
+                "chain_errors": chain_errors,
+                "chain_note": (
+                    "Full chain verified from row 1. Truncation of the newest rows is only "
+                    "detectable against an externally recorded chain_head_hash."
+                ),
             }
         finally:
             valid_shards.clear()

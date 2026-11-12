@@ -5,6 +5,7 @@ live 2048-bit Feldman VSS shard tampering commands, and SQLite HMAC verification
 """
 
 import asyncio
+import json
 import os
 import sys
 
@@ -28,7 +29,8 @@ pipeline = AgentPipeline()
 def make_header() -> Panel:
     title = Text("VAULTMIND v2: NATIVE C ENCLAVE & ZERO-KNOWLEDGE AI PIPELINE", style="bold green")
     subtitle = Text(
-        "C11 memset_s() + GF(2^8) Shamir • 2048-bit Feldman VSS • Paillier PHE + C Lattice RLWE-BFV FHE",
+        "GF(2^8) Shamir + memset_s() key zeroization • 2048-bit Feldman VSS • "
+        "Paillier PHE + RLWE-BFV (leveled, depth 1), N=2048, log q=54",
         style="dim cyan",
     )
     grid = Table.grid(expand=True)
@@ -38,14 +40,78 @@ def make_header() -> Panel:
     return Panel(grid, border_style="green")
 
 
-def make_wire_panel(blinded_text: str, bits: int) -> Panel:
-    safe_wire = escape(blinded_text)
-    body = (
-        f"[bold cyan]TRANSMITTED TO CLOUD HOST:[/bold cyan]\n\n"
-        f"{safe_wire}\n\n"
-        f"[dim]// contains_master_key: false | paillier_modulus: {bits}-bit[/dim]"
-    )
-    return Panel(Text.from_markup(body), title="[bold cyan]External Network Wire[/bold cyan]", border_style="cyan")
+def _count(value):
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def make_leak_line(wire: dict) -> str:
+    """Rich markup for the computed leak check (audit B1). Everything dynamic is escaped."""
+    wire = wire or {}
+    lc = wire.get("leak_check")
+    flagged = [
+        label
+        for key, label in (
+            ("contains_master_key", "master key"),
+            ("contains_raw_pii", "raw PII"),
+            ("contains_raw_secrets", "raw secrets"),
+        )
+        if wire.get(key) is True
+    ]
+    if isinstance(lc, dict):
+        spans = _count(lc.get("detected_spans"))
+        residual = _count(lc.get("residual_matches"))
+        spans_txt = "?" if spans is None else str(spans)
+        residual_txt = "?" if residual is None else str(residual)
+        bad = (residual is not None and residual > 0) or bool(flagged)
+        line = f"Leak check: {spans_txt} spans blinded, {residual_txt} residual matches"
+        if bad:
+            out = f"[bold red]⚠ {escape(line)}[/bold red]"
+            if flagged:
+                out += f"\n[red]Flagged: {escape(', '.join(flagged))}[/red]"
+        else:
+            out = f"[bold green]✔ {escape(line)}[/bold green]"
+        note = lc.get("note") or "Blinding is heuristic: wrap unlabeled secrets in <secret>…</secret>."
+        return out + f"\n[dim]{escape(str(note))}[/dim]"
+    if flagged:
+        return f"[bold red]⚠ Backend flags: {escape(', '.join(flagged))}[/bold red]"
+    return "[dim]Leak check not reported. Blinding is heuristic: wrap unlabeled secrets in <secret>…</secret>.[/dim]"
+
+
+def make_wire_panel(result: dict) -> Panel:
+    """Show the request actually sent to the provider (audit B4), never a made-up endpoint."""
+    wire = result.get("cloud_wire_payload") or {}
+    req = wire.get("actual_request")
+    blinded = result.get("blinded_prompt") or wire.get("transmitted_prompt") or ""
+    bits = (result.get("paillier_public_key") or {}).get("modulus_bits") or wire.get("paillier_phe_modulus_bits")
+
+    if isinstance(req, dict) and req.get("url"):
+        body = req.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                pass
+        body_txt = body if isinstance(body, str) else json.dumps(body, indent=2, ensure_ascii=False)
+        head = f"[bold cyan]{escape(str(req.get('method') or 'POST'))} {escape(str(req['url']))}[/bold cyan]"
+        wire_txt = f"{head}\n\n{escape(body_txt)}"
+    elif isinstance(req, dict):
+        note = f"\n[dim]{escape(str(req['note']))}[/dim]" if req.get("note") else ""
+        wire_txt = (
+            "[bold green]LOCAL ONLY: offline engine, nothing left this machine[/bold green]"
+            f"{note}\n\n[cyan]Blinded prompt processed locally:[/cyan]\n{escape(blinded)}"
+        )
+    else:
+        wire_txt = f"[cyan]Blinded prompt (exact request not reported):[/cyan]\n{escape(blinded)}"
+
+    footer = f"\n\n{make_leak_line(wire)}"
+    if bits:
+        footer += f"\n[dim]paillier_modulus: {escape(str(bits))}-bit[/dim]"
+    return Panel(Text.from_markup(wire_txt + footer), title="[bold cyan]External Network Wire[/bold cyan]", border_style="cyan")
 
 
 def make_vault_panel(vault_status: dict, receipt: dict = None) -> Panel:
@@ -105,32 +171,65 @@ async def main_loop():
             continue
 
         if user_input == "/verify":
-            ver = pipeline.enclave.verify_ledger_entries()
+            try:
+                ver = pipeline.enclave.verify_ledger_entries()
+            except Exception as exc:  # keep the TUI alive on backend errors
+                console.print(f"[bold red]Ledger verification error:[/bold red] {escape(str(exc))}")
+                continue
+            style = "bold green" if ver.get("verified") else "bold red"
             console.print(
-                f"[bold green]SQLite Ledger C-Enclave Verification:[/bold green] verified={ver['verified']} "
+                f"[{style}]SQLite Ledger C-Enclave Verification:[/{style}] verified={escape(str(ver.get('verified')))} "
                 f"({len(ver.get('entries', []))} sealed rows checked)"
             )
+            if ver.get("error"):
+                console.print(f"[red]{escape(str(ver['error']))}[/red]")
+            for row in ver.get("entries", []):
+                if row.get("hmac_verified") is False:
+                    reason = next(
+                        (row.get(k) for k in ("verification_reason", "verify_reason","failure_reason", "reason", "error", "verification_error") if row.get(k)),
+                        "HMAC mismatch",
+                    )
+                    console.print(f"[red]  ✘ row #{escape(str(row.get('id')))}: {escape(str(reason))}[/red]")
             continue
 
         if user_input == "/metrics":
             console.print(pipeline.monitor.snapshot())
             continue
 
-        with console.status("[bold green]Running Blinder, Dual PHE/RLWE-BFV FHE & Native C Enclave...[/bold green]"):
-            result = await pipeline.process_prompt(user_input, provider="auto")
+        try:
+            with console.status("[bold green]Running blinder, Paillier PHE / RLWE-BFV & native C enclave...[/bold green]"):
+                result = await pipeline.process_prompt(user_input, provider="auto")
+        except Exception as exc:  # provider errors (HTTP, timeout, bad JSON) must not crash the TUI
+            console.print(
+                Panel(
+                    Text.from_markup(
+                        f"[bold red]Pipeline / LLM provider error:[/bold red]\n{escape(type(exc).__name__)}: {escape(str(exc))}\n\n"
+                        "[dim]Nothing was sealed. Check the API key / network, or use the offline engine.[/dim]"
+                    ),
+                    title="[bold red]Error[/bold red]",
+                    border_style="red",
+                )
+            )
+            continue
 
         console.clear()
         console.print(make_header())
 
-        safe_client = escape(result["unblinded_result"])
+        safe_client = escape(str(result.get("unblinded_result", "")))
         fhe_line = ""
         if result.get("fhe_computation") and result["fhe_computation"].get("decrypted_outputs"):
-            fhe_line = f"\n[bold cyan]FHE Math:[/bold cyan] {escape(str(result['fhe_computation']['decrypted_outputs']))}"
+            fhe_line = f"\n[bold cyan]Homomorphic result:[/bold cyan] {escape(str(result['fhe_computation']['decrypted_outputs']))}"
+        phase3 = next(
+            (p for p in result.get("audit_trail", []) if str(p.get("phase", "")).startswith("PHASE_3")), None
+        )
+        parse_warning = ((phase3 or {}).get("details") or {}).get("parse_warning") or result.get("parse_warning")
+        if parse_warning:
+            fhe_line += f"\n[yellow]⚠ LLM output parse warning: {escape(str(parse_warning))}[/yellow]"
 
         client_markup = (
             f"[bold green]Decrypted Client Verdict:[/bold green]\n\n"
             f"{safe_client}{fhe_line}\n\n"
-            f"[dim]Latency: {result['duration_ms']} ms | Engine: {escape(str(result['provider_used']))}[/dim]"
+            f"[dim]Latency: {escape(str(result.get('duration_ms', '--')))} ms | Engine: {escape(str(result.get('provider_used')))}[/dim]"
         )
 
         top_grid = Table.grid(expand=True, padding=(0, 1))
@@ -138,11 +237,12 @@ async def main_loop():
         top_grid.add_column(ratio=1)
         top_grid.add_row(
             Panel(Text.from_markup(client_markup), title="[bold green]Local Client View[/bold green]", border_style="green"),
-            make_wire_panel(result["blinded_prompt"], result["paillier_public_key"]["modulus_bits"]),
+            make_wire_panel(result),
         )
 
         console.print(top_grid)
-        console.print(make_vault_panel(result["vault_topology"], result.get("enclave_receipt")))
+        if result.get("vault_topology"):
+            console.print(make_vault_panel(result["vault_topology"], result.get("enclave_receipt")))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
 Security & Cryptographic Telemetry Monitoring Module.
-Tracks blinding metrics, 1024-bit Paillier FHE latencies, C-enclave seals,
+Tracks blinding metrics, Paillier PHE / RLWE-BFV computations, C-enclave seals,
 and 2048-bit Feldman VSS tamper alerts in real time without logging any plaintext secrets.
 """
 
@@ -31,6 +31,11 @@ class SecurityMonitor:
                 "message": message,
             }
         )
+
+    def record_homomorphic_computation(self, component: str, message: str) -> None:
+        """Count one homomorphic evaluation. Callers must not put operand values in `message`."""
+        self.total_fhe_computations += 1
+        self.record_event("INFO", component, message)
 
     def record_pipeline_run(
         self,

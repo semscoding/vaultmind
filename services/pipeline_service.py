@@ -1,7 +1,10 @@
 """
 Pipeline Service: Orchestrates Blinding, Zero-Retention C AES-256 Secret Sealing,
-Cloud/ZK LLM Reasoning, 1024-bit Paillier PHE + 128-bit PQ Lattice RLWE-BFV FHE Math,
+Cloud/ZK LLM Reasoning, Paillier PHE (2048-bit default) + RLWE-BFV (leveled, depth 1) Math,
 Dual-Field Enclave Sealing, and Security Telemetry.
+
+The cloud-wire leak flags are computed by a post-blinding scan of the detected spans (B1);
+the blinding itself is regex/heuristic, which `wire_payload["leak_check"]` states explicitly.
 """
 
 import time
@@ -17,7 +20,7 @@ class AgentPipeline:
     def __init__(
         self,
         storage_dir: Optional[str] = None,
-        paillier_bits: int = 1024,
+        paillier_bits: int = 2048,
         reset_vault: bool = False,
         monitor: Optional[SecurityMonitor] = None,
     ):
@@ -41,15 +44,32 @@ class AgentPipeline:
         audit_trail: List[Dict[str, Any]] = []
 
         blinded_text, ctx = self.tokenizer.blind_prompt(user_prompt)
+        scan = self.tokenizer.residual_scan(blinded_text, ctx)
 
         wire_payload = {
             "provider_mode": provider,
             "transmitted_prompt": blinded_text,
             "paillier_phe_modulus_bits": self.tokenizer.paillier.n.bit_length(),
-            "bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]",
+            "bfv_fhe_ring": (
+                "Z_{2^54}[X]/(X^2048 + 1) [RLWE-BFV (leveled, depth 1): N=2048, log q=54, "
+                "HE-standard classical-128 size row, ternary errors]"
+            ),
+            # The master key never enters the pipeline process (it is reconstructed only inside the C enclave).
             "contains_master_key": False,
-            "contains_raw_pii": False,
-            "contains_raw_secrets": False,
+            "contains_raw_pii": scan["residual_pii_matches"] > 0,
+            "contains_raw_secrets": scan["residual_secret_matches"] > 0,
+            "leak_check": {
+                "method": "post-blinding scan of detected spans",
+                "detected_spans": scan["detected_spans"],
+                "residual_matches": scan["residual_matches"],
+                "heuristic": True,
+                "note": (
+                    "Regex/heuristic blinding: unmarked secrets without a recognizable pattern are not "
+                    "detected. Wrap them in <secret>...</secret>."
+                ),
+            },
+            # Filled in after the LLM call (B4): the request that actually left this machine, without API key.
+            "actual_request": None,
         }
         audit_trail.append(
             {
@@ -64,8 +84,32 @@ class AgentPipeline:
             provider=provider,
             api_key=api_key,
         )
+        if not isinstance(llm_result, dict):
+            llm_result = {}
+        wire_payload["actual_request"] = llm_result.get("wire_request")
+
+        # M3: the LLM output is untrusted; only dicts are accepted for fhe_compute / action_intent.
+        llm_output_warnings: List[str] = []
+        parse_warning = llm_result.get("parse_warning")
+        if parse_warning:
+            llm_output_warnings.append(str(parse_warning))
         fhe_spec = llm_result.get("fhe_compute")
+        if fhe_spec is not None and not isinstance(fhe_spec, dict):
+            llm_output_warnings.append(
+                f"Ignored fhe_compute from LLM: expected an object, got {type(fhe_spec).__name__}."
+            )
+            fhe_spec = None
         action_intent = llm_result.get("action_intent")
+        if action_intent is not None and not isinstance(action_intent, dict):
+            llm_output_warnings.append(
+                f"Ignored action_intent from LLM: expected an object, got {type(action_intent).__name__}."
+            )
+            action_intent = None
+        raw_response = llm_result.get("raw_response")
+        if raw_response is None:
+            raw_response = ""
+        elif not isinstance(raw_response, str):
+            raw_response = str(raw_response)
 
         fhe_computation_report = None
         if fhe_spec:
@@ -113,9 +157,10 @@ class AgentPipeline:
                 "details": {
                     "provider": llm_result.get("provider"),
                     "is_live_cloud": llm_result.get("is_live_cloud", False),
-                    "raw_reasoning": llm_result.get("raw_response"),
+                    "raw_reasoning": raw_response,
                     "fhe_compute": fhe_spec,
                     "action_intent_proposed": action_intent,
+                    "llm_output_warnings": llm_output_warnings,
                 },
             }
         )
@@ -141,7 +186,7 @@ class AgentPipeline:
             }
         )
 
-        raw_final = llm_result.get("raw_response", "")
+        raw_final = raw_response
         overall_status = "SUCCESS"
         sealed_ok = False
         blocked_flag = False
@@ -185,6 +230,7 @@ class AgentPipeline:
             "blinded_prompt": blinded_text,
             "cloud_wire_payload": wire_payload,
             "fhe_computation": fhe_computation_report,
+            "llm_output_warnings": llm_output_warnings,
             "enclave_receipt": enclave_result.get("receipt") if enclave_result else None,
             "enclave_error": enclave_result.get("error") if enclave_result and not enclave_result.get("success") else None,
             "unblinded_result": unblinded_output,

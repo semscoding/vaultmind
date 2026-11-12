@@ -1,16 +1,22 @@
 """
 VaultMind v2 Entrypoint (`main.py`).
 Mounts the `apis` router and serves the `frontend` static dashboard on loopback 127.0.0.1:8000.
+TrustedHostMiddleware rejects any Host header other than loopback (DNS-rebinding guard).
 """
 
 import os
 from fastapi import FastAPI
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from apis.routes import router as api_router
 
 app = FastAPI(title="VaultMind v2: Zero-Trust AI Agent Pipeline")
+# "testserver" is the Host used by FastAPI's TestClient.
+app.add_middleware(
+    TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"]
+)
 app.include_router(api_router)
 
 root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,7 +37,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print("\n" + "=" * 64)
-    print("🛡️  VAULTMIND v2: Native C Enclave + 2048-bit VSS + 1024-bit FHE")
+    print("🛡️  VAULTMIND v2: Native C Enclave + 2048-bit Feldman VSS + Paillier PHE + RLWE-BFV (leveled, depth 1)")
     print("📡  Loopback Dashboard: http://127.0.0.1:8000")
     print("=" * 64 + "\n")
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)

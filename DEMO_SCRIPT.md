@@ -1,40 +1,95 @@
-# VaultMind v2: 2.5-Minute Hackathon Demo Video Script
+# VaultMind v2: Demo Video Script (about 2:45)
 
-> **Target Length:** 2:15 – 2:45  
-> **Track:** AI Pipeline Secret Sharing Track  
-> **Pre-Recording Checklist:** Put a live `GEMINI_API_KEY` (free at `aistudio.google.com`) or `OPENAI_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` in `.env` before starting `python3 main.py`. The dashboard automatically detects `.env` and selects the live cloud provider without exposing your key on screen!
+> **Track:** AI Pipeline Secret Sharing Track
+> **Rule for the voice-over:** say only what the screen shows at that moment. If a live run does not produce the banner or receipt mentioned below, re-run or cut; do not narrate it anyway.
+> All button labels, preset names and panel titles below are copied from `frontend/static/index.html` and `frontend/static/app.js`.
 
----
+## Before recording
 
-### 1. Intro & Low-Level Architecture (0:00 – 0:35)
-- **On Screen:** Open `http://127.0.0.1:8000`. Point to the top header (`✨ Google Gemini 2.5 Flash (Live API)` auto-loaded from `.env`) and telemetry bar (`0 BYTES IN PYTHON RAM`, `libvaultcrypto.dylib ACTIVE`, `2048-bit Feldman VSS`, `Paillier 1024-bit PHE + C RLWE-BFV FHE`).
-- **Say:**
-  > *"Hi, this is VaultMind v2 for the AI Pipeline Secret Sharing track. Connecting cloud LLMs like Google Gemini, OpenAI, or AWS Bedrock to enterprise workflows normally leaks PII, passwords, and financial figures to host-provider servers, while exposing master keys in agent memory.*  
-  > *VaultMind pairs Python orchestration with a compiled C11 cryptographic enclave (`libvaultcrypto.dylib`). Before any prompt leaves localhost, sensitive identifiers and arbitrary secrets are blinded and AES-256-sealed locally, numbers are encrypted under both 1024-bit Paillier PHE and Ring-LWE BFV Lattice FHE, and our 256-bit Master Key stays split across 5 isolated disk shards using constant-time $\text{GF}(2^8)$ Shamir Secret Sharing and 2048-bit Feldman VSS."*
-
----
-
-### 2. Live Cloud Blind Reasoning, Paillier PHE & Lattice RLWE-BFV FHE (0:35 – 1:30)
-- **On Screen:**
-  1. Click **"💼 15% Bonus Paillier PHE & DB Seal"** → click **"Execute Zero-Trust Pipeline"**.
-  2. Point to **Column 2 (External Cloud Wire)** & **Cyan Banner**:
-     > *"Here Gemini 2.5 Flash reasons live over blinded tokens: Marcus Vance is an HMAC token, and his \$130,000 salary is a 1024-bit Paillier ciphertext. Without ever decrypting the salary, our evaluator computes $c_1^{15} \bmod n^2$ and $c_1^{115} \bmod n^2$ — decrypting locally to an exact \$19,500.00 bonus and \$149,500.00 total!"*
-  3. Click **"🔐 Lattice RLWE-BFV Product & Password Seal"** → click **"Execute Zero-Trust Pipeline"**:
-     > *"And for non-linear ciphertext-times-ciphertext math plus free-text passwords: both `password is ...` and `<secret>...</secret>` are scrubbed and sealed in C AES-256, while our compiled C Ring-LWE BFV engine over $R_q = \mathbb{Z}_{2^{60}}[X]/(X^{64}+1)$ multiplies encrypted hours $E(160)$ by encrypted rate $E(225)$ with 4-limb gadget relinearization — yielding \$36,000 with zero plaintext exposure!"*
+1. `cp .env.example .env` and fill in `GEMINI_API_KEY` (or `OPENAI_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK`). Never show `.env` on screen.
+2. Do at least ten successful live runs with the presets before recording. If the live provider fails, record with **⚡ Offline Deterministic Engine (nothing leaves this machine)** and say so on screen.
+3. Start the server: `python3 main.py`, open `http://127.0.0.1:8000`.
+4. Click **↺ Restore Shards** so all five nodes show **VSS OK**.
+5. Have a terminal ready in the repo root with the venv active, and an editor open on `backend/native/vaultcrypto.c`.
 
 ---
 
-### 3. Live Byzantine Shard Attack & 2048-bit Feldman VSS Defense (1:30 – 2:10)
-- **On Screen:**
-  1. In **Column 3**, click **"⚡ Corrupt"** on `node-02`. Show the red `TAMPERED` state and the red cross jumping off the $\text{GF}(2^8)$ polynomial curve.
-  2. Click **"Execute Zero-Trust Pipeline"** again.
-  3. Point to the Enclave Receipt & Bottom SQLite Ledger:
-     > *"When an attacker corrupts shard 2 on disk, our 2048-bit RFC 3526 Feldman VSS check $g^{s_i} \equiv \prod C_j^{i^j} \bmod P$ mathematically rejects `node-02`, ejects it from the curve, and automatically fails over to healthy quorum nodes 1, 3, and 4 — reconstructing the Master Key strictly on the C stack and wiping it with C11 `memset_s()`. Corrupting 3 shards drops below $k=3$ and halts execution."*
-  4. Click **"↺ Restore Shards"** and **"✔ Verify HMACs in C Enclave"**.
+## Scene 1: Intro (0:00 – 0:20)
+
+**On screen:** the dashboard. Header dropdown **LLM Host** shows **✨ Google Gemini 2.5 Flash (Live API)** (selected automatically when a key is in `.env`). Telemetry bar: **RECONSTRUCTED MASTER KEY** · *C stack only · wiped after each seal*, **VERIFIABLE SECRET SHARING** · *k=3 of n=5 (2048-bit Feldman VSS)*, **KEY ZEROIZATION** · *C11 memset_s() + CommonCrypto*.
+
+**Say:**
+> "This is VaultMind, for the AI Pipeline Secret Sharing track. A cloud LLM plans actions on enterprise prompts, but it only ever sees tokens. The master key is split over five shard files with Shamir secret sharing and Feldman VSS, and it is only ever reconstructed inside a small C library, on the C stack."
 
 ---
 
-### 4. Audit Suite, Terminal TUI & Closing (2:10 – 2:35)
-- **On Screen:** Switch to terminal: show `python3 -m unittest tests/test_security_audit.py -v` passing all 9 cryptographic audit tests + `python3 frontend/tui.py`.
-- **Say:**
-  > *"Every mathematical guarantee — from constant-time $\text{GF}(2^8)$ axioms and 100 random RLWE-BFV ciphertext multiplications to SQLite HMAC tamper detection — is verified by our 9-part audit suite and accessible via both our loopback web UI and Rich TUI. Thanks for watching!"*
+## Scene 2: Blinded prompt and the real request (0:20 – 1:00)
+
+**On screen:**
+1. Click the preset **💼 15% Bonus Paillier PHE & DB Seal**, then **⚡ Execute Zero-Trust Pipeline**.
+2. Middle column **EXTERNAL CLOUD WIRE · What Host Provider (Gemini/OpenAI/Bedrock) Sees**: zoom into **TRANSMITTED PAYLOAD**. It shows `POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`, the headers with `x-goog-api-key: <redacted>`, and the JSON body with `systemInstruction` and the blinded prompt.
+3. Point at the leak-check badge (**✔ 0 RESIDUAL MATCHES (heuristic)**) and at the token map below it (`[ID_…] ⟷ "Marcus Vance"`, `[FHE_NUM_1] … "$130,000" → 2048-bit PHE`).
+4. If the cyan banner appears, point at it: `c_bonus = [FHE_NUM_1]^15 mod n², c_total = [FHE_NUM_1]^115 mod n²` and the left column output with **$19,500.00** and **$149,500.00**.
+
+**Say:**
+> "This panel is the exact request body that went to Gemini, without the API key. The name became an HMAC token, the salary became a Paillier ciphertext handle, and a leak check confirms that none of the detected values is still in the payload. Gemini only answers with a plan: a fifteen percent bonus on FHE_NUM_1. The bonus is computed on the ciphertext with only the public key, and decrypted locally."
+
+---
+
+## Scene 3: Leveled BFV product and sealed password (1:00 – 1:25)
+
+**On screen:**
+1. Click **🔐 RLWE-BFV Product & Password Seal**, then **⚡ Execute Zero-Trust Pipeline**.
+2. Show in the payload: `[FHE_NUM_1](ENC:0x…)`, `[FHE_NUM_2](ENC:0x…)`, `password is [SECRET_…]`, `seed: [SECRET_…]`.
+3. If the banner appears: `c_prod = Relin(round((t/q) · ([FHE_NUM_1] ⊗ [FHE_NUM_2]))) in R_q (N=2048)` and **$36,000**.
+4. Optional: in the playground at the bottom click **C RLWE-BFV Product (in R_q)** with m₁ = 160, m₂ = 225.
+
+**Say:**
+> "The password and the tagged seed are sealed with AES-256 and HMAC inside the C library before anything is sent. Hours times rate is a ciphertext-times-ciphertext product in leveled BFV, depth one, with N equals 2048 and a 54-bit modulus. The cloud picks the operation; the product is evaluated and decrypted locally."
+
+---
+
+## Scene 4: Typing a prompt live (1:25 – 1:40)
+
+**On screen:** clear the prompt box and type, for example:
+`Pay vendor Acronis Corp 4,250 EUR to IBAN NL91 ABNA 0417 1643 00, approval code <secret>blue-otter-42</secret>.`
+Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payload and the leak-check badge.
+
+**Say:**
+> "Blinding is pattern-based, so anything without a label goes in a secret tag. Everything detected is replaced, and the leak check is computed on every run."
+
+(Rehearse this exact prompt before recording; if the badge shows a residual match, use a different prompt.)
+
+---
+
+## Scene 5: Corrupted shards, failover and refusal (1:40 – 2:15)
+
+**On screen:**
+1. Right column **NATIVE C ENCLAVE & FELDMAN VSS**: click **⚡ Corrupt** on node-02. The card turns **TAMPERED** and a red cross leaves the GF(2⁸) curve.
+2. Run the bonus preset again. The receipt shows `REJECTED: vault-node-02 (Feldman VSS Failed!)` and `QUORUM: vault-node-01, vault-node-03, vault-node-04`.
+3. Click **⚡ Corrupt** on node-01 and node-03 as well (three shards broken). Run again. The receipt shows `❌ ENCLAVE BLOCKED:` with `Threshold Quorum Failed: Only 2 valid shards available (need k=3)`.
+4. Click **↺ Restore Shards**, then **✔ Verify HMACs in C Enclave**: the ledger banner and the table rows show **✔ VALID**.
+
+**Say:**
+> "Each shard is checked against public Feldman commitments in a 2048-bit group. One corrupted shard is rejected and the enclave uses another quorum. With three of five broken, fewer than three valid shards remain, and the enclave refuses to seal anything. Every sealed row is chained to the previous one, and verification runs over the whole chain."
+
+---
+
+## Scene 6: The C code and the binary (2:15 – 2:30)
+
+**On screen (about ten seconds of code):**
+1. `vaultcrypto.c`: `vault_gf256_mul` (fixed loop, masks, no tables).
+2. The `cleanup:` block of `vault_enclave_seal` with the `vault_secure_wipe` calls, and `vault_secure_wipe` calling `memset_s`.
+3. Terminal: `nm -u backend/native/libvaultcrypto.dylib | grep memset_s` → `_memset_s`.
+
+**Say:**
+> "Field arithmetic is branch-free and table-free. The reconstructed key and its subkeys are wiped with memset_s on every exit path, and the binary really links memset_s. To be precise: the shares themselves do pass through Python; the reconstructed key does not."
+
+---
+
+## Scene 7: Tests and close (2:30 – 2:45)
+
+**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 31 tests` and `OK`.
+
+**Say:**
+> "Thirty-one tests cover the field arithmetic, uniform sharing, the AAD length field, shard failover, ledger tampering, BFV at depth one, provider errors and the leak check. The known limitations are listed in the README. Thanks for watching."

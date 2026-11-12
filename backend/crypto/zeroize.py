@@ -1,7 +1,9 @@
 """
 Zeroize & Native C Memory Sanitization Utility.
-Wraps libvaultcrypto's C11 memset_s() + volatile memory barrier to guarantee
-in-place zeroization of mutable C buffers without compiler dead-store elimination.
+Wraps libvaultcrypto's vault_secure_wipe(): memset_s() (C11 Annex K; used on macOS, where libc
+provides it, and wherever __STDC_LIB_EXT1__ is defined) with a volatile-loop fallback elsewhere,
+plus a compiler memory barrier, so in-place zeroization of mutable C buffers is not removed by
+dead-store elimination. Immutable Python str/bytes/int objects cannot be wiped.
 """
 
 import ctypes
@@ -28,7 +30,7 @@ _LIB = load_native_lib()
 
 def secure_zero(buffer_obj) -> None:
     """
-    Overwrite a mutable ctypes array or bytearray in-place using native C memset_s().
+    Overwrite a mutable ctypes array or bytearray in-place using native vault_secure_wipe() (memset_s).
     Explicitly rejects immutable Python str/bytes to prevent false security assumptions.
     """
     if isinstance(buffer_obj, (str, bytes, int)):
@@ -56,7 +58,7 @@ def secure_zero(buffer_obj) -> None:
 class NativeBufferGuard:
     """
     Context manager allocating a fixed-size mutable ctypes uint8 buffer
-    that is guaranteed to be wiped via C memset_s() on scope exit.
+    that is wiped via native vault_secure_wipe() (memset_s) on scope exit.
     """
 
     def __init__(self, size: int):
