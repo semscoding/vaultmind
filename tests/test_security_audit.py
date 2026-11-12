@@ -1,19 +1,23 @@
 """
 Comprehensive Security & Cryptographic Verification Suite for VaultMind v2.
-Tests all 6 architectural layers: frontend, backend, database, apis, services, and monitoring.
+Tests all 6 architectural layers: frontend, backend, database, apis, services, and monitoring,
+including Native C RLWE-BFV Lattice FHE, C AES-256 Session Secret Sealing, and Live LLM Config.
 """
 
 import os
+import random
 import sqlite3
 import tempfile
 import unittest
 from fastapi.testclient import TestClient
 
-from backend.crypto.zeroize import NativeBufferGuard, secure_zero
-from backend.crypto.shamir import ShamirSecretSharing
+from apis.llm_client import LLMClient, load_dotenv_if_present
+from backend.crypto.bfv_fhe import BFVContext, SessionSecretVault
 from backend.crypto.homomorphic import PaillierKeypair
-from services.pipeline_service import AgentPipeline
+from backend.crypto.shamir import ShamirSecretSharing
+from backend.crypto.zeroize import NativeBufferGuard, secure_zero
 from main import app
+from services.pipeline_service import AgentPipeline
 
 
 class VaultMindSecurityAuditTests(unittest.TestCase):
@@ -84,7 +88,7 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
             restored = pipe.enclave.restore_all_shards()
             self.assertTrue(restored["quorum_healthy"])
 
-    def test_04_paillier_1024_fixed_point_and_blind_bonus_math(self):
+    def test_04_paillier_1024_phe_fixed_point_math(self):
         kp = PaillierKeypair.generate(bits=1024)
         self.assertGreaterEqual(kp.n.bit_length(), 1024)
 
@@ -99,7 +103,8 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
                 pipe = AgentPipeline(storage_dir=tmp, paillier_bits=1024, reset_vault=True)
 
                 r_sal = await pipe.process_prompt(
-                    "Evaluate a 15% annual bonus for employee Marcus Vance (salary: $130,000, rating: 4.9) and commit to database."
+                    "Evaluate a 15% annual bonus for employee Marcus Vance (salary: $130,000, rating: 4.9) and commit to database.",
+                    provider="simulation",
                 )
                 self.assertEqual(r_sal["status"], "SUCCESS")
                 self.assertNotIn("Marcus Vance", r_sal["blinded_prompt"])
@@ -109,7 +114,8 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
                 self.assertIn("$149,500.00", r_sal["unblinded_result"])
 
                 r_hlth = await pipe.process_prompt(
-                    "Process confidential patient record for Sophia Laurent (BSN: 94820194, hemoglobin: 14.2, clinic: Amsterdam Central) and update secure EHR ledger."
+                    "Process confidential patient record for Sophia Laurent (BSN: 94820194, hemoglobin: 14.2, clinic: Amsterdam Central) and update secure EHR ledger.",
+                    provider="simulation",
                 )
                 self.assertEqual(r_hlth["status"], "SUCCESS")
                 self.assertIn("record for [ID_", r_hlth["blinded_prompt"])
@@ -118,7 +124,8 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
                 self.assertEqual(r_hlth["enclave_receipt"]["action"], "UPDATE_EHR_LEDGER")
 
                 r_fin = await pipe.process_prompt(
-                    "Authorize executive transfer of €50,000 to vendor Acronis Corp (IBAN: NL91ABNA041289) and sign with root credentials."
+                    "Authorize executive transfer of €50,000 to vendor Acronis Corp (IBAN: NL91ABNA041289) and sign with root credentials.",
+                    provider="simulation",
                 )
                 self.assertEqual(r_fin["status"], "SUCCESS")
                 for secret_piece in ["NL91ABNA041289", "Acronis Corp", "50,000"]:
@@ -170,7 +177,6 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
         self.assertNotIn("sk_live_9988776655", body["blinded_prompt"])
         self.assertIn("$30,000.00", body["unblinded_result"])
 
-        # Verify Monitoring Health & Telemetry endpoints
         res_health = client.get("/api/monitoring/health")
         self.assertEqual(res_health.status_code, 200)
         self.assertEqual(res_health.json()["status"], "HEALTHY")
@@ -178,6 +184,118 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
         res_metrics = client.get("/api/monitoring/metrics")
         self.assertEqual(res_metrics.status_code, 200)
         self.assertGreaterEqual(res_metrics.json()["counters"]["total_requests"], 1)
+
+    def test_07_native_c_rlwe_bfv_lattice_fhe_multiplication_and_relinearization(self):
+        import asyncio
+
+        bfv = BFVContext()
+        rng = random.Random(2026)
+        for _ in range(100):
+            a = rng.randint(0, 65535)
+            b = rng.randint(0, 65535)
+            ct_a = bfv.encrypt_int(a)
+            ct_b = bfv.encrypt_int(b)
+            # Evaluator holds ONLY rlk (zero secret key!)
+            ct_prod = bfv.evaluator.multiply(ct_a, ct_b)
+            ct_sum = bfv.evaluator.add(ct_a, ct_b)
+            self.assertEqual(bfv.decrypt_int(ct_prod), (a * b) % 65536)
+            self.assertEqual(bfv.decrypt_int(ct_sum), (a + b) % 65536)
+        bfv.close()
+
+        async def _run_pipeline_bfv():
+            with tempfile.TemporaryDirectory() as tmp:
+                pipe = AgentPipeline(storage_dir=tmp, paillier_bits=1024, reset_vault=True)
+                res = await pipe.process_prompt(
+                    "Compute invoice product for client Nova Labs (hours: 160, rate: $225, password is correct-horse-battery-staple, seed: <secret>master-seed-alpha-99</secret>) and commit to database.",
+                    provider="simulation",
+                )
+                self.assertEqual(res["status"], "SUCCESS")
+                self.assertEqual(res["fhe_computation"]["op"], "BFV_MULTIPLY")
+                self.assertEqual(
+                    res["fhe_computation"]["decrypted_outputs"]["[FHE_COMPUTED_PRODUCT]"],
+                    "$36,000",
+                )
+                self.assertIn("$36,000", res["unblinded_result"])
+                for secret_piece in [
+                    "Nova Labs",
+                    "160",
+                    "225",
+                    "correct-horse-battery-staple",
+                    "master-seed-alpha-99",
+                    "<secret>",
+                ]:
+                    self.assertNotIn(secret_piece, res["blinded_prompt"])
+
+        asyncio.run(_run_pipeline_bfv())
+
+    def test_08_free_text_passwords_secret_tags_jwts_hex_keys_and_c_session_seal(self):
+        sv = SessionSecretVault()
+        sealed = sv.seal("ultra-confidential-root-passphrase")
+        self.assertEqual(sv.unseal(sealed), "ultra-confidential-root-passphrase")
+
+        # Tamper with ciphertext byte -> C constant-time HMAC must reject
+        bad_blob = dict(sealed)
+        bad_blob["ct_hex"] = ("00" if not sealed["ct_hex"].startswith("00") else "ff") + sealed["ct_hex"][2:]
+        with self.assertRaises(RuntimeError):
+            sv.unseal(bad_blob)
+        sv.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipe = AgentPipeline(storage_dir=tmp, paillier_bits=1024, reset_vault=True)
+            complex_secret_prompt = (
+                "Verify credentials where password is my_custom_password_42!, "
+                'passphrase: "winter-nebula-quantum", pin = 8492, '
+                "Bearer tok_live_abc987xyz654, "
+                "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U, "
+                "raw hex 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08, "
+                "and <secret>arbitrary freeform secret phrase</secret>."
+            )
+            blinded, ctx = pipe.tokenizer.blind_prompt(complex_secret_prompt)
+
+            must_not_appear = [
+                "my_custom_password_42!",
+                "winter-nebula-quantum",
+                "8492",
+                "tok_live_abc987xyz654",
+                "eyJhbGciOiJIUzI1NiJ9",
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "arbitrary freeform secret phrase",
+                "<secret>",
+            ]
+            for s in must_not_appear:
+                self.assertNotIn(s, blinded, f"Secret '{s}' leaked into blinded wire prompt!")
+                # Also verify raw secrets are NOT sitting in plaintext token_to_plaintext dict
+                self.assertNotIn(s, ctx.token_to_plaintext.values())
+
+            self.assertEqual(len(ctx.sealed_secrets), 7)
+
+    def test_09_dotenv_llm_config_and_bfv_api_endpoints(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as tf:
+            tf.write("AWS_BEARER_TOKEN_BEDROCK=ABSK_test_dummy_key_do_not_leak\n")
+            tmp_env_path = tf.name
+
+        old_val = os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+        try:
+            load_dotenv_if_present(tmp_env_path)
+            cfg = LLMClient.get_env_config()
+            self.assertTrue(cfg["bedrock_configured"])
+            self.assertNotIn("ABSK_test_dummy_key_do_not_leak", str(cfg))
+        finally:
+            os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+            if old_val is not None:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = old_val
+            os.unlink(tmp_env_path)
+
+        client = TestClient(app)
+        res_cfg = client.get("/api/llm-config")
+        self.assertEqual(res_cfg.status_code, 200)
+        self.assertIn("recommended_default", res_cfg.json())
+
+        res_bfv = client.post("/api/bfv-fhe-calc", json={"m1": 160, "m2": 225})
+        self.assertEqual(res_bfv.status_code, 200)
+        bfv_data = res_bfv.json()
+        self.assertEqual(bfv_data["decrypted_product_mod_t"], 36000)
+        self.assertEqual(bfv_data["decrypted_sum_mod_t"], 385)
 
 
 if __name__ == "__main__":

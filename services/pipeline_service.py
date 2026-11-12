@@ -1,6 +1,6 @@
 """
-Pipeline Service: Orchestrates Blinding, Cloud/ZK LLM Reasoning,
-1024-bit Paillier FHE Math, Native C Enclave Sealing, and Security Telemetry.
+Pipeline Service: Orchestrates Blinding, C AES-256 Secret Sealing, Cloud/ZK LLM Reasoning,
+1024-bit Paillier PHE + Native C RLWE-BFV FHE Math, Enclave Sealing, and Security Telemetry.
 """
 
 import time
@@ -44,9 +44,11 @@ class AgentPipeline:
         wire_payload = {
             "provider_mode": provider,
             "transmitted_prompt": blinded_text,
-            "paillier_public_modulus_bits": self.tokenizer.paillier.n.bit_length(),
+            "paillier_phe_modulus_bits": self.tokenizer.paillier.n.bit_length(),
+            "bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)",
             "contains_master_key": False,
             "contains_raw_pii": False,
+            "contains_raw_secrets": False,
         }
         audit_trail.append(
             {
@@ -74,21 +76,26 @@ class AgentPipeline:
         hmac_map = {
             k: v for k, v in ctx.token_to_plaintext.items() if not k.startswith("[FHE_")
         }
+        # Include C-sealed secret tokens in token table WITHOUT leaking plaintext secrets
+        for sec_tok, blob in ctx.sealed_secrets.items():
+            hmac_map[sec_tok] = f"[C-AES256 Sealed: {blob['preview']}]"
 
         audit_trail.append(
             {
                 "phase": "PHASE_1_BLINDING",
-                "name": "Local Cryptographic Masking & 1024-bit Paillier FHE",
+                "name": "Local Cryptographic Masking, C Secret Sealing & Dual PHE/FHE",
                 "details": {
                     "original_input": user_prompt,
                     "blinded_output": blinded_text,
                     "hmac_tokens": hmac_map,
+                    "sealed_secret_count": len(ctx.sealed_secrets),
                     "homomorphic_ciphertexts": [
                         {
                             "token": k,
                             "raw_text": v["raw_text"],
                             "scale": v["scale"],
                             "hex_preview": v["hex_preview"],
+                            "bfv_preview": v.get("bfv_preview"),
                             "modulus_n_bits": ctx.paillier.n.bit_length(),
                         }
                         for k, v in ctx.encrypted_numbers.items()
@@ -184,6 +191,7 @@ class AgentPipeline:
             "audit_trail": audit_trail,
             "vault_topology": vault_status,
             "paillier_public_key": self.tokenizer.paillier.public_key_dict,
+            "bfv_parameters": self.tokenizer.bfv.parameters_dict,
             "recent_ledger": self.enclave.ledger.list_entries(limit=10),
             "monitoring": self.monitor.snapshot(),
         }

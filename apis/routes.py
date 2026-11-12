@@ -1,14 +1,17 @@
 """
 API Router Module (`apis/routes.py`).
-Exposes REST endpoints for Zero-Knowledge Pipeline execution, 2048-bit Feldman VSS
-shard inspection/tampering, 1024-bit Paillier FHE math, SQLite HMAC verification,
-and real-time Security Telemetry Monitoring.
+Exposes REST endpoints for Zero-Knowledge Pipeline execution, Host LLM Config detection,
+2048-bit Feldman VSS shard inspection/tampering, 1024-bit Paillier PHE math,
+Native C Lattice RLWE-BFV FHE ciphertext × ciphertext multiplication,
+SQLite HMAC verification, and real-time Security Telemetry Monitoring.
 """
 
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from apis.llm_client import LLMClient
+from backend.crypto.bfv_fhe import BFV_T
 from services.pipeline_service import AgentPipeline
 
 router = APIRouter(prefix="/api")
@@ -20,7 +23,7 @@ pipeline = AgentPipeline()
 class ProcessPromptRequest(BaseModel):
     prompt: str
     api_key: Optional[str] = None
-    provider: Optional[str] = "simulation"
+    provider: Optional[str] = "auto"
 
 
 class HomomorphicCalcRequest(BaseModel):
@@ -28,8 +31,19 @@ class HomomorphicCalcRequest(BaseModel):
     val2: float
 
 
+class BFVCalcRequest(BaseModel):
+    m1: int
+    m2: int
+
+
 class TamperNodeRequest(BaseModel):
     node_index: int
+
+
+@router.get("/llm-config")
+async def get_llm_config():
+    """Return which live cloud LLM host API keys are configured in `.env` / environment."""
+    return LLMClient.get_env_config()
 
 
 @router.get("/vault-status")
@@ -64,7 +78,7 @@ async def process_prompt_endpoint(req: ProcessPromptRequest):
     try:
         return await pipeline.process_prompt(
             user_prompt=req.prompt,
-            provider=req.provider or "simulation",
+            provider=req.provider or "auto",
             api_key=req.api_key,
         )
     except (ValueError, RuntimeError) as exc:
@@ -73,6 +87,7 @@ async def process_prompt_endpoint(req: ProcessPromptRequest):
 
 @router.post("/homomorphic-calc")
 async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
+    """1024-bit Paillier Additive Homomorphic Encryption (PHE) over Z_{n^2}^*."""
     paillier = pipeline.tokenizer.paillier
     evaluator = pipeline.tokenizer.evaluator
 
@@ -84,20 +99,69 @@ async def homomorphic_calc_endpoint(req: HomomorphicCalcRequest):
     pipeline.monitor.total_fhe_computations += 1
     pipeline.monitor.record_event(
         "INFO",
-        "paillier_fhe",
-        f"Evaluated 1024-bit homomorphic ciphertext addition ({paillier.n.bit_length()} bits).",
+        "paillier_phe",
+        f"Evaluated 1024-bit Paillier PHE ciphertext addition ({paillier.n.bit_length()} bits).",
     )
 
     return {
+        "scheme": "1024-bit Paillier Additive Homomorphic Encryption (PHE)",
         "modulus_bits": paillier.n.bit_length(),
         "val1": req.val1,
         "val2": req.val2,
         "c1_hex": f"{hex(c1)[:20]}...{hex(c1)[-8:]}",
         "c2_hex": f"{hex(c2)[:20]}...{hex(c2)[-8:]}",
         "c_sum_hex": f"{hex(c_sum)[:20]}...{hex(c_sum)[-8:]}",
-        "operation": "c_sum = (c1 * c2) mod n^2  [1024-bit modulus]",
+        "operation": "c_sum = (c1 · c2) mod n^2  [1024-bit Paillier PHE]",
         "decrypted_sum": round(decrypted_sum, 4),
-        "mathematical_proof": f"D(E({req.val1}) * E({req.val2}) mod n^2) = {decrypted_sum:g}",
+        "mathematical_proof": f"D(E({req.val1}) · E({req.val2}) mod n^2) = {decrypted_sum:g}",
+    }
+
+
+@router.post("/bfv-fhe-calc")
+async def bfv_fhe_calc_endpoint(req: BFVCalcRequest):
+    """
+    True Lattice RLWE-BFV Homomorphic Encryption in Native C (`libvaultcrypto.dylib`)
+    over R_q = Z_{2^60}[X] / (X^64 + 1), computing BOTH E(m1) + E(m2) AND non-linear
+    ciphertext × ciphertext multiplication E(m1) * E(m2) with 4-limb gadget relinearization.
+    """
+    if not (0 <= req.m1 < BFV_T and 0 <= req.m2 < BFV_T):
+        raise HTTPException(
+            status_code=400,
+            detail=f"BFV plaintext integers must lie in Z_{BFV_T} [0, {BFV_T - 1}].",
+        )
+
+    bfv = pipeline.tokenizer.bfv
+    ct1 = bfv.encrypt_int(req.m1)
+    ct2 = bfv.encrypt_int(req.m2)
+
+    ct_add = bfv.evaluator.add(ct1, ct2)
+    ct_mul = bfv.evaluator.multiply(ct1, ct2)
+
+    dec_add = bfv.decrypt_int(ct_add)
+    dec_mul = bfv.decrypt_int(ct_mul)
+
+    pipeline.monitor.total_fhe_computations += 1
+    pipeline.monitor.record_event(
+        "INFO",
+        "bfv_lattice_fhe",
+        f"Evaluated Native C RLWE-BFV ciphertext × ciphertext product & relinearization ({req.m1} * {req.m2} mod 65536).",
+    )
+
+    return {
+        "scheme": "Native C Ring-LWE BFV Lattice FHE",
+        "ring": "R_q = Z_{2^60}[X] / (X^64 + 1), t = 65536",
+        "m1": req.m1,
+        "m2": req.m2,
+        "ct1_preview": bfv.ciphertext_preview(ct1),
+        "ct2_preview": bfv.ciphertext_preview(ct2),
+        "ct_mul_preview": bfv.ciphertext_preview(ct_mul),
+        "decrypted_sum_mod_t": dec_add,
+        "decrypted_product_mod_t": dec_mul,
+        "exact_integer_no_wrap": (req.m1 * req.m2) < BFV_T,
+        "mathematical_proof": (
+            f"D(Relin(E({req.m1}) ⊗ E({req.m2}))) = {dec_mul}  |  "
+            f"D(E({req.m1}) ⊕ E({req.m2})) = {dec_add}  (mod 65536)"
+        ),
     }
 
 
@@ -113,6 +177,8 @@ async def get_monitoring_health():
         "status": "HEALTHY" if vault_st["quorum_healthy"] else "DEGRADED_QUORUM",
         "native_c_enclave": "ACTIVE",
         "quorum_healthy": vault_st["quorum_healthy"],
-        "paillier_modulus_bits": pipeline.tokenizer.paillier.n.bit_length(),
+        "paillier_phe_modulus_bits": pipeline.tokenizer.paillier.n.bit_length(),
+        "bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)",
+        "llm_env": LLMClient.get_env_config(),
         "telemetry": pipeline.monitor.snapshot(),
     }

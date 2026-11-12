@@ -3,6 +3,7 @@ let shamirChart = null;
 
 const SCENARIOS = {
     salary: "Evaluate a 15% annual bonus for employee Marcus Vance (salary: $130,000, rating: 4.9) and commit to database with master key.",
+    bfv_secrets: "Compute invoice product for client Nova Labs (hours: 160, rate: $225, password is correct-horse-battery-staple, seed: <secret>master-seed-alpha-99</secret>) and commit to database.",
     health: "Process confidential patient record for Sophia Laurent (BSN: 94820194, hemoglobin: 14.2, clinic: Amsterdam Central) and update secure EHR ledger.",
     finance: "Authorize executive transfer of €50,000 to vendor Acronis Corp (IBAN: NL91ABNA041289) and sign with root credentials.",
     xss: "Evaluate 20% bonus for employee Elena Rostova (note: <img src=x onerror=alert('XSS')>, token: sk_live_998877665544, salary: $150,000) and commit to database."
@@ -20,9 +21,26 @@ function escapeHtml(unsafe) {
 document.addEventListener("DOMContentLoaded", () => {
     initChart();
     loadScenario("salary");
+    detectLiveLLMConfig();
     fetchVaultStatus();
     verifyLedger(false);
 });
+
+async function detectLiveLLMConfig() {
+    try {
+        const res = await fetch("/api/llm-config");
+        if (!res.ok) return;
+        const cfg = await res.json();
+        const select = document.getElementById("providerSelect");
+        const keyInput = document.getElementById("apiKeyInput");
+        if (cfg.any_live_configured && cfg.recommended_default) {
+            select.value = cfg.recommended_default;
+            keyInput.placeholder = `✔ ${cfg.recommended_default.toUpperCase()} key loaded from .env`;
+        }
+    } catch (err) {
+        console.error("Failed to check LLM config:", err);
+    }
+}
 
 function loadScenario(type) {
     const input = document.getElementById("promptInput");
@@ -222,7 +240,9 @@ function formatSafeHighlightedWire(blindedPrompt, paillierBits) {
         `// SECURITY INVARIANTS:\n` +
         `"contains_master_key": false,\n` +
         `"contains_raw_pii": false,\n` +
-        `"paillier_modulus_bits": ${Number(paillierBits) || 1024}`
+        `"contains_raw_secrets": false,\n` +
+        `"paillier_phe_modulus_bits": ${Number(paillierBits) || 1024},\n` +
+        `"bfv_fhe_ring": "Z_{2^60}[X]/(X^64 + 1)"`
     );
 }
 
@@ -243,9 +263,9 @@ async function runPipeline() {
     if (!text) return;
 
     runBtn.disabled = true;
-    runBtn.textContent = "⏳ Running C Enclave & FHE...";
+    runBtn.textContent = "⏳ Running C Enclave & PHE/FHE...";
     decryptedOutput.className = "content-output placeholder";
-    decryptedOutput.textContent = "Blinding sensitive spans, running 1024-bit Paillier math, and verifying 2048-bit Feldman shards...";
+    decryptedOutput.textContent = "Blinding sensitive spans, running Paillier PHE / C Lattice RLWE-BFV FHE, and verifying 2048-bit Feldman shards...";
     fheBanner.classList.add("hidden");
 
     try {
@@ -273,7 +293,7 @@ async function runPipeline() {
 
         if (payload.paillier_public_key && payload.paillier_public_key.modulus_bits) {
             document.getElementById("paillierBitsText").textContent =
-                `Paillier ${payload.paillier_public_key.modulus_bits}-bit Fixed-Point`;
+                `Paillier ${payload.paillier_public_key.modulus_bits}-bit PHE + C RLWE-BFV FHE`;
         }
 
         // Homomorphic Agent Computation Proof Banner
@@ -281,8 +301,9 @@ async function runPipeline() {
             const outs = Object.entries(payload.fhe_computation.decrypted_outputs || {})
                 .map(([k, v]) => `${k} → ${v}`)
                 .join("  |  ");
+            const eng = payload.fhe_computation.engine || "Homomorphic Engine";
             fheBanner.textContent =
-                `🧮 Blind FHE Executed: ${payload.fhe_computation.formula}  ⟹  ${outs}`;
+                `🧮 [${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
             fheBanner.classList.remove("hidden");
         }
 
@@ -290,7 +311,7 @@ async function runPipeline() {
         wireOutput.className = "wire-code-block";
         wireOutput.innerHTML = formatSafeHighlightedWire(
             payload.blinded_prompt,
-            payload.cloud_wire_payload ? payload.cloud_wire_payload.paillier_public_modulus_bits : 1024
+            payload.cloud_wire_payload ? payload.cloud_wire_payload.paillier_phe_modulus_bits : 1024
         );
 
         // Mapping Tokens Table (DOM construction with textContent — zero innerHTML injection!)
@@ -306,7 +327,7 @@ async function runPipeline() {
                 kSpan.textContent = tok;
                 const vSpan = document.createElement("span");
                 vSpan.className = "token-val";
-                vSpan.textContent = `⟷ "${orig}"`;
+                vSpan.textContent = tok.startsWith("[SECRET_") ? `⟷ ${orig}` : `⟷ "${orig}"`;
                 row.appendChild(kSpan);
                 row.appendChild(vSpan);
                 mappingTokens.appendChild(row);
@@ -319,7 +340,8 @@ async function runPipeline() {
                 kSpan.textContent = item.token;
                 const vSpan = document.createElement("span");
                 vSpan.className = "token-val";
-                vSpan.textContent = `"${item.raw_text}" → ${item.modulus_n_bits}-bit (${item.hex_preview})`;
+                const bfvNote = item.bfv_preview ? ` + BFV ${item.bfv_preview}` : "";
+                vSpan.textContent = `"${item.raw_text}" → ${item.modulus_n_bits}-bit PHE (${item.hex_preview})${bfvNote}`;
                 row.appendChild(kSpan);
                 row.appendChild(vSpan);
                 mappingTokens.appendChild(row);
@@ -378,7 +400,7 @@ async function calcHomomorphic() {
         const data = await res.json();
         resultBox.classList.remove("hidden");
         resultBox.textContent =
-            `[${data.modulus_bits}-bit Paillier]  ` +
+            `[${data.modulus_bits}-bit Paillier PHE]  ` +
             `E(m₁) = ${data.c1_hex}   |   E(m₂) = ${data.c2_hex}\n` +
             `Operation: ${data.operation}\n` +
             `✔ ${data.mathematical_proof}`;
@@ -386,6 +408,33 @@ async function calcHomomorphic() {
     } catch (err) {
         resultBox.classList.remove("hidden");
         resultBox.textContent = `Error: ${err.message}`;
+    }
+}
+
+async function calcBFV() {
+    const m1 = Math.round(parseFloat(document.getElementById("fheVal1").value) || 0);
+    const m2 = Math.round(parseFloat(document.getElementById("fheVal2").value) || 0);
+    const resultBox = document.getElementById("fheResult");
+
+    try {
+        const res = await fetch("/api/bfv-fhe-calc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ m1, m2 })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.detail || "BFV calculation error.");
+        }
+        resultBox.classList.remove("hidden");
+        resultBox.textContent =
+            `[${data.scheme} | ${data.ring}]\n` +
+            `E(m₁) = ${data.ct1_preview}   |   E(m₂) = ${data.ct2_preview}   |   Relin(E(m₁)⊗E(m₂)) = ${data.ct_mul_preview}\n` +
+            `✔ ${data.mathematical_proof}`;
+        resultBox.style.whiteSpace = "pre-wrap";
+    } catch (err) {
+        resultBox.classList.remove("hidden");
+        resultBox.textContent = `BFV Error: ${err.message}`;
     }
 }
 

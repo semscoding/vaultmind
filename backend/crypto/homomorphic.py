@@ -1,13 +1,15 @@
 """
-Paillier Additive Homomorphic Cryptosystem (1024-bit Default) & Blind Evaluator.
+Paillier Additive Homomorphic Cryptosystem (1024-bit PHE) & Blind Evaluator.
 
 Mathematical properties over Z_{n^2}^*:
-- Additive Homomorphism: D(E(m1) * E(m2) mod n^2) = (m1 + m2) mod n
-- Scalar Multiplication: D(E(m1)^k mod n^2) = (k * m1) mod n
+- Additive Homomorphism (PHE): D(E(m1) * E(m2) mod n^2) = (m1 + m2) mod n
+- Scalar Multiplication (PHE): D(E(m1)^k mod n^2) = (k * m1) mod n
 
-Supports exact fixed-point arithmetic (base scale = 100) so decimals, percentages,
-and currency figures are computed homomorphically on ciphertexts without truncation
-or intermediate decryption.
+Note on Homomorphic Depth:
+- Paillier is an Additive / Partially Homomorphic Encryption (PHE) scheme ideal for
+  exact 1024-bit fixed-point financial sums and public percentage policy scalars.
+- For non-linear ciphertext × ciphertext multiplication E(m1) * E(m2), VaultMind pairs
+  Paillier with Native C Lattice Ring-LWE BFV (Brakerski-Fan-Vercauteren) FHE in `bfv_fhe.py`.
 """
 
 import math
@@ -33,7 +35,7 @@ def lcm(a: int, b: int) -> int:
 
 
 class PaillierKeypair:
-    DEFAULT_SCALE = 100  # 2 decimal places of exact precision
+    DEFAULT_SCALE = 100  # 2 decimal places of exact fixed-point precision
 
     def __init__(self, p: int, q: int, bits: int = 1024):
         if p == q:
@@ -115,6 +117,7 @@ class PaillierKeypair:
     @property
     def public_key_dict(self) -> Dict[str, Any]:
         return {
+            "scheme": "Paillier Additive Homomorphic (1024-bit PHE)",
             "modulus_bits": self.n.bit_length(),
             "n_preview": hex(self.n)[:22] + "..." + hex(self.n)[-10:],
             "n_squared_bits": self.n_sq.bit_length(),
@@ -147,7 +150,6 @@ class HomomorphicEvaluator:
         """
         Compute `percent_int`% of encrypted value `c` without decrypting:
             c_out = c^(percent_int) mod n^2, new_scale = scale * 100
-        Example: 15% of E(130000 * 100) -> E(195000000) with scale 10000 -> decrypts to 19500.00!
         """
         if percent_int < 0:
             raise ValueError("Percentage must be non-negative.")
@@ -158,10 +160,8 @@ class HomomorphicEvaluator:
         self, op_spec: Dict[str, Any], encrypted_handles: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
-        Evaluate a structured homomorphic instruction emitted by the LLM agent.
-        Supported operations:
+        Evaluate a structured Paillier PHE operation emitted by the LLM agent:
         - {"op": "PERCENT_BONUS", "ref": "[FHE_NUM_1]", "percent": 15}
-          Computes bonus = ref * (percent/100) AND total = ref * ((100 + percent)/100).
         - {"op": "ADD", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"}
         - {"op": "MUL_SCALAR", "ref": "[FHE_NUM_1]", "scalar": 12}
         """
@@ -171,11 +171,12 @@ class HomomorphicEvaluator:
             ref = op_spec.get("ref", "")
             pct = int(op_spec.get("percent", 15))
             if ref not in encrypted_handles:
-                raise KeyError(f"Unknown FHE handle: {ref}")
+                raise KeyError(f"Unknown homomorphic handle: {ref}")
             entry = encrypted_handles[ref]
             c_bonus, scale_bonus = self.percentage_of(entry["ciphertext"], entry["scale"], pct)
             c_total, scale_total = self.percentage_of(entry["ciphertext"], entry["scale"], 100 + pct)
             return {
+                "engine": "1024-bit Paillier PHE",
                 "op": op,
                 "label": f"{pct}% Bonus & Adjusted Compensation on {ref}",
                 "formula": f"c_bonus = {ref}^{pct} mod n², c_total = {ref}^{100 + pct} mod n²",
@@ -189,14 +190,15 @@ class HomomorphicEvaluator:
             ref_a = op_spec.get("ref_a", "")
             ref_b = op_spec.get("ref_b", "")
             if ref_a not in encrypted_handles or ref_b not in encrypted_handles:
-                raise KeyError(f"Unknown FHE handles for ADD: {ref_a}, {ref_b}")
+                raise KeyError(f"Unknown homomorphic handles for ADD: {ref_a}, {ref_b}")
             ea = encrypted_handles[ref_a]
             eb = encrypted_handles[ref_b]
             c_sum, scale_sum = self.add_scaled(ea["ciphertext"], ea["scale"], eb["ciphertext"], eb["scale"])
             return {
+                "engine": "1024-bit Paillier PHE",
                 "op": op,
                 "label": f"Homomorphic Sum ({ref_a} + {ref_b})",
-                "formula": f"c_sum = ({ref_a} * {ref_b}) mod n²",
+                "formula": f"c_sum = ({ref_a} · {ref_b}) mod n²",
                 "outputs": {
                     "[FHE_COMPUTED_SUM]": {"ciphertext": c_sum, "scale": scale_sum},
                 },
@@ -206,10 +208,11 @@ class HomomorphicEvaluator:
             ref = op_spec.get("ref", "")
             scalar = int(op_spec.get("scalar", 1))
             if ref not in encrypted_handles:
-                raise KeyError(f"Unknown FHE handle: {ref}")
+                raise KeyError(f"Unknown homomorphic handle: {ref}")
             entry = encrypted_handles[ref]
             c_mul = pow(entry["ciphertext"], scalar, self.n_sq)
             return {
+                "engine": "1024-bit Paillier PHE",
                 "op": op,
                 "label": f"Homomorphic Scalar Product ({scalar} × {ref})",
                 "formula": f"c_prod = {ref}^{scalar} mod n²",
@@ -218,4 +221,4 @@ class HomomorphicEvaluator:
                 },
             }
 
-        raise ValueError(f"Unsupported homomorphic operation: {op}")
+        raise ValueError(f"Unsupported Paillier operation: {op}")

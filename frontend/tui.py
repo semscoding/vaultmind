@@ -28,7 +28,7 @@ pipeline = AgentPipeline()
 def make_header() -> Panel:
     title = Text("VAULTMIND v2: NATIVE C ENCLAVE & ZERO-KNOWLEDGE AI PIPELINE", style="bold green")
     subtitle = Text(
-        "C11 memset_s() + GF(2^8) Shamir • 2048-bit Feldman VSS • 1024-bit Paillier FHE",
+        "C11 memset_s() + GF(2^8) Shamir • 2048-bit Feldman VSS • Paillier PHE + C Lattice RLWE-BFV FHE",
         style="dim cyan",
     )
     grid = Table.grid(expand=True)
@@ -116,8 +116,8 @@ async def main_loop():
             console.print(pipeline.monitor.snapshot())
             continue
 
-        with console.status("[bold green]Running Blinder, 1024-bit FHE & Native C Enclave...[/bold green]"):
-            result = await pipeline.process_prompt(user_input)
+        with console.status("[bold green]Running Blinder, Dual PHE/RLWE-BFV FHE & Native C Enclave...[/bold green]"):
+            result = await pipeline.process_prompt(user_input, provider="auto")
 
         console.clear()
         console.print(make_header())

@@ -1,6 +1,11 @@
 """
-External Cloud LLM API Connectors (Google Gemini 2.5 Flash & OpenAI GPT-4o-mini)
-plus Offline Deterministic Zero-Knowledge Engine.
+External Cloud LLM API Connectors:
+- Google Gemini 2.5 Flash (`GEMINI_API_KEY`)
+- OpenAI GPT-4o-mini (`OPENAI_API_KEY`)
+- AWS Bedrock Converse API (`AWS_BEARER_TOKEN_BEDROCK`)
+- Offline Deterministic Zero-Knowledge Engine (air-gapped fallback / CI testing)
+
+Automatically loads project-root `.env` on import without external dependencies.
 """
 
 import json
@@ -10,17 +15,42 @@ from typing import Any, Dict, Optional
 import httpx
 
 
+def load_dotenv_if_present(dotenv_path: Optional[str] = None) -> None:
+    """Minimal, dependency-free `.env` loader that preserves existing environment variables."""
+    if dotenv_path is None:
+        dotenv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    if not os.path.isfile(dotenv_path):
+        return
+    try:
+        with open(dotenv_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and val and key not in os.environ:
+                    os.environ[key] = val
+    except OSError:
+        pass
+
+
+load_dotenv_if_present()
+
+
 SYSTEM_PROMPT = """You are VaultMind Zero-Knowledge Autonomous Agent.
 SECURITY INVARIANTS:
-1. Sensitive identifiers are HMAC-blinded tokens: [ID_XXXX], [IBAN_XXXX], [GOV_ID_XXXX], [EMAIL_XXXX], [LOC_XXXX].
-2. Sensitive numbers are 1024-bit Paillier ciphertexts: [FHE_NUM_1], [FHE_NUM_2], etc.
-3. You hold ZERO shares of any master key and cannot access plaintext PII or numbers.
+1. Sensitive identifiers and secrets are blinded tokens: [ID_XXXX], [IBAN_XXXX], [GOV_ID_XXXX], [EMAIL_XXXX], [LOC_XXXX], [SECRET_XXXX].
+2. Sensitive numbers are encrypted ciphertexts: [FHE_NUM_1], [FHE_NUM_2], etc. (1024-bit Paillier PHE + Lattice RLWE-BFV FHE).
+3. You hold ZERO shares of any master key and cannot access plaintext PII, passwords, or numbers.
 
 INSTRUCTIONS:
 1. Reason concisely over the blinded tokens.
 2. If a mathematical calculation on encrypted numbers is appropriate:
    - Percentage bonus (e.g. 15% on [FHE_NUM_1]): emit "fhe_compute": {"op": "PERCENT_BONUS", "ref": "[FHE_NUM_1]", "percent": 15} and reference [FHE_COMPUTED_BONUS] and [FHE_COMPUTED_TOTAL] in your summary.
    - Sum of two encrypted numbers: emit "fhe_compute": {"op": "ADD", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_SUM] in your summary.
+   - Non-linear product of two encrypted integers (e.g. hours * rate or units * price): emit "fhe_compute": {"op": "BFV_MULTIPLY", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_PRODUCT] in your summary.
 3. If the prompt requests committing, updating, authorizing, transferring, or storing privileged data, emit "action_intent" with action in ["GRANT_COMPLIANCE_BONUS", "UPDATE_EHR_LEDGER", "TRANSFER_EXECUTE", "DB_WRITE_RECORD"].
 
 Always include one fenced ```json block at the end of your response using this schema:
@@ -39,12 +69,40 @@ Set "fhe_compute" or "action_intent" to null if not needed.
 
 
 class LLMClient:
+    @staticmethod
+    def get_env_config() -> Dict[str, Any]:
+        """Return safe boolean availability of live host-provider API keys (never exposes key values)."""
+        load_dotenv_if_present()
+        has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+        has_openai = bool(os.getenv("OPENAI_API_KEY", "").strip())
+        has_bedrock = bool(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip())
+
+        if has_gemini:
+            recommended = "gemini"
+        elif has_openai:
+            recommended = "openai"
+        elif has_bedrock:
+            recommended = "bedrock"
+        else:
+            recommended = "simulation"
+
+        return {
+            "gemini_configured": has_gemini,
+            "openai_configured": has_openai,
+            "bedrock_configured": has_bedrock,
+            "any_live_configured": has_gemini or has_openai or has_bedrock,
+            "recommended_default": recommended,
+            "bedrock_region": os.getenv("AWS_REGION", "us-east-1"),
+            "bedrock_model": os.getenv("AWS_BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
+        }
+
     async def generate_blind_reasoning(
         self,
         blinded_prompt: str,
         provider: str = "simulation",
         api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        load_dotenv_if_present()
         mode = (provider or "simulation").lower().strip()
 
         if mode == "auto":
@@ -52,30 +110,34 @@ class LLMClient:
                 mode = "gemini"
             elif api_key and api_key.startswith("sk-"):
                 mode = "openai"
-            elif os.getenv("GEMINI_API_KEY"):
-                mode = "gemini"
-            elif os.getenv("OPENAI_API_KEY"):
-                mode = "openai"
+            elif api_key and api_key.startswith("ABSK"):
+                mode = "bedrock"
             else:
-                mode = "simulation"
+                mode = self.get_env_config()["recommended_default"]
 
         if mode == "gemini":
-            key = api_key or os.getenv("GEMINI_API_KEY")
+            key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
             if not key:
                 raise ValueError(
-                    "Gemini 2.5 Flash selected, but no GEMINI_API_KEY was provided. "
-                    "Enter an API key or select the Offline Zero-Knowledge Engine."
+                    "Gemini 2.5 Flash selected, but no GEMINI_API_KEY was provided in the UI or `.env`."
                 )
             return await self._call_gemini(blinded_prompt, key)
 
         if mode == "openai":
-            key = api_key or os.getenv("OPENAI_API_KEY")
+            key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
             if not key:
                 raise ValueError(
-                    "OpenAI GPT-4o-mini selected, but no OPENAI_API_KEY was provided. "
-                    "Enter an API key or select the Offline Zero-Knowledge Engine."
+                    "OpenAI GPT-4o-mini selected, but no OPENAI_API_KEY was provided in the UI or `.env`."
                 )
             return await self._call_openai(blinded_prompt, key)
+
+        if mode == "bedrock":
+            key = (api_key or os.getenv("AWS_BEARER_TOKEN_BEDROCK") or "").strip()
+            if not key:
+                raise ValueError(
+                    "AWS Bedrock selected, but no AWS_BEARER_TOKEN_BEDROCK was provided in the UI or `.env`."
+                )
+            return await self._call_bedrock(blinded_prompt, key)
 
         return self._run_deterministic_engine(blinded_prompt)
 
@@ -122,10 +184,33 @@ class LLMClient:
                 text, provider_label="OpenAI GPT-4o-mini (Live Cloud API)", is_live=True
             )
 
+    async def _call_bedrock(self, blinded_prompt: str, bearer_token: str) -> Dict[str, Any]:
+        region = os.getenv("AWS_REGION", "us-east-1").strip()
+        model_id = os.getenv("AWS_BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0").strip()
+        url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/converse"
+        headers = {"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"}
+        payload = {
+            "system": [{"text": SYSTEM_PROMPT}],
+            "messages": [{"role": "user", "content": [{"text": blinded_prompt}]}],
+            "inferenceConfig": {"temperature": 0.1},
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            res = await client.post(url, headers=headers, json=payload)
+            if res.status_code != 200:
+                raise RuntimeError(
+                    f"AWS Bedrock API error (HTTP {res.status_code}): {res.text[:240]}"
+                )
+            data = res.json()
+            text = data["output"]["message"]["content"][0]["text"]
+            return self._parse_structured_output(
+                text, provider_label=f"AWS Bedrock ({model_id} Live Cloud API)", is_live=True
+            )
+
     def _run_deterministic_engine(self, blinded_prompt: str) -> Dict[str, Any]:
         lower = blinded_prompt.lower()
 
         id_tokens = re.findall(r"\[(?:ID|EMAIL|GOV_ID|IBAN)_[A-F0-9]{8}\]", blinded_prompt)
+        secret_tokens = re.findall(r"\[SECRET_[A-F0-9]{8}\]", blinded_prompt)
         person_or_org = next((t for t in id_tokens if t.startswith("[ID_")), None)
         iban_tok = next((t for t in id_tokens if t.startswith("[IBAN_")), None)
         gov_tok = next((t for t in id_tokens if t.startswith("[GOV_ID_")), None)
@@ -138,6 +223,10 @@ class LLMClient:
         if "bonus" in lower and fhe_tokens:
             pct = int(pct_match.group(1)) if pct_match else 15
             fhe_compute = {"op": "PERCENT_BONUS", "ref": fhe_tokens[0], "percent": pct}
+        elif len(fhe_tokens) >= 2 and any(
+            w in lower for w in ["multiply", "product", "invoice", "hours", "units", "rate"]
+        ):
+            fhe_compute = {"op": "BFV_MULTIPLY", "ref_a": fhe_tokens[0], "ref_b": fhe_tokens[1]}
         elif len(fhe_tokens) >= 2 and any(w in lower for w in ["sum", "total", "combine", "add", "plus"]):
             fhe_compute = {"op": "ADD", "ref_a": fhe_tokens[0], "ref_b": fhe_tokens[1]}
 
@@ -174,23 +263,37 @@ class LLMClient:
             action_intent = {
                 "action": "DB_WRITE_RECORD",
                 "target": primary_target,
-                "params": {"fhe_refs": fhe_tokens},
+                "params": {
+                    "fhe_refs": fhe_tokens,
+                    "computed_product": "[FHE_COMPUTED_PRODUCT]"
+                    if (fhe_compute and fhe_compute["op"] == "BFV_MULTIPLY")
+                    else "N/A",
+                },
             }
 
         lines = [f"Zero-Knowledge reasoning completed for subject {primary_target}."]
         if fhe_compute and fhe_compute["op"] == "PERCENT_BONUS":
             lines.append(
-                f"- Homomorphic Policy Calculation ({fhe_compute['percent']}% on {fhe_compute['ref']}): "
+                f"- 1024-bit Paillier PHE Policy Calculation ({fhe_compute['percent']}% on {fhe_compute['ref']}): "
                 f"Bonus = [FHE_COMPUTED_BONUS], New Total Compensation = [FHE_COMPUTED_TOTAL]."
+            )
+        elif fhe_compute and fhe_compute["op"] == "BFV_MULTIPLY":
+            lines.append(
+                f"- Native C Lattice RLWE-BFV Non-Linear Product ({fhe_compute['ref_a']} × {fhe_compute['ref_b']} in R_q): "
+                f"Product = [FHE_COMPUTED_PRODUCT]."
             )
         elif fhe_compute and fhe_compute["op"] == "ADD":
             lines.append(
-                f"- Homomorphic Aggregation ({fhe_compute['ref_a']} + {fhe_compute['ref_b']}): "
+                f"- 1024-bit Paillier PHE Aggregation ({fhe_compute['ref_a']} + {fhe_compute['ref_b']}): "
                 f"Sum = [FHE_COMPUTED_SUM]."
             )
         elif fhe_tokens:
-            lines.append(f"- Verified 1024-bit Paillier encrypted field(s): {', '.join(fhe_tokens)}.")
+            lines.append(f"- Verified homomorphically encrypted field(s): {', '.join(fhe_tokens)}.")
 
+        if secret_tokens:
+            lines.append(
+                f"- Scrubbed & C-AES256 sealed {len(secret_tokens)} secret credential token(s) prior to wire transmission (zero plaintext exposure)."
+            )
         if iban_tok:
             lines.append(f"- Blinded Banking Routing Handle verified: {iban_tok}.")
         if gov_tok:

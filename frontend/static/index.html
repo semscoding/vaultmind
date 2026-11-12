@@ -17,7 +17,7 @@
                 <span class="logo-icon">🛡️</span>
                 <div class="logo-text">
                     <h1>VaultMind <span class="v-tag">v2</span></h1>
-                    <span class="sub-badge">Native C Enclave • 2048-bit VSS • 1024-bit FHE</span>
+                    <span class="sub-badge">Native C Enclave • 2048-bit VSS • Paillier PHE + Lattice RLWE-BFV FHE</span>
                 </div>
             </div>
             <div class="enclave-badge">
@@ -28,14 +28,15 @@
 
         <div class="header-right">
             <div class="model-select-wrapper">
-                <label for="providerSelect">LLM Engine:</label>
+                <label for="providerSelect">LLM Host:</label>
                 <select id="providerSelect">
-                    <option value="simulation" selected>⚡ Offline Deterministic ZK Engine</option>
                     <option value="gemini">✨ Google Gemini 2.5 Flash (Live API)</option>
                     <option value="openai">🤖 OpenAI GPT-4o-mini (Live API)</option>
+                    <option value="bedrock">☁️ AWS Bedrock Converse (Live API)</option>
+                    <option value="simulation" selected>⚡ Offline Deterministic ZK Engine</option>
                 </select>
             </div>
-            <input type="password" id="apiKeyInput" placeholder="API Key (required for Live Cloud)">
+            <input type="password" id="apiKeyInput" placeholder="API Key or configure .env">
         </div>
     </header>
 
@@ -49,8 +50,8 @@
             <span class="value purple" id="quorumText">k=3 of n=5 (2048-bit Feldman VSS)</span>
         </div>
         <div class="telemetry-card">
-            <span class="label">HOMOMORPHIC ENGINE</span>
-            <span class="value cyan" id="paillierBitsText">Paillier 1024-bit Fixed-Point</span>
+            <span class="label">HOMOMORPHIC CRYPTO</span>
+            <span class="value cyan" id="paillierBitsText">Paillier 1024-bit PHE + C RLWE-BFV FHE</span>
         </div>
         <div class="telemetry-card">
             <span class="label">HARDWARE / OS ZEROIZE</span>
@@ -60,10 +61,11 @@
 
     <div class="scenario-bar">
         <span class="scenario-title">Verified Scenarios:</span>
-        <button class="chip" onclick="loadScenario('salary')">💼 15% Bonus FHE Calculation &amp; DB Seal</button>
+        <button class="chip" onclick="loadScenario('salary')">💼 15% Bonus Paillier PHE &amp; DB Seal</button>
+        <button class="chip" onclick="loadScenario('bfv_secrets')">🔐 Lattice RLWE-BFV Product &amp; Password Seal</button>
         <button class="chip" onclick="loadScenario('health')">🏥 Patient BSN &amp; Biomarker EHR Update</button>
         <button class="chip" onclick="loadScenario('finance')">💳 Executive IBAN Wire Transfer Auth</button>
-        <button class="chip" onclick="loadScenario('xss')">🧪 XSS &amp; Secret Leak Stress Test</button>
+        <button class="chip" onclick="loadScenario('xss')">🧪 XSS &amp; Secret Key Leak Stress Test</button>
     </div>
 
     <main class="workspace-grid">
@@ -75,7 +77,7 @@
             </div>
 
             <div class="input-container">
-                <label for="promptInput">Confidential Enterprise Prompt:</label>
+                <label for="promptInput">Confidential Enterprise Prompt (supports free-text passwords &amp; &lt;secret&gt;...&lt;/secret&gt;):</label>
                 <textarea id="promptInput" rows="5"></textarea>
 
                 <div class="action-row">
@@ -94,7 +96,7 @@
                     <span id="providerUsedTag" class="secure-tag">Ready</span>
                 </div>
                 <div id="decryptedOutput" class="content-output placeholder">
-                    Click "Execute Zero-Trust Pipeline" to run blind reasoning, FHE math, and native C enclave sealing...
+                    Click "Execute Zero-Trust Pipeline" to run blind reasoning, PHE/FHE math, and native C enclave sealing...
                 </div>
             </div>
         </div>
@@ -103,13 +105,13 @@
         <div class="column-panel wire-panel">
             <div class="panel-header">
                 <span class="panel-tag tag-wire">EXTERNAL CLOUD WIRE</span>
-                <h3>What Host Provider (Gemini/OpenAI) Sees</h3>
+                <h3>What Host Provider (Gemini/OpenAI/Bedrock) Sees</h3>
             </div>
 
             <div class="wire-box">
                 <div class="wire-header">
                     <span>TRANSMITTED PAYLOAD</span>
-                    <span class="wire-lock">🔒 ZERO PLAINTEXT PII / KEYS</span>
+                    <span class="wire-lock">🔒 ZERO PLAINTEXT PII / KEYS / PASSWORDS</span>
                 </div>
                 <div id="wireOutput" class="wire-code-block placeholder">
                     Awaiting transmission...
@@ -118,7 +120,7 @@
 
             <div class="crypto-meta-box">
                 <div class="box-title">
-                    <span>Local Ephemeral Blinding &amp; 1024-bit Ciphertext Map</span>
+                    <span>Local Ephemeral Blinding, C-AES256 Secrets &amp; Ciphertext Map</span>
                 </div>
                 <div id="mappingTokens" class="tokens-list">
                     <p class="empty-state">No active session tokens.</p>
@@ -164,24 +166,25 @@
         </div>
     </main>
 
-    <!-- Bottom Dual Section: Interactive FHE Math + Encrypted SQLite Ledger -->
+    <!-- Bottom Dual Section: Interactive PHE + Lattice FHE Math + Encrypted SQLite Ledger -->
     <section class="bottom-grid">
         <div class="fhe-drawer">
             <div class="fhe-header">
-                <h3>🧮 1024-bit Paillier Homomorphic Math Playground</h3>
-                <span class="fhe-formula">D(E(m₁) · E(m₂) mod n²) = m₁ + m₂</span>
+                <h3>🧮 Dual Homomorphic Playground: Paillier PHE &amp; C Lattice RLWE-BFV FHE</h3>
+                <span class="fhe-formula">Z_{n²}* Addition &amp; R_q = Z_q[X]/(X⁶⁴+1) Multiplication</span>
             </div>
             <div class="fhe-controls">
                 <div class="input-pair">
                     <label for="fheVal1">m₁:</label>
-                    <input type="number" step="0.01" id="fheVal1" value="130000.50">
+                    <input type="number" step="1" id="fheVal1" value="160">
                 </div>
-                <div class="plus-sign">+</div>
+                <div class="plus-sign">⊕ / ⊗</div>
                 <div class="input-pair">
                     <label for="fheVal2">m₂:</label>
-                    <input type="number" step="0.01" id="fheVal2" value="19500.25">
+                    <input type="number" step="1" id="fheVal2" value="225">
                 </div>
-                <button class="btn-secondary" onclick="calcHomomorphic()">Multiply Ciphertexts (mod n²)</button>
+                <button class="btn-secondary" onclick="calcHomomorphic()">Paillier PHE Sum (mod n²)</button>
+                <button class="btn-secondary" onclick="calcBFV()">C RLWE-BFV Product (in R_q)</button>
             </div>
             <div id="fheResult" class="fhe-result-box hidden"></div>
         </div>
@@ -200,7 +203,7 @@
 
     <footer class="app-footer">
         <p>Built for <strong>Mathematics for Systems Security Hackathon</strong> • Track: <em>AI Pipeline Secret Sharing</em></p>
-        <p>Native C Constant-Time GF(2⁸) Shamir + memset_s() • RFC 3526 2048-bit Feldman VSS • 1024-bit Fixed-Point Paillier FHE</p>
+        <p>Native C Constant-Time GF(2⁸) Shamir + memset_s() • RFC 3526 2048-bit Feldman VSS • 1024-bit Paillier PHE • C Lattice RLWE-BFV FHE</p>
     </footer>
 
     <script src="/static/app.js"></script>
