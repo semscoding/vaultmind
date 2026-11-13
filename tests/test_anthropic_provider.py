@@ -35,6 +35,26 @@ ANTHROPIC_OK_BODY = {
 }
 
 
+ANTHROPIC_TOOL_BODY = {
+    "id": "msg_tool",
+    "type": "message",
+    "role": "assistant",
+    "content": [
+        {
+            "type": "tool_use",
+            "id": "toolu_test",
+            "name": "emit_plan",
+            "input": {
+                "summary": "Bonus for [ID_ABCDEF12] is [FHE_COMPUTED_BONUS].",
+                "fhe_compute": {"op": "PERCENT_BONUS", "ref": "[FHE_NUM_1]", "percent": 15},
+                "action_intent": {"action": "GRANT_COMPLIANCE_BONUS", "target": "[ID_ABCDEF12]", "params": {}},
+            },
+        }
+    ],
+    "stop_reason": "tool_use",
+}
+
+
 class _Capture:
     """Records what would have been posted and returns a canned response."""
 
@@ -71,6 +91,7 @@ class TestAnthropicProvider(unittest.TestCase):
         self.assertEqual(call["headers"]["anthropic-version"], "2023-06-01")
         self.assertEqual(call["json"]["model"], DEFAULT_ANTHROPIC_MODEL)
         self.assertIn("max_tokens", call["json"])
+        self.assertNotIn("temperature", call["json"])  # rejected as deprecated by current models
         self.assertEqual(call["json"]["messages"][0]["role"], "user")
         self.assertIn("[FHE_NUM_1]", call["json"]["messages"][0]["content"])
 
@@ -82,6 +103,27 @@ class TestAnthropicProvider(unittest.TestCase):
         self.assertEqual(wire["headers_redacted"]["x-api-key"], "<redacted>")
         self.assertEqual(wire["body"], call["json"])
         self.assertNotIn(DUMMY_ANTHROPIC_KEY, json.dumps(wire))
+
+    def test_forced_tool_call_carries_the_plan(self):
+        cap = _Capture(response=httpx.Response(200, json=ANTHROPIC_TOOL_BODY))
+        with cap.patch():
+            result = asyncio.run(LLMClient()._call_anthropic("blinded [FHE_NUM_1]", DUMMY_ANTHROPIC_KEY))
+        sent = cap.calls[0]["json"]
+        self.assertEqual(sent["tool_choice"], {"type": "tool", "name": "emit_plan"})
+        self.assertEqual(sent["tools"][0]["name"], "emit_plan")
+        self.assertEqual(result["fhe_compute"]["op"], "PERCENT_BONUS")
+        self.assertEqual(result["action_intent"]["action"], "GRANT_COMPLIANCE_BONUS")
+        self.assertEqual(result["raw_response"], "Bonus for [ID_ABCDEF12] is [FHE_COMPUTED_BONUS].")
+        self.assertFalse(result.get("parse_warning"))
+
+    def test_tool_input_with_wrong_types_is_not_executed(self):
+        body = json.loads(json.dumps(ANTHROPIC_TOOL_BODY))
+        body["content"][0]["input"]["fhe_compute"] = "PERCENT_BONUS"
+        body["content"][0]["input"]["action_intent"] = ["x"]
+        with _Capture(response=httpx.Response(200, json=body)).patch():
+            result = asyncio.run(LLMClient()._call_anthropic("blinded", DUMMY_ANTHROPIC_KEY))
+        self.assertIsNone(result["fhe_compute"])
+        self.assertIsNone(result["action_intent"])
 
     def test_model_override_from_environment(self):
         cap = _Capture(response=httpx.Response(200, json=ANTHROPIC_OK_BODY))

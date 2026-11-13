@@ -16,7 +16,7 @@
 
 ## Scene 1: Intro (0:00 – 0:20)
 
-**On screen:** the dashboard. Header dropdown **LLM Host** shows **Google Gemini 2.5 Flash (Live API)** (selected automatically when a key is in `.env`). Telemetry bar: **Reconstructed master key** · *C stack only · wiped after each seal*, **Verifiable secret sharing** · *k=3 of n=5 (2048-bit Feldman VSS)*, **Key zeroization** · *C11 memset_s() + CommonCrypto*.
+**On screen:** the dashboard. Header dropdown **LLM Host** shows the live provider whose key is in `.env` (selected automatically), for example **Google Gemini 2.5 Flash (Live API)** or **Anthropic Claude (Live API)**. Telemetry bar: **Reconstructed master key** · *C stack only · wiped after each seal*, **Verifiable secret sharing** · *k=3 of n=5 (2048-bit Feldman VSS)*, **Key zeroization** · *C11 memset_s() + CommonCrypto*.
 
 **Say:**
 > "This is VaultMind, for the AI Pipeline Secret Sharing track. A cloud LLM plans actions on enterprise prompts, but it only ever sees tokens. The master key is split over five shard files with Shamir secret sharing and Feldman VSS, and it is only ever reconstructed inside a small C library, on the C stack."
@@ -28,12 +28,13 @@
 **On screen:**
 1. Click the preset **15% Bonus Paillier PHE & DB Seal**, then **Execute Zero-Trust Pipeline**.
 2. Middle column **EXTERNAL CLOUD WIRE · What Host Provider (Gemini/OpenAI/Bedrock) Sees**: zoom into **Transmitted payload**. It shows `POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`, the headers with `x-goog-api-key: <redacted>`, and the JSON body with `systemInstruction` and the blinded prompt.
+   With **Anthropic Claude (Live API)** selected the same panel shows `POST https://api.anthropic.com/v1/messages`, the headers `x-api-key: <redacted>` and `anthropic-version`, and a JSON body with `model`, `system`, `messages` (the blinded prompt) and the `emit_plan` tool. Verified live on 13 Nov 2026: 20 preset runs out of 20 returned the expected amounts and an action, in 2 to 3 seconds each.
 3. Point at the leak-check verdict next to the heading (**✔ 0 residual matches (heuristic)**) and at the token map below it (`[ID_…] ⟷ "Marcus Vance"`, `[FHE_NUM_1] … "$130,000" → 2048-bit PHE`).
 4. If the blue formula box appears in the left column, point at it: `c_bonus = [FHE_NUM_1]^15 mod n², c_total = [FHE_NUM_1]^115 mod n²` and the left column output with **$19,500.00** and **$149,500.00**.
 5. In the same blue box, point at the line under the formula: `Evaluated by: untrusted evaluator process (pid …; holds only n)`. If it reads `in-process fallback` with a warning instead, re-run or cut; do not narrate the process separation for that run.
 
 **Say:**
-> "This panel is the exact request body that went to Gemini, without the API key. The name became an HMAC token, the salary became a Paillier ciphertext handle, and a leak check confirms that none of the detected values is still in the payload. Gemini only answers with a plan: a fifteen percent bonus on FHE_NUM_1. The bonus is computed on the ciphertext with only the public key, and decrypted locally."
+> "This panel is the exact request body that went to the provider (say its name: Gemini or Anthropic), without the API key. The name became an HMAC token, the salary became a Paillier ciphertext handle, and a leak check confirms that none of the detected values is still in the payload. Gemini only answers with a plan: a fifteen percent bonus on FHE_NUM_1. The bonus is computed on the ciphertext with only the public key, and decrypted locally."
 > "That computation ran in a separate local process that only received the public modulus n and the ciphertext, never the secret key."
 
 ---
@@ -91,7 +92,7 @@ Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payl
 
 ## Scene 7: Tests and close (2:30 – 2:45)
 
-**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 100 tests` and `OK`.
+**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 102 tests` and `OK`.
 
 **Say:**
-> "One hundred tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, C-only share files, the separate evaluator process, concurrent ledger writes, BFV at depth one, provider errors, name and address blinding, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."
+> "One hundred and two tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, C-only share files, the separate evaluator process, concurrent ledger writes, BFV at depth one, provider errors, name and address blinding, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."

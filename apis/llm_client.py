@@ -81,6 +81,7 @@ INSTRUCTIONS:
    - Sum of two encrypted numbers: emit "fhe_compute": {"op": "ADD", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_SUM] in your summary.
    - Non-linear product of two encrypted integers (e.g. hours * rate or units * price): emit "fhe_compute": {"op": "BFV_MULTIPLY", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_PRODUCT] in your summary.
 3. If the prompt requests committing, updating, authorizing, transferring, or storing privileged data, emit "action_intent" with action in ["GRANT_COMPLIANCE_BONUS", "UPDATE_EHR_LEDGER", "TRANSFER_EXECUTE", "DB_WRITE_RECORD"].
+   Emitting "action_intent" is a proposal, not the action itself: the local enclave validates it against its whitelist and executes it with its own key quorum. You never need a key to propose it, so always emit it when such a change is requested, even though you hold no key shares.
 
 Always include one fenced ```json block at the end of your response using this schema:
 ```json
@@ -98,6 +99,23 @@ Set "fhe_compute" or "action_intent" to null if not needed.
 
 
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"
+ANTHROPIC_PLAN_TOOL = {
+    "name": "emit_plan",
+    "description": (
+        "Return your answer for the client: a concise summary over the blinded tokens, plus the "
+        "optional homomorphic computation and the optional privileged action, exactly as specified "
+        "in the system prompt. Use null for a part that is not needed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Concise reasoning over the blinded tokens."},
+            "fhe_compute": {"type": ["object", "null"], "description": "Homomorphic operation or null."},
+            "action_intent": {"type": ["object", "null"], "description": "Privileged action or null."},
+        },
+        "required": ["summary", "fhe_compute", "action_intent"],
+    },
+}
 _MASKED_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{0,24}\*{4,}[A-Za-z0-9_\-*]{0,160}")
 
 
@@ -349,17 +367,39 @@ class LLMClient:
         payload = {
             "model": model_id,
             "max_tokens": 1024,
-            "temperature": 0.1,
+            # No `temperature`: current Claude models reject the parameter as deprecated.
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": blinded_prompt}],
+            # The plan is requested as a forced tool call, so the structured part cannot be
+            # omitted or malformed the way a free-text JSON block can (temperature is not settable).
+            "tools": [ANTHROPIC_PLAN_TOOL],
+            "tool_choice": {"type": "tool", "name": ANTHROPIC_PLAN_TOOL["name"]},
         }
         wire = self._wire_request(url, headers, payload, "x-api-key")
         data = await self._post_json(label, url, headers, payload, api_key, wire)
         try:
             blocks = data["content"]
-            text = "".join(
-                b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text" and "text" in b
+            plan = next(
+                (
+                    b.get("input")
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == ANTHROPIC_PLAN_TOOL["name"]
+                ),
+                None,
             )
+            if isinstance(plan, dict):
+                summary = plan.get("summary")
+                summary = summary if isinstance(summary, str) else ""
+                structured = {
+                    "fhe_compute": plan.get("fhe_compute"),
+                    "action_intent": plan.get("action_intent"),
+                }
+                # Re-use the one validated parser: the tool input is untrusted model output too.
+                text = f"{summary}\n```json\n{json.dumps(structured)}\n```"
+            else:
+                text = "".join(
+                    b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text" and "text" in b
+                )
             if not text.strip():
                 raise TypeError(f"empty content (stop_reason={data.get('stop_reason')})")
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
