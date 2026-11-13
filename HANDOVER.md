@@ -60,7 +60,7 @@
 │   ├── ledger.py                    # `EncryptedLedger`: append with chain position, row_hash, migration of pre-chain tables
 │   └── runtime/                     # git-ignored: shards/node_01..05.json + node_01..05.gfshare, .demo_clean_shards/, manifest.json, vault_ledger.db
 ├── apis/
-│   ├── llm_client.py                # Gemini / OpenAI / Bedrock adapters, offline engine, `LLMProviderError`, tolerant JSON parser
+│   ├── llm_client.py                # Gemini / OpenAI / Bedrock / Anthropic adapters, offline engine, `LLMProviderError`, tolerant JSON parser
 │   └── routes.py                    # /api/process, /api/llm-config, /api/vault-status, /api/tamper-node, /api/restore-nodes,
 │                                    # /api/ledger, /api/homomorphic-calc, /api/bfv-fhe-calc, /api/monitoring/{metrics,health}
 ├── services/
@@ -74,6 +74,7 @@
     ├── test_audit_regressions.py    # 37 regression tests for Victory Audit + rounds 3–5 (temp dirs, mocked HTTP)
     ├── test_c_share_files.py        # 16 tests: share-file layout, Python never opens .gfshare, failover, legacy migration
     ├── test_evaluator_process.py    # 14 tests: separate process, no secret material on the wire, restart, fallback, manipulated answers
+    ├── test_anthropic_provider.py   # 8 tests: Anthropic adapter, wrong-provider key guard, masked-key scrubber
     └── test_blinding_gazetteer.py   # 15 tests: list-based names, addresses, places, cued organisations, prose, hostile inputs
 ```
 
@@ -123,7 +124,7 @@ cd /Users/sem/.gemini/antigravity/scratch/vaultmind
 ./venv/bin/python3 backend/native/build.py
 nm -u backend/native/libvaultcrypto.dylib | grep memset_s
 
-# 2. Full test suite: 92 tests (about 20 s; writes to database/runtime/, which is git-ignored)
+# 2. Full test suite: 100 tests (about 20 s; writes to database/runtime/, which is git-ignored)
 ./venv/bin/python3 -m unittest discover -s tests -v
 
 # 3. Smoke-test the TUI
@@ -177,7 +178,7 @@ Peer-review verification (`T-378`) + follow-up fixes on `claude/victory-audit-fi
 
 ## 9. Hardening round (13 Nov 2026)
 
-Branch `claude/hardening` (retargeted to `main` after PR #2 merged). Three changes, plus a UI/TUI line that shows who ran the homomorphic step, followed by peer-review hardening fixes. Suite: 92 tests, OK.
+Branch `claude/hardening` (retargeted to `main` after PR #2 merged). Three changes, plus a UI/TUI line that shows who ran the homomorphic step, followed by peer-review hardening fixes. Suite: 100 tests, OK.
 
 **Resolved**
 - **GF(2^8) shares no longer pass through Python.** Each share lives in `shards/node_0X.gfshare` (32 bytes, 0600) and is written, read, checked, copied and (demo) corrupted only by `libvaultcrypto` (`vault_generate_split_key_to_files`, `vault_enclave_seal_files`, `vault_enclave_unseal_files`, `vault_share_file_check`, `vault_share_file_copy`, `vault_share_file_flip_byte`), staged via `O_CREAT | O_EXCL | O_NOFOLLOW` sibling temp files + `rename` so existing or hard-linked inodes are never truncated or clobbered on failure. Shard JSON (`_read_private_json` / `_write_private_json` with `O_NOFOLLOW`) holds only `x`, `gf_share_sha256`, `canary_y`, `feldman_y_hex` (and `node_id`); manifest `format_version: 2`. Old-format runtimes preserve custom `(threshold_k, total_n)`, clean up stale JSON shards, re-provision first, and archive the old ledger table. Tests: `tests/test_c_share_files.py`.
