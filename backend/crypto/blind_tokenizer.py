@@ -346,6 +346,7 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
             if k + 1 < n and adjacent(k, k + 1) and (lows[k], lows[k + 1]) in NAME_PARTICLE_PAIRS:
                 k += 1
             k += 1
+        has_particle = k > i + 1
         last = None
         if k < n and adjacent(k - 1, k) and surname_ok(k, want_cap=cap):
             last = k
@@ -367,7 +368,9 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
             and lows[last].endswith(_COMMON_WORD_SUFFIXES)
         ):
             last = None  # "to max capacity", "met mark overleggen": an everyday word, not a surname
-        if last is not None and (cued or cap and not amb):
+        # A surname particle between an unambiguous first name and the next word ("jan de vries",
+        # "maria van dijk") is strong enough evidence on its own, also in lower case without a cue.
+        if last is not None and (cued or (cap and not amb) or (has_particle and not amb)):
             # "to jan jansen", "mail maria de vries", "for will smith". A lower-case name needs a
             # person cue in front of it (preposition, role or contact word): without one, "mark the
             # invoice", "the emma project" or a bare "renée müller confirmed" are too weak evidence

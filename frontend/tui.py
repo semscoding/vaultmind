@@ -219,6 +219,9 @@ async def main_loop():
         fhe_line = ""
         if result.get("fhe_computation") and result["fhe_computation"].get("decrypted_outputs"):
             fhe_line = f"\n[bold cyan]Homomorphic result:[/bold cyan] {escape(str(result['fhe_computation']['decrypted_outputs']))}"
+            evaluated_by = result["fhe_computation"].get("evaluated_by")
+            if evaluated_by:
+                fhe_line += f"\n[dim]Evaluated by: {escape(str(evaluated_by))}[/dim]"
         phase3 = next(
             (p for p in result.get("audit_trail", []) if str(p.get("phase", "")).startswith("PHASE_3")), None
         )

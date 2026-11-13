@@ -338,6 +338,29 @@ class PresetRegressionTests(unittest.TestCase):
         self.assertIn("Amsterdam Central", ctx.token_to_plaintext.values())
         self.assertIn("clinic: [LOC_", blinded)
 
+class TestLowerCaseNameWithParticle(unittest.TestCase):
+    def test_lower_case_name_with_particle_needs_no_cue(self):
+        from backend.crypto.blind_tokenizer import BlindTokenizer
+
+        tok = BlindTokenizer(paillier_bits=1024)
+        for prompt, forbidden in [
+            ("ask whether jan de vries can join the call", "jan de vries"),
+            ("the report says maria van dijk approved it", "maria van dijk"),
+            ("and pieter van der berg signed", "pieter van der berg"),
+        ]:
+            with self.subTest(prompt=prompt):
+                blinded, _ = tok.blind_prompt(prompt)
+                self.assertNotIn(forbidden, blinded)
+        # Ambiguous first names and plain words stay untouched.
+        for sentence in [
+            "we will de facto accept the terms",
+            "mark de deadline in de agenda",
+            "the team met in de ochtend",
+        ]:
+            with self.subTest(sentence=sentence):
+                blinded, _ = tok.blind_prompt(sentence)
+                self.assertEqual(blinded, sentence)
+
 
 if __name__ == "__main__":
     unittest.main()
