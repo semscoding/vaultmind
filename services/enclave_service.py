@@ -2,18 +2,36 @@
 Enclave Service: Local Loopback Secure Enclave (v2).
 Manages isolated 0600 disk shards, 2048-bit RFC 3526 Feldman VSS verification,
 and C-stack AES-256-CBC + HMAC-SHA256 sealing into the encrypted SQLite ledger.
+
+Shard storage (manifest format_version 2), per node x:
+- shards/node_0X.json     (0600, written by Python): x, canary_y, feldman_y_hex and
+                          gf_share_sha256 (public SHA-256 of the GF(2^8) share). No share bytes.
+- shards/node_0X.gfshare  (0600, exactly 32 raw bytes): the GF(2^8) share of K_GF. Written,
+                          read, checked, copied and (demo) corrupted only by libvaultcrypto.
+This service never opens a .gfshare file itself: the GF(2^8) shares and K_GF do not pass
+through Python. The Feldman shares and alpha_0 still do (2048-bit arithmetic in Python), so a
+Python heap dump yields only the Feldman half, which is not enough to derive K_master.
 """
 
-import hashlib
+import errno
 import itertools
 import json
+import logging
 import os
 import random
+import re
+import secrets
+import sqlite3
+import stat
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.crypto.shamir import ShamirSecretSharing
+from backend.crypto.shamir import ShamirSecretSharing, ShareFileError
 from database.ledger import EncryptedLedger, LedgerChainConflict
+
+logger = logging.getLogger(__name__)
+
+MANIFEST_FORMAT_VERSION = ShamirSecretSharing.SHARD_FORMAT_VERSION
 
 
 ALLOWED_ACTIONS = {
@@ -39,20 +57,42 @@ class SecureEnclave:
         self.shards_dir = os.path.join(base_dir, "shards")
         self.backup_dir = os.path.join(base_dir, ".demo_clean_shards")
         self.manifest_path = os.path.join(base_dir, "manifest.json")
-        self.ledger = EncryptedLedger(os.path.join(base_dir, "vault_ledger.db"))
+        ledger_path = os.path.join(base_dir, "vault_ledger.db")
 
         self.sss = ShamirSecretSharing()
         self.threshold = threshold
         self.total_shares = total_shares
+        self.vault_migration_note: Optional[str] = None
 
         os.makedirs(self.shards_dir, exist_ok=True)
         os.makedirs(self.backup_dir, exist_ok=True)
 
-        if reset_on_init or not os.path.exists(self.manifest_path):
+        legacy_params = None if reset_on_init else self._legacy_manifest_params()
+        legacy = legacy_params is not None
+        if legacy:
+            self.threshold, self.total_shares = legacy_params
+
+        if reset_on_init or legacy or not os.path.lexists(self.manifest_path):
+            self._cleanup_stale_node_files(remove_all_json=legacy)
             self._provision_fresh_vault()
 
-        with open(self.manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+        if legacy:
+            # Rows sealed under the old key can never verify against the new one: hand the
+            # old table to the ledger's own legacy archive path (see _archive_legacy_ledger)
+            # only after the new v2 vault has been provisioned on disk.
+            self._archive_legacy_ledger(ledger_path)
+        self.ledger = EncryptedLedger(ledger_path)
+
+        if legacy:
+            self.vault_migration_note = (
+                "Legacy runtime vault detected (GF(2^8) shares stored as gf256_share_hex in shard JSON, "
+                f"no manifest format_version). Re-provisioned as format v{MANIFEST_FORMAT_VERSION} with "
+                "C-only .gfshare files; the old key is discarded."
+                + (f" {self.ledger.migration_note}" if self.ledger.migration_note else "")
+            )
+            logger.warning(self.vault_migration_note)
+
+        manifest = self._read_private_json(self.manifest_path)
 
         self.threshold = int(manifest["threshold_k"])
         self.total_shares = int(manifest["total_n"])
@@ -68,28 +108,176 @@ class SecureEnclave:
     def _backup_file(self, x: int) -> str:
         return os.path.join(self.backup_dir, f"node_0{x}.json.bak")
 
+    def _gfshare_file(self, x: int) -> str:
+        return os.path.join(self.shards_dir, f"node_0{x}.gfshare")
+
+    def _gfshare_backup_file(self, x: int) -> str:
+        return os.path.join(self.backup_dir, f"node_0{x}.gfshare.bak")
+
+    def _legacy_manifest_params(self) -> Optional[Tuple[int, int]]:
+        """
+        Return (threshold_k, total_n) for a pre-v2 runtime (manifest without format_version,
+        shares in JSON), or None for a current/absent manifest. Decided from manifest.json only,
+        so no legacy shard JSON (with share bytes) is read into Python. An unparseable or symlinked
+        manifest is NOT treated as legacy: silently re-keying on a corrupt manifest would let
+        anyone who can write it wipe the vault, so that still raises ValueError.
+        """
+        if not os.path.lexists(self.manifest_path):
+            return None
+        manifest = self._read_private_json(self.manifest_path)
+        version = manifest.get("format_version")
+        if version is None or (isinstance(version, int) and not isinstance(version, bool) and version < MANIFEST_FORMAT_VERSION):
+            k = manifest.get("threshold_k")
+            n = manifest.get("total_n")
+            if (
+                isinstance(k, int)
+                and not isinstance(k, bool)
+                and isinstance(n, int)
+                and not isinstance(n, bool)
+                and 1 <= k <= n <= 255
+            ):
+                return k, n
+            return self.threshold, self.total_shares
+        if not isinstance(version, int) or isinstance(version, bool) or version != MANIFEST_FORMAT_VERSION:
+            raise ValueError(f"Unsupported vault manifest format_version {version!r}")
+        return None
+
+    def _manifest_is_legacy(self) -> bool:
+        return self._legacy_manifest_params() is not None
+
+    def _cleanup_stale_node_files(self, remove_all_json: bool = False) -> None:
+        """
+        Unlink planted symlinks on target share slots and stale node_* files beyond total_shares
+        (plus legacy JSON shards containing gf256_share_hex during v1 -> v2 migration). Never opens
+        any file, so share bytes are never read into Python.
+        """
+        node_re = re.compile(r"^node_0?(\d+)\.(json|gfshare)(\.bak)?$")
+        for folder in (self.shards_dir, self.backup_dir):
+            if not os.path.isdir(folder):
+                continue
+            for name in os.listdir(folder):
+                m = node_re.match(name)
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                kind = m.group(2)
+                full = os.path.join(folder, name)
+                if os.path.islink(full) or idx < 1 or idx > self.total_shares or (remove_all_json and kind == "json"):
+                    try:
+                        os.unlink(full)
+                    except OSError:
+                        pass
+
+    @staticmethod
+    def _archive_legacy_ledger(ledger_path: str) -> None:
+        """
+        Reuse EncryptedLedger's existing legacy archive path without changing database/:
+        it renames sealed_transactions to sealed_transactions_legacy_<ns> when PRAGMA
+        user_version is below LEDGER_SCHEMA_VERSION. Resetting user_version to 0 here makes
+        the next EncryptedLedger(...) archive the old-key rows and start an empty chain.
+        """
+        if not os.path.exists(ledger_path):
+            return
+        with sqlite3.connect(ledger_path) as conn:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sealed_transactions'"
+            ).fetchone()
+            if has_table:
+                conn.execute("PRAGMA user_version = 0")
+                conn.commit()
+
+    @staticmethod
+    def _read_private_json(path: str, max_bytes: int = 65_536) -> Dict[str, Any]:
+        """
+        Read a JSON object from `path` without following symlinks or blocking on FIFOs, bounded to
+        `max_bytes`. Used only for manifest.json and shard JSON metadata (never .gfshare files).
+        """
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError(f"{os.path.basename(path)} is a symbolic link (refused)") from None
+            raise ValueError(f"Could not open {os.path.basename(path)}: {exc}") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{os.path.basename(path)} is not a regular file")
+            if st.st_size < 0 or st.st_size > max_bytes:
+                raise ValueError(f"{os.path.basename(path)} exceeds maximum JSON size ({max_bytes} bytes)")
+            chunks: List[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(fd, min(65_536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"{os.path.basename(path)} exceeds maximum JSON size ({max_bytes} bytes)")
+        finally:
+            os.close(fd)
+        obj = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(obj, dict):
+            raise TypeError(f"{os.path.basename(path)} holds a JSON {type(obj).__name__}, expected an object")
+        return obj
+
     @staticmethod
     def _write_private_json(path: str, obj: Any) -> None:
-        """Write JSON to `path` with owner-only (0600) permissions from the first byte."""
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2)
-        os.chmod(path, 0o600)
+        """Atomically write JSON to `path` via a fresh 0600 sibling temp file + os.replace."""
+        if os.path.isdir(path) and not os.path.islink(path):
+            raise IsADirectoryError(path)
+        tmp_path = f"{path}.tmp.{secrets.token_hex(8)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                json.dump(obj, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _provision_fresh_vault(self) -> None:
-        bundle = self.sss.generate_and_split_master_key(
+        # Remove any planted symlinks at destination share paths before C stages and renames shares.
+        for x in range(1, self.total_shares + 1):
+            for p in (self._gfshare_file(x), self._gfshare_backup_file(x)):
+                if os.path.islink(p):
+                    os.unlink(p)
+
+        # C generates K_GF, splits it and writes each share to node_0X.gfshare (0600);
+        # Python only gets back the per-share SHA-256 and the key commitment.
+        share_paths = [self._gfshare_file(x) for x in range(1, self.total_shares + 1)]
+        bundle = self.sss.generate_and_split_master_key_to_files(
+            share_paths,
             threshold_k=self.threshold,
-            total_n=self.total_shares,
         )
 
         for shard in bundle["shards"]:
             x = int(shard["x"])
-            s_path = self._shard_file(x)
-            b_path = self._backup_file(x)
-            self._write_private_json(s_path, shard)
-            self._write_private_json(b_path, shard)
+            self._write_private_json(self._shard_file(x), shard)
+            self._write_private_json(self._backup_file(x), shard)
+            # Demo backup of the share file: copied by vault_share_file_copy through a wiped
+            # C stack buffer (not shutil/os.link). A hard link would share the inode, so the
+            # "Corrupt" button would corrupt the backup too; shutil.copyfile would avoid the
+            # Python heap on macOS (fcopyfile) but follows symlinks and does not enforce 0600
+            # or the 32-byte size. The C copy refuses symlinks and writes 0600 + fsync.
+            self.sss.copy_share_file(self._gfshare_file(x), self._gfshare_backup_file(x))
 
         public_manifest = {
+            "format_version": bundle["format_version"],
             "threshold_k": bundle["threshold_k"],
             "total_n": bundle["total_n"],
             "key_commitment_hex": bundle["key_commitment_hex"],
@@ -117,7 +305,7 @@ class SecureEnclave:
         for x in range(1, self.total_shares + 1):
             path = self._shard_file(x)
             node_id = f"vault-node-0{x}"
-            if not os.path.exists(path):
+            if not os.path.lexists(path):
                 rejected_nodes.append({"node_id": node_id, "x": x, "reason": "Missing shard file"})
                 node_summaries.append(
                     {
@@ -133,29 +321,32 @@ class SecureEnclave:
                 continue
 
             # M2: every read and field access of an on-disk shard sits inside one try.
-            # Any malformed file (empty, truncated, JSON list, non-numeric fields) is
+            # Any malformed file (empty, truncated, symlink, JSON list, non-numeric fields) is
             # treated exactly like a cryptographic tamper: TAMPER_REJECTED + failover.
             shard: Any = None
             fp = "UNREADABLE"
             c_y = 0
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    shard = json.load(f)
-                if not isinstance(shard, dict):
-                    raise TypeError(f"shard file holds a JSON {type(shard).__name__}, expected an object")
-                ok, reason = self.sss.verify_shard_integrity(
+                shard = self._read_private_json(path)
+                # JSON + Feldman + manifest digest in Python, then C checks node_0X.gfshare
+                # (exists, regular, 32 bytes, SHA-256 == gf_share_sha256) without returning it.
+                ok, reason = self.sss.verify_shard_file_integrity(
                     shard,
+                    self._gfshare_file(x),
                     self.feldman_commitments_hex,
                     self.share_digests.get(x),
                     self.key_commitment_hex,
                 )
-                gf_hex = shard.get("gf256_share_hex", "")
-                if not isinstance(gf_hex, str):
-                    raise TypeError("gf256_share_hex is not a string")
-                fp = hashlib.sha256(gf_hex.encode("utf-8")).hexdigest()[:8]
+                share_sha = shard.get("gf_share_sha256", "")
+                if not isinstance(share_sha, str):
+                    raise TypeError("gf_share_sha256 is not a string")
+                # Public fingerprint = first 8 hex chars of the share digest (not of the share).
+                fp = share_sha[:8] if share_sha and all(c in "0123456789abcdef" for c in share_sha[:8]) else "INVALID"
                 c_y = int(shard.get("canary_y", 0))
                 if ok and int(shard.get("x", -1)) != x:
                     ok, reason = False, f"Shard index mismatch (file node_0{x} claims x={shard.get('x')})"
+                if ok:
+                    shard["gf_share_path"] = self._gfshare_file(x)
             except Exception as exc:  # noqa: BLE001 - any parse failure == tamper
                 ok = False
                 reason = f"Unreadable or malformed shard file ({type(exc).__name__}: {exc})"[:240]
@@ -225,6 +416,7 @@ class SecureEnclave:
                 "observed_shard_points": observed_points,
             },
             "audit_log_count": self.ledger.count_entries(),
+            "vault_migration_note": self.vault_migration_note,
         }
 
     def tamper_shard_for_demo(self, node_index: int) -> Dict[str, Any]:
@@ -233,34 +425,42 @@ class SecureEnclave:
 
         path = self._shard_file(node_index)
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                shard = json.load(f)
+            shard = self._read_private_json(path)
             corrupted_feldman = int(shard["feldman_y_hex"], 16) ^ 0xDEADBEEF1337
-            raw_gf = bytearray(bytes.fromhex(shard["gf256_share_hex"]))
-            raw_gf[0] ^= 0xFF
             shard["feldman_y_hex"] = hex(corrupted_feldman)
-            shard["gf256_share_hex"] = bytes(raw_gf).hex()
             shard["canary_y"] = (int(shard["canary_y"]) ^ 0x55) & 0xFF
+            # The GF(2^8) share byte is flipped in place by C; Python never reads the file.
+            self.sss.flip_share_file_byte(self._gfshare_file(node_index), 0, 0xFF)
+            self._write_private_json(path, shard)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(
                 f"Shard node_0{node_index} is missing or already unreadable ({type(exc).__name__}); "
                 "use restore-nodes first."
             ) from None
 
-        self._write_private_json(path, shard)
         return self.get_public_vault_status()
 
     def restore_all_shards(self) -> Dict[str, Any]:
         for x in range(1, self.total_shares + 1):
             b_path = self._backup_file(x)
             s_path = self._shard_file(x)
-            if os.path.exists(b_path):
-                with open(b_path, "rb") as src:
-                    raw = src.read()
-                fd = os.open(s_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as dst:
-                    dst.write(raw)
-                os.chmod(s_path, 0o600)
+            if os.path.lexists(b_path):
+                try:
+                    backup_shard = self._read_private_json(b_path)
+                    self._write_private_json(s_path, backup_shard)
+                except (OSError, ValueError, TypeError) as exc:
+                    logger.warning("restore of %s failed: %s", os.path.basename(s_path), exc)
+            # Share file: copied by C (vault_share_file_copy), never loaded into Python. A planted
+            # symlink at the destination is removed first (unlink does not read its target).
+            gb_path = self._gfshare_backup_file(x)
+            g_path = self._gfshare_file(x)
+            if os.path.lexists(gb_path):
+                if os.path.islink(g_path):
+                    os.unlink(g_path)
+                try:
+                    self.sss.copy_share_file(gb_path, g_path)
+                except ShareFileError as exc:
+                    logger.warning("restore of %s failed: %s", os.path.basename(g_path), exc)
         return self.get_public_vault_status()
 
     # ------------------------------------------------------------------
@@ -278,8 +478,9 @@ class SecureEnclave:
     ) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[List[str]]]:
         """
         Seal with the first k valid shards. If the C enclave rejects the reconstructed
-        key on the key-commitment check (ValueError, rc -10) and more than k valid
-        shards exist, retry every other k-combination before giving up.
+        key on the key-commitment check (ValueError, rc -10) or a share file changed since
+        inspection (ShareFileError, a ValueError) and more than k valid shards exist, retry
+        every other k-combination before giving up.
         Returns (sealed, quorum_used, rejected_combinations).
         """
         rejected_combos: List[List[str]] = []
@@ -287,7 +488,7 @@ class SecureEnclave:
         for combo in self._quorum_candidates(valid_shards):
             quorum = list(combo)
             try:
-                sealed = self.sss.enclave_seal_record(
+                sealed = self.sss.enclave_seal_record_files(
                     quorum_shards=quorum,
                     key_commitment_hex=self.key_commitment_hex,
                     plaintext_bytes=plaintext_bytes,
@@ -488,7 +689,7 @@ class SecureEnclave:
 
                 aad_bytes = self._ledger_aad(row["id"], row["prev_hash"], row["action"], row["target_token"])
                 try:
-                    self.sss.enclave_unseal_record(
+                    self.sss.enclave_unseal_record_files(
                         quorum_shards=quorum,
                         iv_hex=row["iv_hex"],
                         ciphertext_hex=row["ciphertext_hex"],

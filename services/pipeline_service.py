@@ -7,6 +7,7 @@ The cloud-wire leak flags are computed by a post-blinding scan of the detected s
 the blinding itself is regex/heuristic, which `wire_payload["leak_check"]` states explicitly.
 """
 
+import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -114,9 +115,14 @@ class AgentPipeline:
         fhe_computation_report = None
         if fhe_spec:
             try:
-                fhe_computation_report = self.tokenizer.execute_and_decrypt_fhe(fhe_spec, ctx)
+                fhe_computation_report = await asyncio.to_thread(
+                    self.tokenizer.execute_and_decrypt_fhe, fhe_spec, ctx
+                )
             except Exception as exc:
                 fhe_computation_report = {"error": str(exc)}
+        # Where the homomorphic evaluation ran: the separate evaluator process (public n / rlk only)
+        # or the explicitly labelled in-process fallback. None when nothing was evaluated.
+        fhe_evaluated_by = (fhe_computation_report or {}).get("evaluated_by")
 
         hmac_map = {
             k: v for k, v in ctx.token_to_plaintext.items() if not k.startswith("[FHE_")
@@ -145,6 +151,7 @@ class AgentPipeline:
                         for k, v in ctx.encrypted_numbers.items()
                     ],
                     "homomorphic_computed": fhe_computation_report,
+                    "homomorphic_evaluated_by": fhe_evaluated_by,
                     "logs": ctx.logs,
                 },
             }
@@ -230,6 +237,7 @@ class AgentPipeline:
             "blinded_prompt": blinded_text,
             "cloud_wire_payload": wire_payload,
             "fhe_computation": fhe_computation_report,
+            "fhe_evaluated_by": fhe_evaluated_by,
             "llm_output_warnings": llm_output_warnings,
             "enclave_receipt": enclave_result.get("receipt") if enclave_result else None,
             "enclave_error": enclave_result.get("error") if enclave_result and not enclave_result.get("success") else None,

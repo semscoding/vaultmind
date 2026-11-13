@@ -581,6 +581,19 @@ async function runPipeline() {
             const eng = payload.fhe_computation.engine || "Homomorphic engine";
             fheBanner.textContent =
                 `[${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
+            // Who ran the homomorphic step: a separate process holding public keys only, or the
+            // in-process fallback (which does not demonstrate the key separation).
+            const who = payload.fhe_computation.evaluated_by;
+            if (who) {
+                const by = document.createElement("span");
+                by.className = "fhe-evaluated-by";
+                by.textContent = `Evaluated by: ${who}`;
+                if (payload.fhe_computation.evaluator_warning) {
+                    by.classList.add("fhe-evaluated-fallback");
+                    by.textContent += ` (${payload.fhe_computation.evaluator_warning})`;
+                }
+                fheBanner.appendChild(by);
+            }
             fheBanner.classList.remove("hidden");
         }
 

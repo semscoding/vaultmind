@@ -21,8 +21,10 @@ Capabilities:
 
 KNOWN LIMITATIONS (heuristic, regex-based blinding):
 - A secret without a label or recognisable pattern is NOT detected: wrap it in <secret>...</secret>.
-- Single first names without context ("Sem", "Maria"), lower-case names ("jan jansen"),
-  street names and cities without a clinic/city label are not detected.
+- Names, places and streets are matched against a bundled offline gazetteer (`gazetteer.py`).
+  Names/places outside those lists, lower-case names without a person cue in front of them
+  ("renée müller confirmed"), ambiguous names/places without context ("Will", "Best") and street
+  names without a house number or address cue are not detected.
 - Percentages and bare integers below 10 stay in clear text (they are public policy parameters).
 - `1.234` (one dot group, no comma) is ambiguous and is read as the English decimal 1.234.
 """
@@ -37,6 +39,25 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bfv_fhe import BFVContext, SessionSecretVault
+from .gazetteer import (
+    AMBIGUOUS_FIRST_NAMES,
+    AMBIGUOUS_PLACES,
+    CALENDAR_WORDS,
+    CONTACT_WORDS,
+    FIRST_NAMES,
+    NAME_PARTICLE_PAIRS,
+    NAME_PARTICLES,
+    NAME_STOP,
+    ORG_CUE_PATTERN,
+    PERSON_CUES,
+    PERSON_PREPOSITIONS,
+    PLACE_INDEX,
+    PLACE_PREPOSITIONS,
+    ROLE_WORDS,
+    STREET_SUFFIX_STOPLIST,
+    STREET_SUFFIXES_NL,
+    STREET_WORDS_EN,
+)
 from .homomorphic import HomomorphicEvaluator, PaillierKeypair, normalize_fhe_handle
 
 MAX_PROMPT_CHARS = 65_536
@@ -226,6 +247,305 @@ NUM_RE = re.compile(
     rf"(?P<num>{_NUM_BODY})(?P<mult>[kK])?(?:\s?(?P<code2>{_CUR_ALT})\b)?(?![\w%]|[.,]\d)"
 )
 _TOKEN_STRIP_RE = re.compile(r"\[[A-Z_]+_[0-9A-F]{8}\]|\[FHE_NUM_\d+\](?:\(ENC:[^)]*\))?")
+
+# ---- Gazetteer-based detectors (names, places, addresses, cued organisations) ----------------
+# Word tokens: letters with inner hyphen/apostrophe parts of 2+ letters (O'Connor, Jean-Luc,
+# s-Hertogenbosch) but not a possessive "'s" (Maria's -> Maria). Strictly linear.
+_WORD_RE = re.compile(r"[^\W\d_]+(?:[-'’][^\W\d_]{2,})*")
+# Leading capitalised verbs that cue an organisation; never part of the blinded name itself.
+_LEADING_CUE_CAPITALS = {"Pay", "Betaal"}
+# Gap between a cue word and the next word: optional "." (dr.) or ":" (to:) plus 1-3 spaces/tabs.
+_CUE_GAP_RE = re.compile(r"[.:]?[ \t]{1,3}")
+# House number with addition: 12, 4b, 12-14, 12 bis, 12-hs, 12 A (no decimals, no percentages).
+_HOUSE_NO_RE = re.compile(
+    r"[ \t]{1,3}(\d{1,4}(?:[a-z]|[ \t]?[A-Z])?(?:[ \t]?-[ \t]?\d{1,4}[a-zA-Z]?|-(?:hs|bis|[IV]{1,3}))?"
+    r"(?:[ \t]+bis)?)(?![\w%]|[.,]\d)"
+)
+_EN_STREET_ALT = "|".join(sorted(STREET_WORDS_EN, key=len, reverse=True))
+# Number-first English address: "12 Baker Street", "221B Baker Street", "12-14 Old Kent Road".
+_EN_ADDRESS_NUM_RE = re.compile(
+    rf"(?<![\w.,-])(\d{{1,5}}[A-Za-z]?(?:-\d{{1,5}})?)[ \t]+((?:{NAME_WORD}[ \t]+){{1,3}}(?:{_EN_STREET_ALT}))\b\.?"
+)
+# Street words without a number are only blinded after an address cue.
+_EN_STREET_RE = re.compile(rf"\b((?:{NAME_WORD}[ \t]+){{1,3}}(?:{_EN_STREET_ALT}))\b")
+_ADDRESS_CUE_RE = re.compile(
+    r"(?i:\b(?:lives?|living|located|based|resides?|residing|woont|wonend|gevestigd|verhuisd)"
+    r"\s+(?:at|on|in|aan|op|in|naar)(?:\s+(?:de|het|the))?\s*$"
+    r"|\b(?:adres|address|straat|street|bezorgadres|afleveradres)\b\s*(?:is\s+|:\s*)?$)"
+)
+_ADDRESS_TAIL_RE = re.compile(r"(?:\d[A-Za-z]?|\b[1-9]\d{3}[ \t]?[A-Z]{2}),?[ \t]*$")
+_ORG_CUE_RE = re.compile(
+    rf"(?i:\b(?:{ORG_CUE_PATTERN}))[ \t]+"
+    rf"({NAME_WORD}(?:[ \t]+{NAME_WORD}){{1,3}}(?:[ \t]+(?:Corp|Inc|Ltd|BV|NV|LLC|B\.V\.|N\.V\.))?)\b"
+)
+_ORG_CONTINUE_RE = re.compile(
+    rf"(?:[ \t]*,[ \t]*|[ \t]+(?:and|en|&)[ \t]+)"
+    rf"({NAME_WORD}(?:[ \t]+{NAME_WORD}){{1,3}}(?:[ \t]+(?:Corp|Inc|Ltd|BV|NV|LLC))?)\b"
+)
+# Word endings that mark an everyday EN/NL word rather than a surname; only consulted after an
+# ambiguous lower-case first name ("to max capacity" vs "to max verstappen").
+_COMMON_WORD_SUFFIXES = (
+    "ity", "tion", "sion", "ing", "ment", "ness", "ance", "ence", "able", "ible", "ize", "ise",
+    "ful", "less", "ous", "ive", "ly", "ed", "heid", "eren", "elen", "ggen", "kken", "nnen", "llen",
+)
+_ORG_ROLE_CUES = {"vendor", "client", "customer", "leverancier", "klant", "supplier"}
+_ORG_CORP_SUFFIXES = {
+    "Corp", "Inc", "Ltd", "BV", "NV", "LLC", "B.V.", "N.V.",
+    "Group", "Bank", "Central", "Hospital", "Labs",
+}
+_ACCOUNTING_HEAD_NOUNS = {
+    "Tax", "Bonus", "Salary", "Budget", "Margin", "Profit", "Revenue",
+    "Cost", "Credit", "Debit", "Income", "Flow", "Sheet", "Statement",
+    "Summary", "Ledger", "Notice", "Policy", "Agreement", "Contract",
+    "Invoice", "Quarter", "Year", "Subsidy", "Adjustment", "Earnout",
+    "Credentials", "Authorization", "Compliance", "Escalation", "Record",
+}
+_TO_INFINITIVE_VERBS = {"peter", "harry", "jimmy"}
+_TO_INFINITIVE_FOLLOWERS = {
+    "out", "off", "away", "down", "open", "the", "a", "an", "this", "that", "our", "their", "into",
+}
+
+
+def _is_accounting_business_phrase(words: List[str]) -> bool:
+    """True for pure accounting/compensation/policy phrases ('Quarterly Tax', 'Balance Sheet',
+    'Annual Bonus', 'Cash Flow') even after generic cues like 'Pay', 'client', or 'employee',
+    while keeping entity/service-like names ('Total Security', 'Cloud Reserve', 'Master Audit',
+    'Annual Report') eligible after explicit organisation cues."""
+    return (
+        bool(words)
+        and words[-1] not in _ORG_CORP_SUFFIXES
+        and all(w in BUSINESS_CAPITAL_NOUNS for w in words)
+        and words[-1] in _ACCOUNTING_HEAD_NOUNS
+    )
+
+
+def _is_cap(tok: str) -> bool:
+    """Title-case word (Maria, McDonald, IJmuiden, O'Connor); not ALL-CAPS and not lower case."""
+    return tok[0].isupper() and any(ch.islower() for ch in tok[1:])
+
+
+def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
+    """
+    Deterministic, offline detectors on top of the regex rules (O(N): one tokenisation pass plus
+    set/dict lookups per token, bounded look-ahead):
+      1. Full names from the first-name list, case-insensitive ("jan jansen", "maria de vries").
+      2. Single capitalised first names ("about Maria"); ambiguous names only after a person cue.
+      3. Street addresses with house number ("Keizersgracht 12", "12 Baker Street"); a street
+         without number only after an address cue ("woont aan de Keizersgracht").
+      4. Capitalised place names ("Amsterdam", "Den Haag"); ambiguous ones only after a place
+         preposition or inside an address ("in Best", "12, Best").
+      5. Title-Case organisation groups directly after a cue word ("Pay Total Security and
+         Cloud Reserve"), even when made only of business nouns. The cue word stays in clear.
+    """
+    toks = [(m.start(), m.end(), m.group(0)) for m in _WORD_RE.finditer(prompt)]
+    lows = [t[2].lower() for t in toks]
+    n = len(toks)
+    out: List[SpanMatch] = []
+
+    def adjacent(i: int, j: int) -> bool:
+        gap_start, gap_end = toks[i][1], toks[j][0]
+        return 0 < gap_end - gap_start <= 3 and prompt[gap_start:gap_end] in (" ", "  ", "   ", "\t")
+
+    def prev_in(i: int, words) -> bool:
+        if i == 0 or lows[i - 1] not in words:
+            return False
+        return _CUE_GAP_RE.fullmatch(prompt[toks[i - 1][1] : toks[i][0]]) is not None
+
+    def surname_ok(k: int, want_cap: bool) -> bool:
+        tok = toks[k][2]
+        if len(tok) < 2 or lows[k] in NAME_STOP or tok in STOPWORD_CAPITALS:
+            return False
+        return _is_cap(tok) if want_cap else tok.islower() or _is_cap(tok)
+
+    # 1 + 2: names -------------------------------------------------------------------------
+    skip_until = -1
+    for i in range(n):
+        if i <= skip_until or lows[i] not in FIRST_NAMES:
+            continue
+        tok = toks[i][2]
+        cap = _is_cap(tok)
+        if not (cap or tok.islower()):
+            continue
+        low = lows[i]
+        amb = low in AMBIGUOUS_FIRST_NAMES
+        cued = prev_in(i, PERSON_CUES)
+        if (
+            not cap
+            and prev_in(i, {"to"})
+            and i + 1 < n
+            and adjacent(i, i + 1)
+            and (
+                lows[i + 1] in {"out", "off", "away", "down"}
+                or (low in _TO_INFINITIVE_VERBS and lows[i + 1] in _TO_INFINITIVE_FOLLOWERS)
+            )
+        ):
+            continue  # "to peter out", "to harry the team", "to jimmy open the lock"
+
+        # optional particle(s), then one surname word (two when both are capitalised)
+        k = i + 1
+        if k < n and adjacent(i, k) and lows[k] in NAME_PARTICLES:
+            if k + 1 < n and adjacent(k, k + 1) and (lows[k], lows[k + 1]) in NAME_PARTICLE_PAIRS:
+                k += 1
+            k += 1
+        has_particle = k > i + 1
+        last = None
+        if k < n and adjacent(k - 1, k) and surname_ok(k, want_cap=cap):
+            last = k
+            if (
+                cap
+                and _is_cap(toks[k][2])
+                and k + 1 < n
+                and adjacent(k, k + 1)
+                and lows[k + 1] not in FIRST_NAMES
+                and surname_ok(k + 1, want_cap=True)
+            ):
+                last = k + 1
+
+        if (
+            last is not None
+            and amb
+            and not cap
+            and not _is_cap(toks[last][2])
+            and lows[last].endswith(_COMMON_WORD_SUFFIXES)
+        ):
+            last = None  # "to max capacity", "met mark overleggen": an everyday word, not a surname
+        # A surname particle between an unambiguous first name and the next word ("jan de vries",
+        # "maria van dijk") is strong enough evidence on its own, also in lower case without a cue.
+        if last is not None and (cued or (cap and not amb) or (has_particle and not amb)):
+            # "to jan jansen", "mail maria de vries", "for will smith". A lower-case name needs a
+            # person cue in front of it (preposition, role or contact word): without one, "mark the
+            # invoice", "the emma project" or a bare "renée müller confirmed" are too weak evidence
+            # (documented limitation). An ambiguous capitalised first name without a cue ("Will
+            # Smith" at sentence start) is left to the capitalised multi-word rule.
+            out.append(
+                SpanMatch(toks[i][0], toks[last][1], "ID", prompt[toks[i][0] : toks[last][1]], priority=5,
+                          is_role_subject=prev_in(i, ROLE_WORDS))
+            )
+            skip_until = last
+            continue
+
+        if not cap:
+            # A lower-case first name alone counts only right after a person cue ("ask lisa",
+            # "stuur naar sem"), and never when it is also an everyday word ("to mark", "met max")
+            # or an English infinitive ("to peter out", "to harry the team", "to jimmy the lock").
+            if cued and not amb:
+                out.append(SpanMatch(toks[i][0], toks[i][1], "ID", tok, priority=6,
+                                     is_role_subject=prev_in(i, ROLE_WORDS)))
+            continue
+        if amb and (not cued or low in CALENDAR_WORDS):
+            continue
+        if low == "jan":
+            if re.match(r"[ \t]?\d|\.", prompt[toks[i][1] : toks[i][1] + 2]):
+                continue  # "Jan 15", "Jan. 2026": English month abbreviation
+            if prev_in(i, {"in", "during", "since", "until", "before", "after", "through", "per"}):
+                continue  # "in Jan", "since Jan": temporal preposition, not a person
+            if (i + 2 < n and lows[i + 1] in {"to", "through", "and", "or"} and lows[i + 2] in CALENDAR_WORDS) or (
+                i >= 2 and lows[i - 1] in {"to", "through", "and", "or"} and lows[i - 2] in CALENDAR_WORDS
+            ):
+                continue  # "from Jan to Mar", "Dec and Jan"
+        out.append(SpanMatch(toks[i][0], toks[i][1], "ID", tok, priority=6, is_role_subject=prev_in(i, ROLE_WORDS)))
+
+    # 3: addresses ---------------------------------------------------------------------------
+    for i in range(n):
+        tok = toks[i][2]
+        low = lows[i]
+        if not _is_cap(tok) or low in STREET_SUFFIX_STOPLIST:
+            continue
+        suffix = next((s for s in STREET_SUFFIXES_NL if low.endswith(s) and len(low) >= len(s) + 3), None)
+        if suffix is None:
+            continue
+        # Multi-word street names: "Prins Hendrikkade", "Van Baerlestraat", "Oudezijds Voorburgwal".
+        first = i
+        while first > 0 and i - first < 2 and adjacent(first - 1, first):
+            prev_tok = toks[first - 1][2]
+            if _is_cap(prev_tok) and prev_tok not in STOPWORD_CAPITALS and lows[first - 1] not in NAME_STOP:
+                first -= 1
+            elif lows[first - 1] in NAME_PARTICLES and first >= 2 and _is_cap(toks[first - 2][2]):
+                first -= 1
+            else:
+                break
+        while first < i and lows[first] in NAME_PARTICLES and not _is_cap(toks[first][2]):
+            first += 1
+        start = toks[first][0]
+        hm = _HOUSE_NO_RE.match(prompt, toks[i][1])
+        if hm:
+            num = hm.group(1)
+            digits = re.match(r"\d+", num).group(0)
+            if len(digits) == 4 and num == digits and 1900 <= int(digits) <= 2099:
+                hm = None  # "Woningmarkt 2025" is a year, not a house number
+        if hm:
+            out.append(SpanMatch(start, hm.end(1), "LOC", prompt[start : hm.end(1)], priority=4))
+        elif _ADDRESS_CUE_RE.search(prompt[max(0, start - 40) : start]):
+            out.append(SpanMatch(start, toks[i][1], "LOC", prompt[start : toks[i][1]], priority=4))
+
+    for m in _EN_ADDRESS_NUM_RE.finditer(prompt):
+        out.append(SpanMatch(m.start(), m.end(2), "LOC", prompt[m.start() : m.end(2)], priority=4))
+    for m in _EN_STREET_RE.finditer(prompt):
+        if _ADDRESS_CUE_RE.search(prompt[max(0, m.start() - 40) : m.start()]):
+            out.append(SpanMatch(m.start(1), m.end(1), "LOC", m.group(1), priority=4))
+
+    # 4: places --------------------------------------------------------------------------------
+    place_only_preps = PLACE_PREPOSITIONS - PERSON_PREPOSITIONS
+    i = 0
+    while i < n:
+        key = lows[i]
+        tok = toks[i][2]
+        start_off = toks[i][0]
+        if key.startswith("s-") and start_off > 0 and prompt[start_off - 1] in "'’":
+            capital_ok = len(tok) > 2 and tok[2].isupper()  # 's-Hertogenbosch
+            start_off -= 1
+        elif key.startswith("s-"):
+            capital_ok = len(tok) > 2 and tok[2].isupper()  # s-Hertogenbosch / s-Gravenhage
+        else:
+            capital_ok = tok[0].isupper() and not tok.isupper()
+        entries = PLACE_INDEX.get(key) if capital_ok else None
+        matched = None
+        if entries:
+            for words in entries:
+                last = i + len(words) - 1
+                if last >= n:
+                    continue
+                if all(lows[i + w] == words[w] and adjacent(i + w - 1, i + w) for w in range(1, len(words))):
+                    matched = (words, last)
+                    break
+        if matched is None:
+            i += 1
+            continue
+        words, last = matched
+        name = " ".join(words)
+        if len(words) == 1 and prev_in(i, ROLE_WORDS | CONTACT_WORDS):
+            # "employee Austin", "medewerker Milan", "Dear Sofia": person role/contact cue, not a city.
+            i = last + 1
+            continue
+        if name in AMBIGUOUS_PLACES:
+            in_address = _ADDRESS_TAIL_RE.search(prompt[max(0, start_off - 12) : start_off]) is not None
+            preps = (
+                place_only_preps
+                if (len(words) == 1 and name in FIRST_NAMES and name not in AMBIGUOUS_FIRST_NAMES)
+                else PLACE_PREPOSITIONS
+            )
+            if not (prev_in(i, preps) or in_address):
+                i = last + 1
+                continue
+        out.append(SpanMatch(start_off, toks[last][1], "LOC", prompt[start_off : toks[last][1]], priority=5))
+        i = last + 1
+
+    # 5: organisations after a cue word --------------------------------------------------------
+    for m in _ORG_CUE_RE.finditer(prompt):
+        cue = prompt[m.start() : m.start(1)].split()[0].lower()
+        role = cue in _ORG_ROLE_CUES
+        if not _is_accounting_business_phrase(m.group(1).split()):
+            out.append(SpanMatch(m.start(1), m.end(1), "ID", m.group(1), priority=5, is_role_subject=role))
+        pos, extra = m.end(1), 0
+        while extra < 4:
+            cm = _ORG_CONTINUE_RE.match(prompt, pos)
+            if not cm:
+                break
+            if not _is_accounting_business_phrase(cm.group(1).split()):
+                out.append(SpanMatch(cm.start(1), cm.end(1), "ID", cm.group(1), priority=5))
+            pos, extra = cm.end(1), extra + 1
+
+    return out
 
 
 @dataclass
@@ -541,6 +861,10 @@ class BlindTokenizer:
                 continue  # 5000EUR / EUR5000: handled as an encrypted amount below
             candidates.append(SpanMatch(m.start(), m.end(), "GOV_ID", tok, priority=5))
 
+        # Priority 4-6: gazetteer names, addresses, places and cued organisations (offline lists).
+        # Added before the capitalised-phrase rule so a place ("Den Haag") wins a tie with it.
+        candidates.extend(_gazetteer_spans(prompt))
+
         # Priority 5: Multi-word Capitalized Names / Dutch & European Particles / Organizations / Locations
         role_prefix_re = re.compile(
             r"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|customer|lead|recipient|user|"
@@ -555,7 +879,11 @@ class BlindTokenizer:
             phrase = m.group(1)
             words = phrase.split()
             start_offset = m.start(1)
-            while words and words[0] in STOPWORD_CAPITALS:
+            while words and (
+                words[0] in STOPWORD_CAPITALS
+                or words[0] in _LEADING_CUE_CAPITALS
+                or words[0].lower() in ROLE_WORDS
+            ):
                 removed = words.pop(0)
                 start_offset = prompt.index(words[0], start_offset + len(removed)) if words else start_offset
             if len(words) >= 2:
@@ -564,7 +892,9 @@ class BlindTokenizer:
                 prefix_ctx = prefix_window.lower()
                 has_role = role_prefix_re.search(prefix_window) is not None
                 has_org = words[-1] in org_suffixes
-                if not has_role and not has_org and all(w in BUSINESS_CAPITAL_NOUNS for w in words):
+                if _is_accounting_business_phrase(words) or (
+                    not has_role and not has_org and all(w in BUSINESS_CAPITAL_NOUNS for w in words)
+                ):
                     continue
                 cat = "LOC" if ("clinic" in prefix_ctx or "city" in prefix_ctx) else "ID"
                 candidates.append(
@@ -581,7 +911,7 @@ class BlindTokenizer:
         # Priority 6: Single proper name after a role/title word (e.g. "patient O'Connor", "dhr. Müller")
         for m in re.finditer(
             rf"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|customer|lead|recipient|user|medewerker|werknemer|"
-            rf"leverancier|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)({NAME_WORD})\b",
+            rf"leverancier|subject|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)({NAME_WORD})\b",
             prompt,
         ):
             word = m.group(1)
@@ -595,6 +925,17 @@ class BlindTokenizer:
                 and word.upper() not in CURRENCY_CODES
             ):
                 candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6, is_role_subject=True))
+
+        # Priority 6: surname with a particle after a personal title ("mevr. de Wit", "dhr. van Dijk",
+        # "dr. van der Berg"). Only titles qualify: after a role noun the same shape is ordinary
+        # prose ("een klant van Microsoft").
+        for m in re.finditer(
+            rf"(?i:\b(?:mr|mrs|ms|dr|dhr|mevr|prof)\.?\s+)((?i:{NAME_PARTICLE})\s+{NAME_WORD})\b",
+            prompt,
+        ):
+            candidates.append(
+                SpanMatch(m.start(1), m.end(1), "ID", m.group(1), priority=6, is_role_subject=True)
+            )
 
         # Priority 7: Sensitive amounts (Paillier PHE; non-negative 32-bit integers also RLWE-BFV)
         for m in NUM_RE.finditer(prompt):
@@ -795,6 +1136,14 @@ class BlindTokenizer:
         }
 
     def execute_and_decrypt_fhe(self, op_spec: Dict[str, Any], ctx: BlindContext) -> Dict[str, Any]:
+        """
+        Validate the LLM's op_spec here, send ONLY public material (Paillier n / BFV rlk) plus the
+        ciphertexts to the separate evaluator process, then decrypt the returned ciphertexts locally.
+        Same machine: a process boundary with public material only, not a network/hardware boundary.
+        """
+        # Lazy import: services/ imports this module (avoids an import cycle).
+        from services import evaluator_worker as ew
+
         op = str(op_spec.get("op", "")).upper()
 
         if op in ("BFV_MULTIPLY", "MULTIPLY"):
@@ -807,7 +1156,9 @@ class BlindTokenizer:
             if ea.get("bfv_limbs") is None or eb.get("bfv_limbs") is None:
                 raise ValueError("Selected operands are non-integers or exceed 32-bit unsigned BFV limb domain.")
 
-            prod_terms = self.bfv.evaluator.multiply_limbs(ea["bfv_limbs"], eb["bfv_limbs"])
+            req = ew.build_bfv_request(ref_a, ref_b, ea["bfv_limbs"], eb["bfv_limbs"], self.bfv.evaluator.public_rlk)
+            res = ew.run_evaluation(req, lambda resp, pid: ew.decode_bfv_response(resp, req, pid))
+            prod_terms = res["terms"]
             dec_int = self.bfv.decrypt_limbs_product(prod_terms)
             sym = ea.get("prefix_symbol") or eb.get("prefix_symbol") or ""
             formatted = _format_amount(sym, dec_int, "{:,}")
@@ -821,6 +1172,7 @@ class BlindTokenizer:
                 "scale": 1,
             }
             ctx.token_to_plaintext[out_token] = formatted
+            ctx.log(f"RLWE-BFV product evaluated by {res['evaluated_by']}")
             ctx.log(
                 f"Native C RLWE-BFV (leveled, depth 1, N=2048) product {out_token}: "
                 f"D(Relin({ref_a} ⊗ {ref_b})) decrypted locally"
@@ -832,9 +1184,14 @@ class BlindTokenizer:
                 "formula": f"c_prod = Relin(round((t/q) · ({ref_a} ⊗ {ref_b}))) in R_q (N=2048)",
                 "decrypted_outputs": {out_token: formatted},
                 "ciphertext_previews": {out_token: preview},
+                **ew.provenance(res),
             }
 
-        eval_res = self.evaluator.evaluate_operation(op_spec, ctx.encrypted_numbers)
+        req, expected_scales = ew.build_paillier_request(op_spec, ctx.encrypted_numbers, self.paillier.n)
+        eval_res = ew.run_evaluation(
+            req, lambda resp, pid: ew.decode_paillier_response(resp, req, self.paillier.n, expected_scales, pid)
+        )
+        ctx.log(f"{self.phe_label} {eval_res['op']} evaluated by {eval_res['evaluated_by']}")
         decrypted_summary: Dict[str, str] = {}
 
         ref_key = normalize_fhe_handle(op_spec.get("ref") or op_spec.get("ref_a") or "")
@@ -867,6 +1224,7 @@ class BlindTokenizer:
             "ciphertext_previews": {
                 k: v["hex_preview"] for k, v in ctx.computed_numbers.items()
             },
+            **ew.provenance(eval_res),
         }
 
     def unblind_response(self, response_text: str, ctx: BlindContext, include_secrets: bool = False) -> str:

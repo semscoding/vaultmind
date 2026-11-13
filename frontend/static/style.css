@@ -506,6 +506,16 @@ button { font-family: inherit; }
     overflow-wrap: anywhere;
 }
 
+.fhe-evaluated-by {
+    display: block;
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid #B9CBF7;
+    font-family: var(--font-sans);
+    color: var(--ink-2);
+}
+.fhe-evaluated-by.fhe-evaluated-fallback { color: var(--warn); font-weight: 600; }
+
 .parse-warning {
     font-size: 0.8125rem;
     color: var(--warn);
