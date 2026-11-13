@@ -289,6 +289,34 @@ _COMMON_WORD_SUFFIXES = (
     "ful", "less", "ous", "ive", "ly", "ed", "heid", "eren", "elen", "ggen", "kken", "nnen", "llen",
 )
 _ORG_ROLE_CUES = {"vendor", "client", "customer", "leverancier", "klant", "supplier"}
+_ORG_CORP_SUFFIXES = {
+    "Corp", "Inc", "Ltd", "BV", "NV", "LLC", "B.V.", "N.V.",
+    "Group", "Bank", "Central", "Hospital", "Labs",
+}
+_ACCOUNTING_HEAD_NOUNS = {
+    "Tax", "Bonus", "Salary", "Budget", "Margin", "Profit", "Revenue",
+    "Cost", "Credit", "Debit", "Income", "Flow", "Sheet", "Statement",
+    "Summary", "Ledger", "Notice", "Policy", "Agreement", "Contract",
+    "Invoice", "Quarter", "Year", "Subsidy", "Adjustment", "Earnout",
+    "Credentials", "Authorization", "Compliance", "Escalation", "Record",
+}
+_TO_INFINITIVE_VERBS = {"peter", "harry", "jimmy"}
+_TO_INFINITIVE_FOLLOWERS = {
+    "out", "off", "away", "down", "open", "the", "a", "an", "this", "that", "our", "their", "into",
+}
+
+
+def _is_accounting_business_phrase(words: List[str]) -> bool:
+    """True for pure accounting/compensation/policy phrases ('Quarterly Tax', 'Balance Sheet',
+    'Annual Bonus', 'Cash Flow') even after generic cues like 'Pay', 'client', or 'employee',
+    while keeping entity/service-like names ('Total Security', 'Cloud Reserve', 'Master Audit',
+    'Annual Report') eligible after explicit organisation cues."""
+    return (
+        bool(words)
+        and words[-1] not in _ORG_CORP_SUFFIXES
+        and all(w in BUSINESS_CAPITAL_NOUNS for w in words)
+        and words[-1] in _ACCOUNTING_HEAD_NOUNS
+    )
 
 
 def _is_cap(tok: str) -> bool:
@@ -341,6 +369,17 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
         low = lows[i]
         amb = low in AMBIGUOUS_FIRST_NAMES
         cued = prev_in(i, PERSON_CUES)
+        if (
+            not cap
+            and prev_in(i, {"to"})
+            and i + 1 < n
+            and adjacent(i, i + 1)
+            and (
+                lows[i + 1] in {"out", "off", "away", "down"}
+                or (low in _TO_INFINITIVE_VERBS and lows[i + 1] in _TO_INFINITIVE_FOLLOWERS)
+            )
+        ):
+            continue  # "to peter out", "to harry the team", "to jimmy open the lock"
 
         # optional particle(s), then one surname word (two when both are capitalised)
         k = i + 1
@@ -388,15 +427,8 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
         if not cap:
             # A lower-case first name alone counts only right after a person cue ("ask lisa",
             # "stuur naar sem"), and never when it is also an everyday word ("to mark", "met max")
-            # or an English infinitive phrasal verb ("to peter out").
+            # or an English infinitive ("to peter out", "to harry the team", "to jimmy the lock").
             if cued and not amb:
-                if (
-                    prev_in(i, {"to"})
-                    and i + 1 < n
-                    and adjacent(i, i + 1)
-                    and lows[i + 1] in {"out", "off", "away", "down"}
-                ):
-                    continue
                 out.append(SpanMatch(toks[i][0], toks[i][1], "ID", tok, priority=6,
                                      is_role_subject=prev_in(i, ROLE_WORDS)))
             continue
@@ -502,13 +534,15 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
     for m in _ORG_CUE_RE.finditer(prompt):
         cue = prompt[m.start() : m.start(1)].split()[0].lower()
         role = cue in _ORG_ROLE_CUES
-        out.append(SpanMatch(m.start(1), m.end(1), "ID", m.group(1), priority=5, is_role_subject=role))
+        if not _is_accounting_business_phrase(m.group(1).split()):
+            out.append(SpanMatch(m.start(1), m.end(1), "ID", m.group(1), priority=5, is_role_subject=role))
         pos, extra = m.end(1), 0
         while extra < 4:
             cm = _ORG_CONTINUE_RE.match(prompt, pos)
             if not cm:
                 break
-            out.append(SpanMatch(cm.start(1), cm.end(1), "ID", cm.group(1), priority=5))
+            if not _is_accounting_business_phrase(cm.group(1).split()):
+                out.append(SpanMatch(cm.start(1), cm.end(1), "ID", cm.group(1), priority=5))
             pos, extra = cm.end(1), extra + 1
 
     return out
@@ -858,7 +892,9 @@ class BlindTokenizer:
                 prefix_ctx = prefix_window.lower()
                 has_role = role_prefix_re.search(prefix_window) is not None
                 has_org = words[-1] in org_suffixes
-                if not has_role and not has_org and all(w in BUSINESS_CAPITAL_NOUNS for w in words):
+                if _is_accounting_business_phrase(words) or (
+                    not has_role and not has_org and all(w in BUSINESS_CAPITAL_NOUNS for w in words)
+                ):
                     continue
                 cat = "LOC" if ("clinic" in prefix_ctx or "city" in prefix_ctx) else "ID"
                 candidates.append(

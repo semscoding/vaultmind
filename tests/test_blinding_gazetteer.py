@@ -115,10 +115,24 @@ class GazetteerBlindingTests(unittest.TestCase):
         ]:
             with self.subTest(prompt=prompt):
                 self.assert_hidden(prompt, [piece], "ID")
-        # Without a cue word the business-noun rule still applies.
-        for sentence in ["Review Annual Bonus and Balance Sheet today.", "Pay the Annual Bonus to staff"]:
+        # Without a cue word — or for pure accounting/compensation phrases even after generic cues —
+        # the business-noun rule keeps ordinary finance terms in clear.
+        for sentence in [
+            "Review Annual Bonus and Balance Sheet today.",
+            "Pay the Annual Bonus to staff",
+            "Pay Quarterly Tax before Friday.",
+            "Pay Cash Flow and Balance Sheet attention.",
+            "Check client Balance Sheet and Cash Flow before Friday.",
+            "Approve employee Annual Bonus next month.",
+        ]:
             with self.subTest(sentence=sentence):
                 self.assertEqual(self.blind(sentence)[0], sentence)
+        # Mixed list after a cue keeps accounting terms in clear while still blinding the vendor.
+        blinded_mix, ctx_mix = self.assert_hidden(
+            "Pay Quarterly Tax and Total Security today", ["Total Security"], "ID"
+        )
+        self.assertTrue(blinded_mix.startswith("Pay Quarterly Tax and [ID_"))
+        self.assertEqual(set(ctx_mix.token_to_plaintext.values()), {"Total Security"})
 
     def test_ambiguous_names_need_extra_evidence(self):
         for sentence in [
@@ -165,6 +179,9 @@ class GazetteerBlindingTests(unittest.TestCase):
             ("Send the report to Sofia tomorrow.", "Sofia"),
             ("Stuur het rapport naar Anders voor controle.", "Anders"),
             ("Anders Lindqvist approved the budget.", "Anders Lindqvist"),
+            ("Send the file to peter tomorrow.", "peter"),
+            ("Talk to harry about the contract.", "harry"),
+            ("Mail jimmy before Friday.", "jimmy"),
         ]:
             with self.subTest(prompt=prompt):
                 blinded, ctx = self.assert_hidden(prompt, [expected_subject], "ID")
@@ -237,6 +254,10 @@ class GazetteerBlindingTests(unittest.TestCase):
         "Revenue grew from Jan to Mar.",
         "The contract was signed in Jan.",
         "Demand started to peter out.",
+        "We refused to harry the vendor.",
+        "They tried to jimmy the lock.",
+        "They tried to jimmy open the cabinet.",
+        "Pay Quarterly Tax before Friday.",
     ]
 
     def test_ordinary_prose_is_unchanged(self):
