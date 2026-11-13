@@ -29,19 +29,16 @@
     --warn: #7A4F00;           /* 7.4:1 on warn-soft */
     --warn-soft: #FFF4D9;
 
-    /* The wire (untrusted) surface */
-    --wire-bg: #141820;
-    --wire-surface: #1C212B;
-    --wire-rule: #343B48;
-    --wire-ink: #E8EBF0;       /* 15:1 */
-    --wire-ink-2: #AEB6C3;     /* 8.6:1 */
-    --wire-focus: #93B4FF;     /* 8.4:1 on wire-bg */
-    --wire-ok: #7EE0A6;
-    --wire-bad: #FF9E94;
-    --tok-id-ink: #FFD978;
-    --tok-id-bg: rgba(255, 196, 61, 0.16);
-    --tok-fhe-ink: #9BE7FF;
-    --tok-fhe-bg: rgba(110, 200, 255, 0.15);
+    /* The wire (untrusted): an outbound document on warm paper, set apart from the cool local
+       panels by its paper tone and a solid ink band, not by a dark terminal look. */
+    --wire-bg: #FAF7F0;
+    --wire-surface: #FFFFFF;
+    --wire-rule: #DDD6C6;
+    --wire-border: #8F8672;    /* 3.3:1 against the page */
+    --wire-ink: #14130F;       /* 17:1 on wire-bg */
+    --wire-ink-2: #5A5444;     /* 7:1 on wire-bg */
+    --tok-ink: #12161D;
+    --tok-bg: #E4EAFB;         /* the single accent, as a marker stripe */
 
     /* System font stacks: no external font requests (M10) */
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
@@ -338,21 +335,17 @@ select:hover, input:hover, textarea:hover { border-color: var(--ink-2); }
 /* The untrusted wire: the one dark surface on the page */
 .wire-panel {
     background: var(--wire-bg);
-    border-color: var(--wire-bg);
+    border-color: var(--wire-border);
     color: var(--wire-ink);
-    --focus: var(--wire-focus);
-    box-shadow: 0 2px 6px rgba(18, 22, 29, 0.18);
 }
+/* The one inverted strip on the page: it marks where the trust boundary is crossed. */
 .wire-panel .zone-band {
-    background:
-        repeating-linear-gradient(-45deg, transparent 0 7px, rgba(255, 255, 255, 0.045) 7px 14px),
-        #0E1117;
-    border-bottom-color: var(--wire-rule);
+    background: var(--ink);
+    border-bottom-color: var(--ink);
 }
-.wire-panel .panel-tag { color: var(--wire-ink); }
-.wire-panel .zone-where { color: var(--wire-ink-2); }
-.wire-panel .box-title h3, .wire-panel .wire-header h3 { color: var(--wire-ink-2); }
-.wire-panel ::selection { background: #2F4A8A; color: #FFF; }
+.wire-panel .panel-tag { color: #FFFFFF; }
+.wire-panel .zone-where { color: #D3D8E0; }
+.wire-panel .box-title h3, .wire-panel .wire-header h3 { color: var(--wire-ink); }
 
 /* ---------- Boxes inside panels ---------- */
 .input-container {
@@ -539,35 +532,37 @@ button { font-family: inherit; }
     flex-wrap: wrap;
 }
 
+/* The verdict is a plain statement next to the heading, not a pill. */
 .wire-lock {
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    font-weight: 700;
-    padding: 0.22rem 0.5rem;
-    border-radius: var(--r-control);
-    border: 1px solid var(--wire-rule);
-    transition: background-color 0.2s var(--ease-out), color 0.2s var(--ease-out), border-color 0.2s var(--ease-out);
+    font-size: 0.8125rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.2s var(--ease-out);
 }
-.wire-lock.leak-ok { color: var(--wire-ok); border-color: #2F7A50; background: rgba(46, 160, 90, 0.14); }
-.wire-lock.leak-bad { color: var(--wire-bad); border-color: #A2463E; background: rgba(220, 70, 60, 0.16); }
-.wire-lock.leak-unknown { color: var(--wire-ink-2); }
+.wire-lock.leak-ok { color: var(--ok); }
+.wire-lock.leak-bad { color: var(--bad); }
+.wire-lock.leak-unknown { color: var(--wire-ink-2); font-weight: 500; }
 
+/* How the verdict was reached: running text, set as a note under the heading. */
 .leak-status {
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
+    font-size: 0.8125rem;
     line-height: 1.5;
-    border-radius: var(--r-control);
-    padding: 0.55rem 0.7rem;
-    border: 1px solid var(--wire-rule);
     color: var(--wire-ink-2);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+    max-width: 62ch;
 }
-.leak-status strong { font-weight: 700; }
-.leak-status.leak-ok { border-color: #2F7A50; background: rgba(46, 160, 90, 0.1); }
-.leak-status.leak-ok strong { color: var(--wire-ok); }
-.leak-status.leak-bad { border-color: #A2463E; background: rgba(220, 70, 60, 0.13); }
-.leak-status.leak-bad strong { color: var(--wire-bad); }
+.leak-status strong { display: block; font-weight: 650; color: var(--wire-ink); }
+/* Only a real leak earns a filled block. */
+.leak-status.leak-bad {
+    background: var(--bad-soft);
+    border: 1px solid #E3A49D;
+    border-radius: var(--r-control);
+    padding: 0.55rem 0.7rem;
+    color: var(--ink);
+    max-width: none;
+}
+.leak-status.leak-bad strong { color: var(--bad); }
 
 .wire-code-block {
     font-family: var(--font-mono);
@@ -582,28 +577,34 @@ button { font-family: inherit; }
     overflow-wrap: anywhere;
     max-height: 26rem;
     overflow-y: auto;
-    scrollbar-color: #4A5363 var(--wire-surface);
+    scrollbar-color: #B5AD9B var(--wire-surface);
     tab-size: 2;
 }
 .wire-code-block.placeholder { color: var(--wire-ink-2); }
 
-.wire-section-label { color: var(--wire-ink-2); font-weight: 700; }
-.wire-local-only { color: var(--wire-ok); font-weight: 700; }
+/* Captions inside the sheet are set in the text face; only the message itself is monospace. */
+.wire-section-label, .wire-local-only, .wire-note { font-family: var(--font-sans); }
+.wire-section-label { font-size: 0.8125rem; font-weight: 600; color: var(--wire-ink-2); }
+.wire-local-only { font-size: 0.9375rem; font-weight: 650; color: var(--wire-ink); }
+.wire-note { font-size: 0.8125rem; color: var(--wire-ink-2); }
+.wire-request-line { font-weight: 700; color: var(--wire-ink); }
+.wire-headers { color: var(--wire-ink-2); }
 
-.token-highlight-id {
-    color: var(--tok-id-ink);
-    background: var(--tok-id-bg);
-    padding: 0.05rem 0.22rem;
-    border-radius: 3px;
+/* Blinded material is marked like a highlighter stripe in one hue; the two kinds differ by
+   underline, so the distinction does not depend on colour. */
+.token-highlight-id, .token-highlight-fhe {
+    color: var(--tok-ink);
+    background: var(--tok-bg);
+    padding: 0.05rem 0.2rem;
+    border-radius: 2px;
     font-weight: 600;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
 }
-
 .token-highlight-fhe {
-    color: var(--tok-fhe-ink);
-    background: var(--tok-fhe-bg);
-    padding: 0.05rem 0.22rem;
-    border-radius: 3px;
-    font-weight: 600;
+    text-decoration: underline dotted var(--accent);
+    text-decoration-thickness: 1.5px;
+    text-underline-offset: 3px;
 }
 
 .crypto-meta-box {
@@ -619,7 +620,7 @@ button { font-family: inherit; }
     flex-direction: column;
     max-height: 13rem;
     overflow-y: auto;
-    scrollbar-color: #4A5363 var(--wire-bg);
+    scrollbar-color: #B5AD9B var(--wire-bg);
 }
 
 .token-row {
@@ -634,7 +635,7 @@ button { font-family: inherit; }
 }
 .token-row:last-child { border-bottom: 0; }
 
-.token-key { color: var(--tok-id-ink); font-weight: 600; white-space: nowrap; }
+.token-key { color: var(--wire-ink); font-weight: 600; white-space: nowrap; }
 .token-val { color: var(--wire-ink-2); text-align: right; overflow-wrap: anywhere; }
 
 /* ---------- Column 3: enclave ---------- */

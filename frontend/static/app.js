@@ -287,23 +287,23 @@ function formatSafeHighlightedWire(payload) {
         const method = escapeHtml(req.method || "POST");
         // Defence in depth: never display a key that slipped into the query string.
         const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
-        parts.push(`<strong class="wire-section-label">${method} ${escapeHtml(shownUrl)}</strong>`);
+        parts.push(`<strong class="wire-request-line">${method} ${escapeHtml(shownUrl)}</strong>`);
         if (req.headers_redacted && typeof req.headers_redacted === "object") {
             const hdrs = Object.entries(req.headers_redacted)
                 .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
                 .join("\n");
-            if (hdrs) parts.push(hdrs);
+            if (hdrs) parts.push(`<span class="wire-headers">${hdrs}</span>`);
         }
         parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
     } else if (req) {
         // Offline engine: backend reports method/url/body = null.
-        parts.push('<strong class="wire-local-only">✔ LOCAL ONLY: offline engine, nothing left this machine</strong>');
-        if (req.note) parts.push(`// ${escapeHtml(req.note)}`);
-        parts.push('<span class="wire-section-label">Blinded prompt processed locally:</span>');
+        parts.push('<strong class="wire-local-only">Local only: nothing left this machine</strong>');
+        if (req.note) parts.push(`<span class="wire-note">${escapeHtml(req.note)}</span>`);
+        parts.push('<span class="wire-section-label">Blinded prompt, processed locally</span>');
         parts.push(highlightTokens(escapeHtml(blinded)));
     } else {
         // Older backend without actual_request: show only the blinded prompt.
-        parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request):</span>');
+        parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request)</span>');
         parts.push(highlightTokens(escapeHtml(blinded)));
     }
     return parts.join("\n\n");
@@ -342,9 +342,9 @@ function renderLeakCheck(payload) {
         const bad = (residual !== null && residual > 0) || flagged.length > 0;
         head.textContent = bad
             ? `⚠ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`
-            : `✔ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`;
+            : `Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`;
         if (bad) {
-            lines.push("WARNING: detected values are still present in the outgoing payload.");
+            lines.push("Detected values are still present in the outgoing payload.");
         }
         if (flagged.length) lines.push(`Flagged by backend: ${flagged.join(", ")}.`);
         if (lc.method) lines.push(`Method: ${lc.method}`);
@@ -354,7 +354,7 @@ function renderLeakCheck(payload) {
         }
         box.classList.add(bad ? "leak-bad" : "leak-ok");
         badge.classList.add(bad ? "leak-bad" : "leak-ok");
-        badge.textContent = bad ? `⚠ ${residualTxt} RESIDUAL MATCH(ES)` : `✔ 0 RESIDUAL MATCHES (heuristic)`;
+        badge.textContent = bad ? `⚠ ${residualTxt} residual match(es)` : `✔ 0 residual matches (heuristic)`;
     } else {
         head.textContent = flagged.length
             ? `⚠ Backend flags: ${flagged.join(", ")}`
@@ -363,7 +363,7 @@ function renderLeakCheck(payload) {
         if (flagged.length) {
             box.classList.add("leak-bad");
             badge.classList.add("leak-bad");
-            badge.textContent = "⚠ LEAK FLAGGED";
+            badge.textContent = "⚠ Leak flagged";
         } else {
             badge.classList.add("leak-unknown");
             badge.textContent = "Leak check: not reported";
@@ -372,7 +372,7 @@ function renderLeakCheck(payload) {
 
     box.appendChild(head);
     if (lines.length) {
-        box.appendChild(document.createTextNode("\n" + lines.join("\n")));
+        box.appendChild(document.createTextNode(lines.join("\n")));
     }
 }
 
