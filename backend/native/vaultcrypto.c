@@ -16,15 +16,26 @@
  *    HomomorphicEncryption.org standard; the error distribution here is uniform ternary
  *    (sigma ~ 0.82) instead of sigma ~ 3.2, so "128 bit" is an approximation.
  *
- * Constant-time scope: only the GF(2^8) arithmetic and the MAC/commitment comparisons
- * (vault_ct_memeq) are constant-time. The BFV code is NOT constant-time (see bfv_poly_mul_exact).
+ * 4. File-backed GF(2^8) shares (vault_*_files, vault_share_file_*): the GF(2^8) shares of the
+ *    master key are written to and read from their own 32-byte 0600 files by this library only,
+ *    so neither the shares nor K_GF ever pass through Python. Python only passes file paths and
+ *    public SHA-256 digests of the shares.
+ *
+ * Constant-time scope: only the GF(2^8) arithmetic and the MAC/commitment/share-digest
+ * comparisons (vault_ct_memeq) are constant-time. The BFV code is NOT constant-time
+ * (see bfv_poly_mul_exact).
  */
 
 #define __STDC_WANT_LIB_EXT1__ 1
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <CommonCrypto/CommonCryptor.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <CommonCrypto/CommonHMAC.h>
 
 #define VAULT_KEY_LEN 32
@@ -419,6 +430,356 @@ cleanup:
     vault_secure_wipe(mac_key, sizeof(mac_key));
     vault_secure_wipe(actual_id, sizeof(actual_id));
     vault_secure_wipe(computed_hmac, sizeof(computed_hmac));
+    return rc;
+}
+
+/* =========================================================================
+ * FILE-BACKED GF(2^8) SHARES
+ *
+ * Each GF(2^8) share of the 32-byte key K_GF lives in its own file of exactly 32 raw bytes
+ * (mode 0600) that only this library opens. Python passes paths plus the public SHA-256
+ * digest of every share; the share bytes are only ever held in C stack buffers that are
+ * wiped with vault_secure_wipe on every return path.
+ *
+ * Return codes (in addition to the existing ones: -1..-3 reconstruct/split argument errors,
+ * -10 key-commitment mismatch, -11/-21 AES failure, -20 HMAC mismatch):
+ *   -30 share file missing (ENOENT/ENOTDIR)
+ *   -31 share file unreadable (open/fstat/read error other than the cases below)
+ *   -32 share path is a symbolic link (refused by O_NOFOLLOW)
+ *   -33 not a regular file, or not exactly 32 bytes
+ *   -34 SHA-256 of the share does not match the expected digest
+ *   -35 writing a share file failed (open/fchmod/write/fsync/close)
+ *   -36 invalid argument (NULL pointer, zero xor mask, byte index out of range)
+ * ========================================================================= */
+
+#define VAULT_MAX_SHARES 255
+#define VAULT_SHARE_ENOENT   (-30)
+#define VAULT_SHARE_EIO      (-31)
+#define VAULT_SHARE_ESYMLINK (-32)
+#define VAULT_SHARE_ESIZE    (-33)
+#define VAULT_SHARE_EDIGEST  (-34)
+#define VAULT_SHARE_EWRITE   (-35)
+#define VAULT_SHARE_EINVAL   (-36)
+
+static int share_open_error(int err) {
+    if (err == ENOENT || err == ENOTDIR) return VAULT_SHARE_ENOENT;
+    if (err == ELOOP) return VAULT_SHARE_ESYMLINK;
+    return VAULT_SHARE_EIO;
+}
+
+/* Reads exactly 32 bytes from a regular, non-symlink file into `out`. `out` is wiped on error. */
+static int read_share_file(const char *path, uint8_t out[VAULT_KEY_LEN]) {
+    struct stat st;
+    size_t got = 0;
+    ssize_t r = 0;
+    uint8_t extra = 0;
+    int rc = 0;
+
+    if (path == NULL || out == NULL) return VAULT_SHARE_EINVAL;
+    /* O_NONBLOCK: opening a FIFO planted at the path must not block the enclave. */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return share_open_error(errno);
+
+    if (fstat(fd, &st) != 0) {
+        rc = VAULT_SHARE_EIO;
+        goto done;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size != (off_t)VAULT_KEY_LEN) {
+        rc = VAULT_SHARE_ESIZE;
+        goto done;
+    }
+    while (got < VAULT_KEY_LEN) {
+        r = read(fd, out + got, VAULT_KEY_LEN - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            rc = VAULT_SHARE_EIO;
+            goto done;
+        }
+        if (r == 0) break;
+        got += (size_t)r;
+    }
+    if (got != VAULT_KEY_LEN) {
+        rc = VAULT_SHARE_ESIZE; /* shrank after fstat */
+        goto done;
+    }
+    do {
+        r = read(fd, &extra, 1);
+    } while (r < 0 && errno == EINTR);
+    if (r != 0) {
+        rc = (r > 0) ? VAULT_SHARE_ESIZE : VAULT_SHARE_EIO; /* grew after fstat */
+    }
+
+done:
+    vault_secure_wipe(&extra, sizeof(extra));
+    (void)close(fd);
+    if (rc != 0) vault_secure_wipe(out, VAULT_KEY_LEN);
+    return rc;
+}
+
+/* Reads a share file and checks SHA-256(share) == expected_sha256 in constant time. */
+static int load_verified_share(const char *path, const uint8_t *expected_sha256, uint8_t out[VAULT_KEY_LEN]) {
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    if (expected_sha256 == NULL) return VAULT_SHARE_EINVAL;
+    int rc = read_share_file(path, out);
+    if (rc != 0) return rc;
+    CC_SHA256(out, (CC_LONG)VAULT_KEY_LEN, digest);
+    int ok = vault_ct_memeq(digest, expected_sha256, CC_SHA256_DIGEST_LENGTH);
+    vault_secure_wipe(digest, sizeof(digest));
+    if (!ok) {
+        vault_secure_wipe(out, VAULT_KEY_LEN);
+        return VAULT_SHARE_EDIGEST;
+    }
+    return 0;
+}
+
+/* Writes 32 share bytes to `path` (created/truncated, 0600, no symlink follow) and fsyncs. */
+static int write_share_file(const char *path, const uint8_t share[VAULT_KEY_LEN]) {
+    struct stat st;
+    size_t put = 0;
+    int rc = 0;
+
+    if (path == NULL || share == NULL) return VAULT_SHARE_EINVAL;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) return (errno == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
+
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        rc = VAULT_SHARE_EWRITE;
+        goto done;
+    }
+    /* The create mode only applies to new files and is masked by umask: force 0600. */
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        rc = VAULT_SHARE_EWRITE;
+        goto done;
+    }
+    while (put < VAULT_KEY_LEN) {
+        ssize_t w = write(fd, share + put, VAULT_KEY_LEN - put);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            rc = VAULT_SHARE_EWRITE;
+            goto done;
+        }
+        if (w == 0) {
+            rc = VAULT_SHARE_EWRITE;
+            goto done;
+        }
+        put += (size_t)w;
+    }
+    if (fsync(fd) != 0) rc = VAULT_SHARE_EWRITE;
+
+done:
+    if (close(fd) != 0 && rc == 0) rc = VAULT_SHARE_EWRITE;
+    return rc;
+}
+
+/*
+ * Provisioning: draws K_GF (32 bytes) with arc4random_buf on the C stack, splits it
+ * (k, n) over GF(2^8), writes share i (x = i + 1) to share_paths[i], returns per share
+ * SHA-256(share) in out_share_sha256_flat (n * 32 bytes) and the key commitment (32 bytes).
+ * No share byte is written to a caller-visible buffer. On failure the files written so far
+ * are unlinked, the outputs are wiped, and *out_bad_index (may be NULL) names the failing share.
+ */
+int vault_generate_split_key_to_files(
+    uint8_t threshold_k,
+    uint8_t total_n,
+    const uint8_t *feldman_component_32,
+    const char *const *share_paths,
+    uint8_t *out_share_sha256_flat,
+    uint8_t *out_key_commitment,
+    size_t *out_bad_index
+) {
+    uint8_t gf_key[VAULT_KEY_LEN];
+    uint8_t shares[VAULT_MAX_SHARES * VAULT_KEY_LEN];
+    size_t written = 0;
+    int rc = 0;
+
+    if (out_bad_index != NULL) *out_bad_index = SIZE_MAX;
+    if (share_paths == NULL || out_share_sha256_flat == NULL || out_key_commitment == NULL) {
+        return VAULT_SHARE_EINVAL;
+    }
+    if (threshold_k < 1 || threshold_k > total_n) return -1;
+    for (size_t i = 0; i < (size_t)total_n; i++) {
+        if (share_paths[i] == NULL) {
+            if (out_bad_index != NULL) *out_bad_index = i;
+            return VAULT_SHARE_EINVAL;
+        }
+    }
+
+    arc4random_buf(gf_key, sizeof(gf_key));
+    rc = vault_split_secret(gf_key, VAULT_KEY_LEN, threshold_k, total_n,
+                            feldman_component_32, shares, out_key_commitment);
+    vault_secure_wipe(gf_key, sizeof(gf_key));
+    if (rc != 0) goto cleanup;
+
+    for (size_t i = 0; i < (size_t)total_n; i++) {
+        const uint8_t *share = &shares[i * VAULT_KEY_LEN];
+        rc = write_share_file(share_paths[i], share);
+        if (rc != 0) {
+            if (out_bad_index != NULL) *out_bad_index = i;
+            goto cleanup;
+        }
+        written++;
+        CC_SHA256(share, (CC_LONG)VAULT_KEY_LEN, &out_share_sha256_flat[i * VAULT_KEY_LEN]);
+    }
+
+cleanup:
+    if (rc != 0) {
+        for (size_t j = 0; j < written; j++) {
+            (void)unlink(share_paths[j]);
+        }
+        vault_secure_wipe(out_share_sha256_flat, (size_t)total_n * VAULT_KEY_LEN);
+        vault_secure_wipe(out_key_commitment, VAULT_KEY_LEN);
+    }
+    vault_secure_wipe(shares, sizeof(shares));
+    return rc;
+}
+
+/* Loads k verified shares into `shares_out` (k * 32 bytes). */
+static int load_quorum_shares(
+    const char *const *share_paths,
+    const uint8_t *share_x,
+    const uint8_t *expected_share_sha256_flat,
+    size_t k,
+    uint8_t *shares_out,
+    size_t *out_bad_index
+) {
+    if (out_bad_index != NULL) *out_bad_index = SIZE_MAX;
+    if (share_paths == NULL || share_x == NULL || expected_share_sha256_flat == NULL) {
+        return VAULT_SHARE_EINVAL;
+    }
+    if (k < 1 || k > VAULT_MAX_SHARES) return -1;
+    for (size_t i = 0; i < k; i++) {
+        int rc = load_verified_share(share_paths[i], &expected_share_sha256_flat[i * VAULT_KEY_LEN],
+                                     &shares_out[i * VAULT_KEY_LEN]);
+        if (rc != 0) {
+            if (out_bad_index != NULL) *out_bad_index = i;
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/*
+ * vault_enclave_seal with the k GF(2^8) shares read from files by C. share_x[i] and
+ * expected_share_sha256_flat[i * 32 ..] belong to share_paths[i]. On a share-file error
+ * *out_bad_index (may be NULL) is the quorum position of the offending file.
+ */
+int vault_enclave_seal_files(
+    const char *const *share_paths,
+    const uint8_t *share_x,
+    const uint8_t *expected_share_sha256_flat,
+    size_t k,
+    size_t *out_bad_index,
+    const uint8_t *feldman_component_32,
+    const uint8_t *expected_key_commitment,
+    const uint8_t *plaintext,
+    size_t plaintext_len,
+    const uint8_t *aad,
+    size_t aad_len,
+    uint8_t *out_iv,
+    uint8_t *out_ciphertext,
+    size_t ciphertext_buf_cap,
+    size_t *out_ciphertext_len,
+    uint8_t *out_hmac
+) {
+    uint8_t shares[VAULT_MAX_SHARES * VAULT_KEY_LEN];
+    int rc = load_quorum_shares(share_paths, share_x, expected_share_sha256_flat, k, shares, out_bad_index);
+    if (rc == 0) {
+        rc = vault_enclave_seal(share_x, shares, k, feldman_component_32, expected_key_commitment,
+                                plaintext, plaintext_len, aad, aad_len, out_iv, out_ciphertext,
+                                ciphertext_buf_cap, out_ciphertext_len, out_hmac);
+    }
+    vault_secure_wipe(shares, sizeof(shares));
+    return rc;
+}
+
+/* vault_enclave_unseal with the k GF(2^8) shares read from files by C (see vault_enclave_seal_files). */
+int vault_enclave_unseal_files(
+    const char *const *share_paths,
+    const uint8_t *share_x,
+    const uint8_t *expected_share_sha256_flat,
+    size_t k,
+    size_t *out_bad_index,
+    const uint8_t *feldman_component_32,
+    const uint8_t *aad,
+    size_t aad_len,
+    const uint8_t *iv,
+    const uint8_t *ciphertext,
+    size_t ciphertext_len,
+    const uint8_t *expected_hmac,
+    uint8_t *out_plaintext,
+    size_t plaintext_buf_cap,
+    size_t *out_plaintext_len
+) {
+    uint8_t shares[VAULT_MAX_SHARES * VAULT_KEY_LEN];
+    int rc = load_quorum_shares(share_paths, share_x, expected_share_sha256_flat, k, shares, out_bad_index);
+    if (rc == 0) {
+        rc = vault_enclave_unseal(share_x, shares, k, feldman_component_32, aad, aad_len, iv,
+                                  ciphertext, ciphertext_len, expected_hmac, out_plaintext,
+                                  plaintext_buf_cap, out_plaintext_len);
+    }
+    vault_secure_wipe(shares, sizeof(shares));
+    return rc;
+}
+
+/* Returns 0 if `path` is a regular non-symlink file of 32 bytes whose SHA-256 equals
+ * expected_sha256_32, otherwise a share-file error code. The content is never returned. */
+int vault_share_file_check(const char *path, const uint8_t *expected_sha256_32) {
+    uint8_t share[VAULT_KEY_LEN];
+    int rc = load_verified_share(path, expected_sha256_32, share);
+    vault_secure_wipe(share, sizeof(share));
+    return rc;
+}
+
+/* Copies a share file (must be a valid 32-byte share file) to dst (0600, no symlink follow)
+ * through a wiped C stack buffer. Used for the demo backup and restore. */
+int vault_share_file_copy(const char *src_path, const char *dst_path) {
+    uint8_t share[VAULT_KEY_LEN];
+    int rc = read_share_file(src_path, share);
+    if (rc == 0) rc = write_share_file(dst_path, share);
+    vault_secure_wipe(share, sizeof(share));
+    return rc;
+}
+
+/* Demo only ("Corrupt" button): XORs byte `byte_index` of a share file with `xor_mask` in place. */
+int vault_share_file_flip_byte(const char *path, size_t byte_index, uint8_t xor_mask) {
+    struct stat st;
+    uint8_t b = 0;
+    ssize_t r = 0;
+    int rc = 0;
+
+    if (path == NULL || xor_mask == 0) return VAULT_SHARE_EINVAL;
+    int fd = open(path, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return share_open_error(errno);
+
+    if (fstat(fd, &st) != 0) {
+        rc = VAULT_SHARE_EIO;
+        goto done;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        rc = VAULT_SHARE_ESIZE;
+        goto done;
+    }
+    if (st.st_size < 0 || byte_index >= (size_t)st.st_size) {
+        rc = VAULT_SHARE_EINVAL;
+        goto done;
+    }
+    do {
+        r = pread(fd, &b, 1, (off_t)byte_index);
+    } while (r < 0 && errno == EINTR);
+    if (r != 1) {
+        rc = VAULT_SHARE_EIO;
+        goto done;
+    }
+    b ^= xor_mask;
+    do {
+        r = pwrite(fd, &b, 1, (off_t)byte_index);
+    } while (r < 0 && errno == EINTR);
+    if (r != 1 || fsync(fd) != 0) rc = VAULT_SHARE_EWRITE;
+
+done:
+    vault_secure_wipe(&b, sizeof(b));
+    if (close(fd) != 0 && rc == 0) rc = VAULT_SHARE_EWRITE;
     return rc;
 }
 
