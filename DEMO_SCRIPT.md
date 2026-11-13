@@ -30,9 +30,11 @@
 2. Middle column **EXTERNAL CLOUD WIRE · What Host Provider (Gemini/OpenAI/Bedrock) Sees**: zoom into **Transmitted payload**. It shows `POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`, the headers with `x-goog-api-key: <redacted>`, and the JSON body with `systemInstruction` and the blinded prompt.
 3. Point at the leak-check verdict next to the heading (**✔ 0 residual matches (heuristic)**) and at the token map below it (`[ID_…] ⟷ "Marcus Vance"`, `[FHE_NUM_1] … "$130,000" → 2048-bit PHE`).
 4. If the blue formula box appears in the left column, point at it: `c_bonus = [FHE_NUM_1]^15 mod n², c_total = [FHE_NUM_1]^115 mod n²` and the left column output with **$19,500.00** and **$149,500.00**.
+5. In the same blue box, point at the line under the formula: `Evaluated by: untrusted evaluator process (pid …; holds only n)`. If it reads `in-process fallback` with a warning instead, re-run or cut; do not narrate the process separation for that run.
 
 **Say:**
 > "This panel is the exact request body that went to Gemini, without the API key. The name became an HMAC token, the salary became a Paillier ciphertext handle, and a leak check confirms that none of the detected values is still in the payload. Gemini only answers with a plan: a fifteen percent bonus on FHE_NUM_1. The bonus is computed on the ciphertext with only the public key, and decrypted locally."
+> "That computation ran in a separate local process that only received the public modulus n and the ciphertext, never the secret key."
 
 ---
 
@@ -41,11 +43,11 @@
 **On screen:**
 1. Click **RLWE-BFV Product & Password Seal**, then **Execute Zero-Trust Pipeline**.
 2. Show in the payload: `[FHE_NUM_1](ENC:0x…)`, `[FHE_NUM_2](ENC:0x…)`, `password is [SECRET_…]`, `seed: [SECRET_…]`.
-3. If the blue formula box appears: `c_prod = Relin(round((t/q) · ([FHE_NUM_1] ⊗ [FHE_NUM_2]))) in R_q (N=2048)` and **$36,000**.
+3. If the blue formula box appears: `c_prod = Relin(round((t/q) · ([FHE_NUM_1] ⊗ [FHE_NUM_2]))) in R_q (N=2048)` and **$36,000**; the line under it reads `Evaluated by: untrusted evaluator process (pid …; holds only rlk)`.
 4. Optional: in the playground at the bottom click **C RLWE-BFV Product (in R_q)** with m₁ = 160, m₂ = 225.
 
 **Say:**
-> "The password and the tagged seed are sealed with AES-256 and HMAC inside the C library before anything is sent. Hours times rate is a ciphertext-times-ciphertext product in leveled BFV, depth one, with N equals 2048 and a 54-bit modulus. The cloud picks the operation; the product is evaluated and decrypted locally."
+> "The password and the tagged seed are sealed with AES-256 and HMAC inside the C library before anything is sent. Hours times rate is a ciphertext-times-ciphertext product in leveled BFV, depth one, with N equals 2048 and a 54-bit modulus. The cloud picks the operation; a separate local process that holds only the public relinearisation key evaluates the product, and the main process decrypts it."
 
 ---
 
@@ -56,7 +58,7 @@
 Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payload and the leak-check verdict.
 
 **Say:**
-> "Blinding is pattern-based, so anything without a label goes in a secret tag. Everything detected is replaced, and the leak check is computed on every run."
+> "Blinding uses patterns and a bundled list of names and places, so a secret without a label goes in a secret tag. Everything detected is replaced, and the leak check is computed on every run."
 
 (Rehearse this exact prompt before recording; if the verdict shows a residual match, use a different prompt.)
 
@@ -83,13 +85,13 @@ Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payl
 3. Terminal: `nm -u backend/native/libvaultcrypto.dylib | grep memset_s` → `_memset_s`.
 
 **Say:**
-> "Field arithmetic is branch-free and table-free. The reconstructed key and its subkeys are wiped with memset_s on every exit path, and the binary really links memset_s. To be precise: the shares themselves do pass through Python; the reconstructed key does not."
+> "Field arithmetic is branch-free and table-free. The reconstructed key and its subkeys are wiped with memset_s on every exit path, and the binary really links memset_s. The GF(2⁸) shares are read from their files by the C library itself; only the Feldman half passes through Python, and the reconstructed key never does."
 
 ---
 
 ## Scene 7: Tests and close (2:30 – 2:45)
 
-**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 47 tests` and `OK`.
+**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 85 tests` and `OK`.
 
 **Say:**
-> "Forty-seven tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, concurrent ledger writes, BFV at depth one, provider errors, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."
+> "Eighty-five tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, C-only share files, the separate evaluator process, concurrent ledger writes, BFV at depth one, provider errors, name and address blinding, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."

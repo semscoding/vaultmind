@@ -16,16 +16,17 @@ VaultMind lets a cloud LLM (Gemini, OpenAI or AWS Bedrock) plan actions on enter
 
 | Adversary | Capability | What protects the data |
 | :--- | :--- | :--- |
-| Cloud LLM provider | Reads and logs every request; may return malicious or malformed output | Heuristic blinding + `<secret>` sealing; only tokens and truncated ciphertext previews are sent; LLM output is parsed as untrusted data (type checks, action whitelist, range checks) |
+| Cloud LLM provider | Reads and logs every request; may return malicious or malformed output | Rule- and list-based blinding + `<secret>` sealing; only tokens and truncated ciphertext previews are sent; LLM output is parsed as untrusted data (type checks, action whitelist, range checks) |
 | Reader of fewer than $k$ shard files | Reads up to $k-1 = 2$ shard files | Shamir over $\mathbb{F}_{2^8}$ (information-theoretic) combined with Feldman shares over $\mathbb{Z}_q$ (computational) |
-| Writer of shard files | Corrupts, empties, truncates or replaces shard files | Feldman VSS check, SHA-256 share digests, key-commitment check in C, failover over all $k$-subsets |
+| Writer of shard files | Corrupts, empties, truncates, replaces or symlinks shard files | Feldman VSS check, SHA-256 share digests, C-side checks on each `.gfshare` file (`O_NOFOLLOW`, regular file of exactly 32 bytes, constant-time SHA-256 comparison), key-commitment check in C, failover over all $k$-subsets |
 | Writer of the SQLite ledger | Edits, deletes, duplicates or reorders rows | Encrypt-then-MAC with an AAD length field, row id and hash chain bound into the AAD |
+| Heap dump of the Python process (without the shard files) | Reads Python memory | The $\mathbb{F}_{2^8}$ shares and $K_{\mathbb{F}}$ never enter Python (§3.7); the dump yields only the Feldman half ($\alpha_0$ and Feldman shares), which is not enough to derive $K_{\text{master}}$ |
 
 **Out of scope**
 
-- Malware, a debugger or a heap dump of the local Python process. Shares and the Feldman secret $\alpha_0$ pass through Python (see §6); a process-memory attacker who also reads $k$ shards can recompute the key.
+- Malware or a debugger attached to the running process, or an attacker who combines a Python heap dump with read access to $k$ `.gfshare` files: the Feldman half is in Python memory and the $\mathbb{F}_{2^8}$ half is on disk, so together they give the key. The wiping of the C stack has not been measured with a memory dump.
 - A reader of the whole disk: in this demo all five shards live on one disk, plus a full backup copy in `database/runtime/.demo_clean_shards/` that powers the **↺ Restore Shards** button.
-- Secrets that have no label and no recognisable pattern and are not wrapped in `<secret>…</secret>` (blinding is heuristic, see §6).
+- Secrets that have no label and no recognisable pattern and are not wrapped in `<secret>…</secret>` (blinding is rule- and list-based, see §6).
 - Side channels other than those addressed by the constant-time $\mathbb{F}_{2^8}$ arithmetic and MAC comparison (the BFV code is not constant-time).
 - Other local users of the machine: the loopback API has no authentication (it rejects foreign `Host` headers and cross-origin/cross-site browser `POST`s).
 
@@ -43,18 +44,26 @@ VaultMind lets a cloud LLM (Gemini, OpenAI or AWS Bedrock) plan actions on enter
             │  amounts ──► [FHE_NUM_i](ENC:0x…preview)                 |                 │
             │              Paillier E(m) and BFV limbs E(m_i)          |                 │
             ▼                                                        |                 │
- Evaluators (same local process; hold public keys n, rlk) ◄──────────┼─────────────────┘
+ Evaluator child process (same machine; gets only n or rlk ◄─────────┼─────────────────┘
+   + ciphertexts, length-prefixed JSON over pipes)                   |
    Paillier: c1·c2, c^p mod n²      BFV: Relin(E(a)⊗E(b))            |
-            │ decrypt locally                                        |
+            │ result ciphertexts back; main process decrypts         |
             ▼                                                        |
- SecureEnclave ──► libvaultcrypto (C): reconstruct key from k shards,|
-                   derive subkeys, AES-256-CBC + HMAC-SHA256, wipe   |
+ SecureEnclave ──► libvaultcrypto (C): read k .gfshare files itself, |
+                   reconstruct key, derive subkeys,                  |
+                   AES-256-CBC + HMAC-SHA256, wipe                   |
             │                                                        |
             ▼                                                        |
- vault_ledger.db (hash-chained, sealed rows)   shards/node_01..05.json (0600)
+ vault_ledger.db (hash-chained, sealed rows)
+ shards/node_01..05.json (0600: x, Feldman share, canary, SHA-256 of the GF share)
+ shards/node_01..05.gfshare (0600: 32 raw bytes, opened only by C)
 ```
 
-The cloud LLM never receives a ciphertext it could compute on and never evaluates anything: it only chooses **which** operation to run on which handle. The evaluator classes (`HomomorphicEvaluator`, `BFVEvaluator`) hold only public material ($n$, $n^2$, `rlk`), but they run locally, in the same process that holds the secret keys.
+The cloud LLM never receives a ciphertext it could compute on and never evaluates anything: it only chooses **which** operation to run on which handle.
+
+**Who evaluates.** The Paillier and BFV operations the LLM picks are run by a separate child process (`services/evaluator_worker.py`). It receives only public material (the Paillier modulus $n$, or the BFV relinearisation key `rlk`) and the ciphertexts, as length-prefixed JSON frames over its stdin/stdout pipes (no pickle). It never receives $p$, $q$, $\lambda$, $\mu$ or the BFV secret key, and it has no decryption code. Both sides validate fields, lengths and ranges; a manipulated answer becomes an error. The main process decrypts the result. Each result carries `evaluated_by` (for example `untrusted evaluator process (pid 4242; holds only n)`), `evaluator_pid` and `evaluator_inputs`; the pipeline passes `fhe_evaluated_by` to the UI. If the worker crashes it is restarted once; if that fails, the main process evaluates itself, the result says `evaluated_by: "in-process fallback"`, and a warning states that this run does not demonstrate key separation.
+
+What this shows and what it does not: the boundary is a process boundary on the same machine, without a sandbox; it is not a network or hardware boundary. It shows that the evaluator computes without any secret key and could therefore run elsewhere. The playground endpoints (`/api/homomorphic-calc`, `/api/bfv-fhe-calc`) still evaluate in the main process.
 
 ---
 
@@ -62,7 +71,7 @@ The cloud LLM never receives a ciphertext it could compute on and never evaluate
 
 ### 3.1 Shamir Secret Sharing over $\mathbb{F}_{2^8}$ (native C)
 
-Field: $\mathbb{F}_{2^8} \cong \mathbb{F}_2[x]/(x^8 + x^4 + x^3 + x + 1)$ (`0x11B`). The 256-bit key $K_{\mathbb{F}}$ is generated in C with `arc4random_buf` (`vault_generate_and_split_key`) and each byte $s$ is split with a fresh polynomial
+Field: $\mathbb{F}_{2^8} \cong \mathbb{F}_2[x]/(x^8 + x^4 + x^3 + x + 1)$ (`0x11B`). The 256-bit key $K_{\mathbb{F}}$ is generated in C with `arc4random_buf` (`vault_generate_split_key_to_files`, which also writes each share to its own file) and each byte $s$ is split with a fresh polynomial
 
 $$f(x) = s \oplus a_1 x \oplus \dots \oplus a_{k-1} x^{k-1}, \qquad a_1, \dots, a_{k-1} \xleftarrow{\$} \mathbb{F}_{2^8},$$
 
@@ -84,7 +93,7 @@ $$g^{s_i} \stackrel{?}{\equiv} \prod_{j=0}^{k-1} C_j^{\,(i^j \bmod q)} \pmod P$$
 
 $C_0 = g^{\alpha_0}$ hides $\alpha_0$ only computationally (discrete logarithm in a 2048-bit safe-prime group). That suffices here because $\alpha_0$ is uniform over a set of size about $2^{2047}$, so it cannot be guessed, and because $\alpha_0$ alone is useless without $K_{\mathbb{F}}$, which is information-theoretically hidden by Shamir.
 
-Inside `vault_enclave_seal` / `vault_enclave_unseal` (C), with $\alpha_0$ re-interpolated from the quorum's Feldman shares:
+Inside `vault_enclave_seal_files` / `vault_enclave_unseal_files` (C), which read the quorum's $\mathbb{F}_{2^8}$ shares from their files, with $\alpha_0$ re-interpolated in Python from the quorum's Feldman shares and passed in as $\operatorname{SHA256}(\alpha_0)$:
 
 $$K_{\text{master}} = \text{HMAC-SHA256}\!\big(K_{\mathbb{F}},\ \operatorname{SHA256}(\operatorname{I2OSP}_{256}(\alpha_0))\big)$$
 
@@ -145,10 +154,13 @@ Secret $s$ and all errors are sampled uniformly from $\{-1, 0, 1\}^N$ by rejecti
 
 ### 3.7 Key handling, stated precisely
 
-- The 256-bit $\mathbb{F}_{2^8}$ key is generated in C with `arc4random_buf`, split and wiped in C; it never enters Python.
+- The 256-bit $\mathbb{F}_{2^8}$ key is generated in C with `arc4random_buf` and split in C. `vault_generate_split_key_to_files` writes each share to its own file `shards/node_0X.gfshare` (exactly 32 raw bytes, mode 0600, `fsync`) and returns to Python only the SHA-256 of each share and the key commitment.
+- The shard JSON (`node_0X.json`) holds `node_id`, `x`, `gf_share_sha256`, `canary_y` and `feldman_y_hex`, no share bytes; `manifest.json` has `format_version: 2`.
+- Only the C library opens a `.gfshare` file: `vault_enclave_seal_files`, `vault_enclave_unseal_files`, `vault_share_file_check` (inspection), `vault_share_file_copy` (demo backup and restore) and `vault_share_file_flip_byte` (the demo **Corrupt** button). Reads use `O_NOFOLLOW`, an `fstat` check for a regular file of exactly 32 bytes, and a constant-time comparison of the share's SHA-256 with `gf_share_sha256`; share buffers are wiped on every path. `tests/test_c_share_files.py` checks that Python never opens a `.gfshare` file during sealing, verification, corrupt, restore or provisioning.
 - The reconstructed key $K_{\mathbb{F}}$, $K_{\text{master}}$ and the AES/HMAC subkeys exist only on the C stack inside `vault_enclave_seal` / `vault_enclave_unseal` and are wiped with `memset_s` on every path (`nm -u libvaultcrypto.dylib` shows `_memset_s`).
-- Measured per seal: the whole `vault_enclave_seal` call (reconstruct, derive, encrypt, MAC, wipe) took a median of 3.6 µs and a p99 of 6.3 µs (1000 seals of a 200-byte record, Apple M4 Pro, `time.perf_counter_ns` around the ctypes call, so ctypes overhead is included). This is an upper bound on how long the reconstructed key sits on the C stack per seal.
-- **Not** C-only: the $k$ shares are read from disk by Python and pass through Python as hex strings and bytes; the Feldman secret $\alpha_0$ is generated and re-interpolated in Python as an `int`; the BFV and session keys live in ctypes buffers owned by the Python process. The session key for sealing prompt secrets is generated in C (`vault_random_bytes`).
+- Measured per seal (before the switch to share files): the whole `vault_enclave_seal` call (reconstruct, derive, encrypt, MAC, wipe) took a median of 3.6 µs and a p99 of 6.3 µs (1000 seals of a 200-byte record, Apple M4 Pro, `time.perf_counter_ns` around the ctypes call, so ctypes overhead is included). This is an upper bound on how long the reconstructed key sits on the C stack per seal; the `_files` variants add file reads and were not re-measured.
+- **Still in Python:** the Feldman secret $\alpha_0$ is generated and re-interpolated in Python as an `int`, and the Feldman shares are read from the shard JSON by Python (2048-bit arithmetic). A heap dump of the Python process therefore yields only the Feldman half, which is not enough to compute $K_{\text{master}} = \text{HMAC-SHA256}(K_{\mathbb{F}}, \operatorname{SHA256}(\alpha_0))$. The BFV and session keys live in ctypes buffers owned by the Python process. The session key for sealing prompt secrets is generated in C (`vault_random_bytes`).
+- A runtime directory in the old format (shares as hex in the shard JSON, no `format_version`) is re-provisioned at start-up with a new key; the old ledger table is archived, because its rows were sealed under the discarded key.
 
 ---
 
@@ -164,13 +176,15 @@ and commit to database.
 
 Tokens: `[ID_…]`, `[IBAN_…]`, `[GOV_ID_…]`, `[EMAIL_…]`, `[LOC_…]`, `[PHONE_…]` (HMAC-SHA256, 32-bit prefix, fresh key per prompt), `[SECRET_…]` (sealed in C with AES-256-CBC + HMAC-SHA256, never stored in plaintext token maps or logs), `[FHE_NUM_n]` (Paillier and, for integers, BFV ciphertexts; only a truncated preview of the Paillier ciphertext is sent: its first 12 and last 8 hex digits).
 
+Names, places, addresses and some organisations are also found with a bundled list (`backend/crypto/gazetteer.py`): 859 first names (111 of them ambiguous, such as `Will` or `Mark`), 463 places (45 ambiguous, such as `Best` or `Nice`), Dutch street suffixes and English street words. Lookup is per word; there is no ML model and nothing is downloaded. This detects single first names (`Sem`, `Maria`), lower-case names after a person word (`transfer to jan jansen`) or with a surname particle (`maria van dijk approved`), addresses as one `[LOC_…]` token including the house number (`Keizersgracht 12`, `12 Baker Street`), place names (`Amsterdam`), and organisations after a cue word (`Pay …`, `Invoice from …`, `vendor …`). Ambiguous names and places are only blinded with extra context (a person word, or a preposition such as `in Best`).
+
 After blinding, a residual scan checks whether any detected value still appears in the outgoing text (case-insensitive). The result is `contains_raw_pii`, `contains_raw_secrets` and `leak_check` in the response, and is shown above the payload. The scan can only find values the tokenizer detected in the first place.
 
 ---
 
 ## 5. Claim → how to verify
 
-All commands run from the repository root with the venv active. Test names refer to `tests/test_security_audit.py` (`test_01`…`test_10`) and `tests/test_audit_regressions.py`.
+All commands run from the repository root with the venv active. Test names refer to `tests/test_security_audit.py` (`test_01`…`test_10`), `tests/test_audit_regressions.py`, `tests/test_c_share_files.py`, `tests/test_evaluator_process.py` and `tests/test_blinding_gazetteer.py`.
 
 | Claim | How to verify |
 | :--- | :--- |
@@ -197,22 +211,31 @@ All commands run from the repository root with the venv active. Test names refer
 | Concurrent ledger writes preserve hash-chain integrity | `test_concurrent_enclave_seals_succeed_with_valid_hash_chain` |
 | Decimal DoS/underflow bounds, echoed-secret redaction, canonical AAD & CSRF guard | `TestAuditRound5Regressions` (`test_audit_regressions.py`) |
 | Dashboard makes no external requests | `grep -nE "https?://" frontend/static/index.html` → no output (Chart.js is in `frontend/static/vendor/`) |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 47 tests, OK |
+| Shard JSON and manifest hold no $\mathbb{F}_{2^8}$ share bytes; `.gfshare` files are 32 bytes, 0600 | `test_provisioned_layout_holds_no_share_bytes_in_json` |
+| Python never opens a `.gfshare` file (seal, verify, corrupt, restore, provisioning) | `test_python_never_opens_share_files` |
+| Missing, short, long, symlinked or bit-flipped share files are rejected and the enclave fails over | `test_missing_share_file_fails_over`, `test_short_share_file_fails_over`, `test_long_share_file_fails_over`, `test_symlinked_share_file_is_refused_and_restore_repairs_it`, `test_single_bit_flip_fails_over`, `test_three_broken_share_files_block_the_enclave` |
+| Old-format runtime is re-provisioned; a corrupt manifest is not silently re-keyed | `test_legacy_runtime_is_reprovisioned_without_crash`, `test_unparseable_manifest_is_not_silently_rekeyed` |
+| Homomorphic evaluation runs in a separate process that receives no secret material | `test_evaluation_runs_in_a_separate_live_process`, `test_boundary_carries_no_secret_material`, `test_worker_module_has_no_decryption_or_secret_key_code` |
+| Evaluator restart, fallback and manipulated answers | `test_killed_worker_is_restarted`, `test_fallback_when_worker_cannot_start`, `test_hanging_worker_times_out_and_falls_back`, `test_manipulated_responses_fail_cleanly` |
+| List-based blinding of names, addresses, places and cued organisations | `test_lowercase_full_names_after_a_person_cue`, `test_single_first_names`, `test_addresses_and_places`, `test_cued_organisations_keep_the_cue_word_in_clear`, `test_ambiguous_names_need_extra_evidence` |
+| Ordinary prose stays unchanged; hostile inputs stay fast | `test_ordinary_prose_is_unchanged`, `test_hostile_inputs_finish_within_one_second` |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 85 tests, OK (about 19 s) |
 
 ---
 
 ## 6. Known Limitations
 
-- **Blinding is heuristic (regex-based).** Not detected: lower-case names (`jan jansen`), single first names without a role word (`Sem`, `Maria`), bare integers below 10, percentages, street names and cities without a label, company names made only of common business words (`Cloud Reserve`, `Master Audit`), and secrets without a label or a recognisable pattern. After a label such as `password` or `sleutel`, a value is sealed when it looks like a credential (digit mixed with letters, a symbol, or three or more hyphen-joined parts); a plain-word value after a policy word or an indefinite article (`a password is never shared`) is treated as prose and left alone. Wrap such secrets in `<secret>…</secret>`. The residual scan cannot flag what was never detected.
-- **Shares and $\alpha_0$ pass through Python** (see §3.7). The claim is limited to the reconstructed key and subkeys.
+- **Blinding is rule- and list-based** (regexes plus the bundled name and place lists, §4). Not detected: lower-case names without a surname particle and without a person word in front (`renée müller confirmed`), ambiguous first names and places without context (`Will`, `Mark`, `Best`, `Nice`), names and places that are not in the lists, countries, percentages, bare integers below 10, organisations without a cue word, and secrets without a label or a recognisable pattern. The lists were compiled from general knowledge and have not been checked against an official source. On a benchmark of 66 adversarial prompts (run outside the test suite) one leak remained, a percentage, which is left in clear on purpose; five paragraphs of ordinary business text (Dutch and English) gave 0 blinded words. After a label such as `password` or `sleutel`, a value is sealed when it looks like a credential (digit mixed with letters, a symbol, or three or more hyphen-joined parts); a plain-word value after a policy word or an indefinite article (`a password is never shared`) is treated as prose and left alone. Wrap such secrets in `<secret>…</secret>`. The residual scan cannot flag what was never detected.
+- **The Feldman half passes through Python** (see §3.7): $\alpha_0$ and the Feldman shares are Python integers. The $\mathbb{F}_{2^8}$ shares are read only by C. `O_NOFOLLOW` only covers the last path component (a symlinked parent directory is followed). The wiping of the C stack has not been checked with a memory dump.
+- **Share files:** there is no secure deletion of old files; on a copy-on-write file system (APFS) overwritten or re-provisioned shares may remain in free blocks.
 - **Sealed secrets are never put back into the output.** If the model echoes a `[SECRET_…]` token, the local answer shows `[REDACTED:[SECRET_…]]`; names, IBANs and amounts are restored, secrets are not, and redaction does not decrypt them.
 - **Locally, plaintext is kept for unblinding and display.** The token map, the plaintext numbers and the local audit trail (`original_prompt` redacted of secrets, token table) contain names and amounts. `SECRET` spans are never stored in token maps, logs, audit trails, or `unblinded_result` (though the caller's immutable input `prompt: str` and regex slices exist transiently on the Python heap until garbage-collected).
 - **BFV security is approximate:** uniform ternary errors instead of $\sigma \approx 3.2$; no lattice-estimator run.
 - **BFV is not constant-time:** `bfv_poly_mul_exact` skips zero coefficients of its first argument, which can be the secret key or the encryption randomness.
 - **BFV is depth 1 only**; 32-bit products are recombined in plaintext after decrypting up to 16 partial products.
-- **The LLM is a blind planner**, not an evaluator: it gets no full ciphertexts and computes nothing. Evaluation runs locally in the process that holds the secret keys.
+- **The LLM is a blind planner**, not an evaluator: it gets no full ciphertexts and computes nothing. Evaluation runs in a separate local process that holds only $n$ or `rlk` (§2). That is a process boundary on the same machine without a sandbox, not a network or hardware boundary. If the worker cannot be started after one restart, the main process evaluates and the result is labelled `in-process fallback`. The playground endpoints `/api/homomorphic-calc` and `/api/bfv-fhe-calc` still evaluate in the main process.
 - **Ledger:** truncation of the newest rows is only detectable against an externally stored `chain_head_hash`; `created_at` and `quorum_nodes` are not authenticated.
-- **Shard storage:** all shards are on one disk, plus the demo backup copy in `.demo_clean_shards/`. The $\mathbb{F}_{2^8}$ share digest in `manifest.json` is an unkeyed SHA-256; integrity of that half ultimately rests on the key commitment checked in C.
+- **Shard storage:** all shards (JSON and `.gfshare`) are on one disk, plus the demo backup copy in `.demo_clean_shards/`. The $\mathbb{F}_{2^8}$ share digest in `manifest.json` is an unkeyed SHA-256; integrity of that half ultimately rests on the key commitment checked in C.
 - **macOS only** (CommonCrypto, `arc4random_buf`).
 - **Live cloud path:** request bodies and error handling are tested with mocked HTTP responses only; the live Gemini, OpenAI and Bedrock calls have not yet been run with real keys.
 - **No API authentication** on the loopback server.
@@ -233,7 +256,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (47 tests)
+# Run the test suite (85 tests, about 19 s)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -254,11 +277,12 @@ Runtime state (shards, manifest, ledger) is created in `database/runtime/` (git-
 vaultmind/
 ├── frontend/      # Loopback dashboard (index.html, app.js, style.css, vendor/chart.umd.min.js) and Rich TUI (tui.py)
 ├── backend/
-│   ├── native/    # vaultcrypto.c (GF(2^8) Shamir, enclave seal/unseal, session vault, RLWE-BFV) and build.py
-│   └── crypto/    # shamir.py (Feldman VSS + ctypes), homomorphic.py (Paillier), bfv_fhe.py, blind_tokenizer.py, zeroize.py
+│   ├── native/    # vaultcrypto.c (GF(2^8) Shamir, share files, enclave seal/unseal, session vault, RLWE-BFV) and build.py
+│   └── crypto/    # shamir.py (Feldman VSS + ctypes), homomorphic.py (Paillier), bfv_fhe.py, blind_tokenizer.py, gazetteer.py (name/place lists), zeroize.py
 ├── database/      # schema.sql and ledger.py (hash-chained sealed ledger)
 ├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / offline engine)
-├── services/      # pipeline_service.py and enclave_service.py
+├── services/      # pipeline_service.py, enclave_service.py and evaluator_worker.py (separate evaluator process)
 ├── monitoring/    # telemetry.py
-└── tests/         # test_security_audit.py and test_audit_regressions.py (47 tests)
+└── tests/         # test_security_audit.py, test_audit_regressions.py, test_c_share_files.py,
+                   # test_evaluator_process.py, test_blinding_gazetteer.py (85 tests)
 ```
