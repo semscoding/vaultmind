@@ -452,6 +452,26 @@ class ShamirSecretSharing:
                 alpha_0 = self.vss.interpolate_zero(feld_pts)
                 self._fill_feldman_component(alpha_0, feldman_buf)
 
+                if not (
+                    isinstance(iv_hex, str)
+                    and isinstance(ciphertext_hex, str)
+                    and isinstance(hmac_hex, str)
+                ):
+                    raise ValueError("Ledger hex fields (iv_hex, ciphertext_hex, hmac_hex) must be strings.")
+                hex_chars = frozenset("0123456789abcdefABCDEF")
+                if len(iv_hex) != 32 or not all(ch in hex_chars for ch in iv_hex):
+                    raise ValueError("Invalid AES-CBC IV hex: expected exactly 32 hexadecimal characters (16 bytes).")
+                if len(hmac_hex) != 64 or not all(ch in hex_chars for ch in hmac_hex):
+                    raise ValueError("Invalid HMAC-SHA256 hex: expected exactly 64 hexadecimal characters (32 bytes).")
+                if (
+                    len(ciphertext_hex) < 32
+                    or len(ciphertext_hex) % 32 != 0
+                    or not all(ch in hex_chars for ch in ciphertext_hex)
+                ):
+                    raise ValueError(
+                        "Invalid AES-CBC ciphertext hex: expected a non-empty multiple of 32 hexadecimal characters."
+                    )
+
                 iv_b = bytes.fromhex(iv_hex)
                 ct_b = bytes.fromhex(ciphertext_hex)
                 mac_b = bytes.fromhex(hmac_hex)

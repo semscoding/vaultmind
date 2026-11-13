@@ -125,7 +125,7 @@ static int reconstruct_bytes_internal(
     size_t secret_len,
     uint8_t *out_secret
 ) {
-    if (k < 1 || secret_len == 0) return -1;
+    if (k < 1 || k > 255 || secret_len == 0) return -1;
     for (size_t i = 0; i < k; i++) {
         if (share_x[i] == 0) return -2;
         for (size_t j = i + 1; j < k; j++) {

@@ -5,8 +5,8 @@ produced inside the native C enclave (`libvaultcrypto.dylib`).
 
 Rows form a hash chain: `prev_hash` of row i is SHA-256 over row i-1
 (id, action, target_token, iv_hex, ciphertext_hex, hmac_hex, prev_hash); row 1 links
-to GENESIS_HASH. The enclave binds "id:prev_hash:action:target_token" as HMAC AAD,
-so a deleted, duplicated or reordered row fails verification.
+to GENESIS_HASH. The enclave binds canonical JSON `[id, prev_hash, action, target_token]`
+as HMAC AAD, so a deleted, duplicated, reordered, or delimiter-shifted row fails verification.
 """
 
 import hashlib
@@ -18,6 +18,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 _ROW_COLUMNS = "id, created_at, action, target_token, quorum_nodes, iv_hex, ciphertext_hex, hmac_hex, prev_hash"
+LEDGER_SCHEMA_VERSION = 4
 
 
 class LedgerChainConflict(RuntimeError):
@@ -48,16 +49,24 @@ class EncryptedLedger:
                 r["name"]
                 for r in conn.execute("PRAGMA table_info(sealed_transactions)").fetchall()
             }
-            if cols and "prev_hash" not in cols:
-                # Pre-chain ledger: its rows were sealed with AAD "action:target" and can
-                # never verify under the chained AAD. Keep them (renamed) instead of
-                # crashing or silently mixing schemes; start a fresh chained table.
-                legacy = f"sealed_transactions_legacy_{time.time_ns()}"
+            user_ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if cols and ("prev_hash" not in cols or user_ver < LEDGER_SCHEMA_VERSION):
+                # Legacy ledger (pre-chain or pre-v4 colon-delimited AAD): keep old rows
+                # under a unique archive table name and start a fresh v4 canonical-AAD table.
+                base_legacy = f"sealed_transactions_legacy_{time.time_ns()}"
+                legacy = base_legacy
+                suffix = 1
+                while conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (legacy,)
+                ).fetchone():
+                    legacy = f"{base_legacy}_{suffix}"
+                    suffix += 1
                 conn.execute(f"ALTER TABLE sealed_transactions RENAME TO {legacy}")
                 self.migration_note = (
-                    f"Pre-hash-chain ledger moved to table '{legacy}'; a new chained ledger was started."
+                    f"Legacy ledger moved to table '{legacy}'; a new v{LEDGER_SCHEMA_VERSION} chained ledger was started."
                 )
             conn.executescript(ddl)
+            conn.execute(f"PRAGMA user_version = {LEDGER_SCHEMA_VERSION}")
             conn.commit()
 
     # ------------------------------------------------------------------

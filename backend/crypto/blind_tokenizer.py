@@ -3,14 +3,16 @@ Span-Based Blind Tokenizer, Native C AES-256 Secret Sealer, Paillier PHE (2048-b
 and RLWE-BFV (leveled, depth 1) Encryptor.
 
 Capabilities:
-1. Secret & Credential Blinding (zero-retention for the SECRET category):
-   - Explicit `<secret>...</secret>` tags (empty tags too; an UNCLOSED `<secret>` seals everything
-     up to the end of the prompt)
+1. Secret & Credential Blinding (non-retained in Python token maps, logs, or responses):
+   - Explicit `<secret>...</secret>` tags (including `< secret >`, nested tags, and empty tags;
+     an UNCLOSED `<secret>` seals everything up to the end of the prompt)
    - Labelled passwords/PINs/keys in English and Dutch (`password is ...`, `wachtwoord: ...`,
      `pincode = ...`, `password for the database is ...`, `aws_secret_access_key = ...`)
    - Bearer tokens, JWTs, `sk_`/`AKIA`/`AIza`/`ghp_`/Slack `xox?-` keys, hex keys and PEM blocks
    SECRET spans are sealed in C memory via AES-256-CBC + HMAC-SHA256 (`SessionSecretVault`)
-   and are never stored as keys or values in plaintext Python dictionaries or in the logs.
+   and are never stored in `token_to_plaintext`, `plaintext_to_token`, logs, or `unblind_response`
+   output by default (note: the caller's immutable input `prompt: str` and transient regex slices
+   still reside briefly on the Python heap until garbage-collected).
 2. PII Blinding: IBANs (case-insensitive), e-mail (Unicode), phone numbers, dates, labelled and
    mixed alphanumeric IDs (passport/customer numbers, Dutch postcodes), and capitalised multi-word
    names with Unicode letters, Mc/Mac forms and Dutch/European particles.
@@ -29,12 +31,16 @@ import hashlib
 import hmac
 import re
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bfv_fhe import BFVContext, SessionSecretVault
 from .homomorphic import HomomorphicEvaluator, PaillierKeypair, normalize_fhe_handle
+
+MAX_PROMPT_CHARS = 65_536
+_SECRET_TAG_RE = re.compile(r"<\s*(/)?\s*secret\s*>", re.IGNORECASE)
 
 
 STOPWORD_CAPITALS = {
@@ -164,40 +170,47 @@ _PROSE_PREDICATE_GUARD = (
     r"needed|missing|empty|recommended|enforced|stored|hashed|encrypted|"
     r"nooit|niet|altijd|verplicht|optioneel|gewijzigd|verlopen|nodig|leeg|versleuteld)\b)"
 )
-# Value rule (documented choice): a quoted value is taken exactly. An UNQUOTED value runs to the end
-# of its clause: the next `,` `;` `)` `]` or newline, or a `.`/`!`/`?` followed by whitespace or the
-# end of the prompt. This over-blinds ("password is abc and commit" seals "abc and commit") rather
-# than leaking the tail of a multi-word passphrase; quote the value for an exact span.
+# Value rule (documented choice): a quoted value is taken exactly (supporting backslash escapes and
+# mid-token apostrophes inside single quotes, e.g. 'p@ss'word99'). An UNQUOTED value (including a
+# value with an unclosed leading quote) runs to the end of its clause: `,` or `;` followed by
+# whitespace/end-of-line, `)` `]` or newline, or `.`/`!`/`?` followed by whitespace/end-of-prompt.
+# Mid-token `,`/`;` (e.g. `p@ss,word123`, `My;Pass123`) stay inside the credential span.
+_DBL_QUOTED = r'"((?:\\.|[^"\\\n])*)"'
+_SGL_QUOTED = r"'((?:\\.|'(?=\w[^'\s\n]*')|[^'\\\n])*)'"
+_UNQUOTED_CHAR = r"(?:[^,;)\]\n]|[,;](?!\s|$))"
+_CLAUSE_END = r"(?=\s*(?:[,;](?:\s|$)|[)\]\n]|[.!?](?:\s|$)|$))"
 _VALUE = (
-    r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
-    r"|([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+    rf"(?:{_DBL_QUOTED}|{_SGL_QUOTED}"
+    rf"|([^\s,;)\]]{_UNQUOTED_CHAR}*?){_CLAUSE_END})"
 )
 _PROSE_VALUE = (
-    r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
-    r"|" + _PROSE_PREDICATE_GUARD + r"([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+    rf"(?:{_DBL_QUOTED}|{_SGL_QUOTED}"
+    rf"|{_PROSE_PREDICATE_GUARD}([^\s,;)\]]{_UNQUOTED_CHAR}*?){_CLAUSE_END})"
 )
 # Fail-closed override (B-R4): a value whose FIRST token looks like a credential rather than a word
-# is always sealed, whatever the prose guards above say. "Credential-like" means: it mixes a digit
-# with another character, or contains a typical credential symbol, or has `!`/`?` inside the token,
-# or consists of three or more hyphen-joined parts (never-gonna-give-you-up).
-_TOK = r"[^\s,;)\]\"']"
+# is always sealed, whatever the prose guards above say. Every branch below uses partitioned/disjoint
+# character classes so scanning an arbitrary-length non-matching token is strictly O(L) (zero ReDoS).
+_TOK = r"(?:[^\s,;)\]\"']|[,;](?!\s|$))"
 _STRONG_FIRST = (
-    rf"(?=(?:{_TOK}*\d{_TOK}*[^\s\d,;)\]\"'.!?]{_TOK}*"
-    rf"|{_TOK}*[^\s\d,;)\]\"']{_TOK}*\d{_TOK}*"
-    rf"|{_TOK}*[@#$%^&*_+~=/\\|]{_TOK}*"
-    rf"|{_TOK}*[!?]{_TOK}*[^\W_]{_TOK}*"
-    r"|[^\s,;)\]\"'-]+(?:-[^\s,;)\]\"'-]+){2,}))"
+    r"(?=(?:[\"'])?(?:"
+    r"(?=[^\s\d,;)\]\"']*\d)(?=[\d.!?]*[^\s\d,;)\]\"'.!?])"
+    r"|[^\s,;)\]\"'@#$%^&*_+~=/\\|]*[@#$%^&*_+~=/\\|]"
+    r"|[^\s,;)\]\"']*[,;](?!\s|$)"
+    r"|(?=[^\s,;)\]\"'!?]*[!?]+(?![\s,;)\]\"']|$))(?=(?:_|[^\w\s,;)\]\"'])*[^\W_])"
+    r"|[^\s,;)\]\"'-]+(?:-[^\s,;)\]\"'-]+){2,}"
+    r"))"
 )
 _STRONG_VALUE = (
-    r"(?:\"([^\"\n]+)\"|'([^'\n]+)'"
-    r"|" + _STRONG_FIRST + r"([^\s,;)\]\"'][^,;)\]\n]*?)(?=\s*(?:[,;)\]\n]|[.!?](?:\s|$)|$)))"
+    rf"(?:{_DBL_QUOTED}|{_SGL_QUOTED}"
+    rf"|{_STRONG_FIRST}([^\s,;)\]]{_UNQUOTED_CHAR}*?){_CLAUSE_END})"
 )
 # One credential-like token after a generic word in prose ("De sleutel van de kluis is Kluis#4815"):
-# at least 4 characters and either digit+letter mixed or a credential symbol. Pure numbers are left
-# to the amount detector; plain words ("...is goede samenwerking") are left alone.
+# at least 4 characters and either digit+letter mixed or a credential symbol (strictly O(L)).
 _GENERIC_STRONG_TOKEN = (
-    rf"((?={_TOK}{{4,}})(?:{_TOK}*\d{_TOK}*[^\W\d_]{_TOK}*|{_TOK}*[^\W\d_]{_TOK}*\d{_TOK}*"
-    rf"|{_TOK}*[@#$%^&*_+~=/\\|]{_TOK}*))"
+    rf"((?=(?:(?=[^\s\d,;)\]\"']*\d)(?=(?:[\d_]|[^\w\s,;)\]\"'])*[^\W\d_])"
+    rf"|[^\s,;)\]\"'@#$%^&*_+~=/\\|]*[@#$%^&*_+~=/\\|]"
+    rf"|[^\s,;)\]\"']*[,;](?!\s|$)))"
+    rf"{_TOK}{{4,}})"
 )
 # Digits in the NL format "1.234,56", multiple dot groups "1.234.567", EN "130,000.50",
 # NL decimal "14,2", or plain "4.9". `1.234` alone is ambiguous and parsed as EN decimal.
@@ -254,16 +267,17 @@ class BlindContext:
 
 
 def _value_occurs(value: str, text: str) -> bool:
-    """Case-insensitive occurrence with word boundaries on word-character edges."""
-    v = value.strip()
+    """Case-insensitive, NFC-normalized occurrence with word boundaries on word-character edges."""
+    v = unicodedata.normalize("NFC", value).strip()
     if not v:
         return False
+    norm_text = unicodedata.normalize("NFC", text)
     pat = re.escape(v)
     if re.match(r"\w", v[0]):
         pat = r"(?<!\w)" + pat
     if re.match(r"\w", v[-1]):
         pat = pat + r"(?!\w)"
-    return re.search(pat, text, flags=re.IGNORECASE) is not None
+    return re.search(pat, norm_text, flags=re.IGNORECASE) is not None
 
 
 def _format_amount(sym: str, value: Any, fmt: str) -> str:
@@ -335,15 +349,55 @@ class BlindTokenizer:
             val = -val
         return val, has_dec
 
+    @staticmethod
+    def _find_secret_tag_spans(prompt: str) -> List[SpanMatch]:
+        """
+        Linear O(N) scanner for `<secret>...</secret>` tags (including whitespace variants `< secret >`,
+        nested `<secret>...<secret>...</secret>...</secret>`, stray `</secret>`, and unclosed `<secret>`).
+        """
+        spans: List[SpanMatch] = []
+        depth = 0
+        outer_start = 0
+        inner_open_end = 0
+        last_emitted_end = 0
+
+        for m in _SECRET_TAG_RE.finditer(prompt):
+            is_close = m.group(1) is not None
+            if not is_close:
+                if depth == 0:
+                    outer_start = m.start()
+                    inner_open_end = m.end()
+                depth += 1
+            else:
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0:
+                        raw = prompt[outer_start : m.end()]
+                        inner = _SECRET_TAG_RE.sub("", prompt[inner_open_end : m.start()])
+                        spans.append(SpanMatch(outer_start, m.end(), "SECRET", raw, priority=0, unseal_value=inner))
+                        last_emitted_end = m.end()
+                else:
+                    # Stray closing tag (e.g. malformed `secret>val</secret>`): seal preceding token + tag.
+                    tok_start = m.start()
+                    while tok_start > last_emitted_end and not prompt[tok_start - 1].isspace():
+                        tok_start -= 1
+                    raw = prompt[tok_start : m.end()]
+                    inner = _SECRET_TAG_RE.sub("", prompt[tok_start : m.start()])
+                    spans.append(SpanMatch(tok_start, m.end(), "SECRET", raw, priority=0, unseal_value=inner))
+                    last_emitted_end = m.end()
+
+        if depth > 0:
+            raw = prompt[outer_start:]
+            inner = _SECRET_TAG_RE.sub("", prompt[inner_open_end:])
+            spans.append(SpanMatch(outer_start, len(prompt), "SECRET", raw, priority=0, unseal_value=inner))
+
+        return spans
+
     def _collect_spans(self, prompt: str) -> List[SpanMatch]:
         candidates: List[SpanMatch] = []
 
-        # Priority 0: Explicit <secret>...</secret> tags. An unclosed <secret> runs to the end of the
-        # prompt (S8/B1b), so "<secret>alpha-bravo-99" can never leak a remainder.
-        for m in re.finditer(r"<secret>(.*?)(?:</secret>|\Z)", prompt, flags=re.DOTALL | re.IGNORECASE):
-            candidates.append(
-                SpanMatch(m.start(), m.end(), "SECRET", m.group(0), priority=0, unseal_value=m.group(1))
-            )
+        # Priority 0: Explicit <secret>...</secret> tags (handles whitespace, nesting, and unclosed tags).
+        candidates.extend(self._find_secret_tag_spans(prompt))
 
         # Priority 0: PEM blocks (-----BEGIN ... KEY----- through END, or to end of prompt)
         for m in re.finditer(
@@ -387,15 +441,15 @@ class BlindTokenizer:
             candidates.append(self._labelled_value_span(m, 1, priority=1))
         for m in re.finditer(
             rf"(?i:\bpin(?:\s+(?:code|number|nr|(?:for|van|voor)(?:\s+[\w-]+){{1,3}}))?{_SEP_PROSE})"
-            r"(?:\"([^\"\n]+)\"|'([^'\n]+)'|(\d{3,12})\b)",
+            rf"(?:{_DBL_QUOTED}|{_SGL_QUOTED}|(\d{{3,12}})\b)",
             prompt,
         ):
             candidates.append(self._labelled_value_span(m, 1, priority=1))
 
-        # Priority 1C: "password X" without separator, when X contains a digit or symbol
+        # Priority 1C: "password X" without separator, when X contains a digit or symbol (strictly O(L))
         for m in re.finditer(
             r"(?i:\b(?:password|passwd|wachtwoord|pincode|pin)\s+)(?![:=])"
-            r"([^\s,;)\]\"']*?[\d!@#$%^&*_+~][^\s,;)\]\"']*)",
+            rf"([^\s,;)\]\"'\d!@#$%^&*_+~]*[\d!@#$%^&*_+~]{_TOK}*)",
             prompt,
         ):
             val, end = m.group(1), m.end(1)
@@ -591,7 +645,7 @@ class BlindTokenizer:
                 continue
             union_text = prompt[start:end]
             if rep.category == "SECRET":
-                inner = re.sub(r"</?secret>", "", union_text, flags=re.IGNORECASE)
+                inner = _SECRET_TAG_RE.sub("", union_text)
                 merged.append(SpanMatch(start, end, "SECRET", union_text, rep.priority, unseal_value=inner))
             else:
                 merged.append(
@@ -607,6 +661,11 @@ class BlindTokenizer:
         return merged
 
     def blind_prompt(self, prompt: str) -> Tuple[str, BlindContext]:
+        if not isinstance(prompt, str):
+            raise ValueError("Prompt must be a string.")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ValueError(f"Prompt exceeds maximum length ({MAX_PROMPT_CHARS} characters).")
+        prompt = unicodedata.normalize("NFC", prompt)
         ctx = BlindContext(secrets.token_bytes(32), self.paillier, self.bfv)
         spans = self._collect_spans(prompt)
         ctx.detected_span_count = len(spans)
@@ -802,14 +861,23 @@ class BlindTokenizer:
             },
         }
 
-    def unblind_response(self, response_text: str, ctx: BlindContext) -> str:
-        """Restore local tokens, C-sealed secrets, and decrypted homomorphic handles for client display."""
+    def unblind_response(self, response_text: str, ctx: BlindContext, include_secrets: bool = False) -> str:
+        """
+        Restore local PII tokens and decrypted homomorphic handles for client display.
+        Echoed `[SECRET_XXXX]` tokens stay redacted by default so cloud/prompt-injected
+        echoes cannot exfiltrate sealed credentials into plaintext JSON responses or UI views.
+        """
         cleaned = re.sub(r"(\[FHE_NUM_\d+\])\(ENC:0x[0-9a-fA-F\.]+\)", r"\1", response_text)
 
         for sec_token, blob in ctx.sealed_secrets.items():
             if sec_token in cleaned:
-                unsealed_val = self.secret_vault.unseal(blob)
-                cleaned = cleaned.replace(sec_token, unsealed_val)
+                if include_secrets:
+                    replacement = self.secret_vault.unseal(blob)
+                else:
+                    # Verify C-vault HMAC integrity without exposing the raw secret in output.
+                    _ = self.secret_vault.unseal(blob)
+                    replacement = f"[REDACTED:{sec_token}]"
+                cleaned = cleaned.replace(sec_token, replacement)
 
         for token in sorted(ctx.token_to_plaintext.keys(), key=len, reverse=True):
             cleaned = cleaned.replace(token, ctx.token_to_plaintext[token])

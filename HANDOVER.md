@@ -69,7 +69,7 @@
 │   └── telemetry.py                 # `SecurityMonitor`
 └── tests/
     ├── test_security_audit.py       # 10 original tests (test_01 … test_10)
-    └── test_audit_regressions.py    # 21 regression tests for the Victory Audit findings (temp dirs, mocked HTTP)
+    └── test_audit_regressions.py    # 34 regression tests for Victory Audit + rounds 3–5 (temp dirs, mocked HTTP)
 ```
 
 ---
@@ -83,7 +83,7 @@
    - `vault_secure_wipe` calls `memset_s` on macOS (`#if defined(__STDC_LIB_EXT1__) || defined(__APPLE__)`), volatile loop elsewhere; `nm -u libvaultcrypto.dylib` shows `_memset_s`.
    - `SecureEnclave` keeps no shares in `self.__dict__`; shards are 0600 JSON files. Malformed files (empty, truncated, JSON list, non-numeric fields) become `TAMPER_REJECTED`. If the commitment check fails, every other k-subset of the Feldman-valid shards is tried.
    - Precisely stated: shares and $\alpha_0$ pass through Python; only the reconstructed key and the subkeys are C-stack-only.
-2. **Ledger (`ledger.py`, `schema.sql`):** columns `id, created_at, action, target_token, quorum_nodes, iv_hex, ciphertext_hex, hmac_hex, prev_hash`. `prev_hash` = SHA-256 over the previous row (`id, action, target_token, iv_hex, ciphertext_hex, hmac_hex, prev_hash`), genesis = 64 zeros; AAD = `"{id}:{prev_hash}:{action}:{target_token}"`. `verify_ledger_entries` checks the whole chain and returns `verification_reason` per displayed row plus `chain_errors` and `chain_head_hash`. Not detected: truncation of the newest rows (only against an externally stored `chain_head_hash`); `created_at` and `quorum_nodes` are not authenticated.
+2. **Ledger (`ledger.py`, `schema.sql`):** columns `id, created_at, action, target_token, quorum_nodes, iv_hex, ciphertext_hex, hmac_hex, prev_hash`. `prev_hash` = SHA-256 over the previous row (`id, action, target_token, iv_hex, ciphertext_hex, hmac_hex, prev_hash`), genesis = 64 zeros; AAD = canonical JSON `[id, prev_hash, action, target_token]` (schema v4; older tables archived automatically). `verify_ledger_entries` checks the whole chain (including `ALLOWED_ACTIONS` policy and strict hex lengths) and returns `verification_reason` per displayed row plus `chain_errors` and `chain_head_hash`. Not detected: truncation of the newest rows (only against an externally stored `chain_head_hash`); `created_at` and `quorum_nodes` are not authenticated.
 3. **Homomorphic layer (`homomorphic.py`, `bfv_fhe.py`, `vaultcrypto.c`):**
    - Paillier, 2048-bit modulus by default (`AgentPipeline(paillier_bits=2048)`; tests pass 1024 for speed). Fixed point via `Decimal`; percentages may be non-integer (up to 4 decimals, 0 to 1000); scalars are integers with |scalar| ≤ 10^6.
    - RLWE-BFV, leveled, multiplicative depth 1: N = 2048, q = 2^54, t = 65536, Δ = 2^38, gadget base 2^14 with 4 limbs, uniform ternary secret and errors. N and log q match the classical 128-bit row of the HE standard, but the errors are ternary (σ ≈ 0.82, not 3.2), so 128 bit is an approximation. BFV functions return int status codes (`VAULT_BFV_ENOMEM`); the multiplication is `vault_bfv_mul_relin` and wipes its workspace before `free`. The `ai == 0` skip in `bfv_poly_mul_exact` is not constant-time.
@@ -112,11 +112,11 @@
 ```bash
 cd /Users/sem/.gemini/antigravity/scratch/vaultmind
 
-# 1. (Re)compile the C core (also happens automatically when the .dylib is missing)
+# 1. (Re)compile the C core (also happens automatically when the .dylib is missing or older than vaultcrypto.c)
 ./venv/bin/python3 backend/native/build.py
 nm -u backend/native/libvaultcrypto.dylib | grep memset_s
 
-# 2. Full test suite: 36 tests
+# 2. Full test suite: 44 tests
 ./venv/bin/python3 -m unittest discover -s tests -v
 
 # 3. Smoke-test the TUI
@@ -155,3 +155,13 @@ Peer-review verification (`T-378`) + follow-up fixes on `claude/victory-audit-fi
 - **M-R2 (TUI LLM warnings):** `frontend/tui.py` now renders `llm_output_warnings` (including `parse_warning` and non-object `fhe_compute`/`action_intent` warnings) alongside the web UI.
 - **M-R3 (Docs & Vault sync):** corrected `HANDOVER.md` notes on `parse_warning` and Feldman coefficient sampling, and synchronized the Obsidian project `README.md`.
 - **S-R1..S-R4 (UX & Concurrency polish):** `app.js` renders the scrubbed `wire_request` even on HTTP 502 provider errors; ledger verification banner reports `chain_length` and `chain_errors` when older rows outside the 15-row preview fail; `SecureEnclave.execute_privileged_intent` retries `LedgerChainConflict` under concurrent writes and `EncryptedLedger` uses `time.time_ns()` for legacy table migration names; `#apiKeyInput` widened (`min-width: 14.5rem`) so its placeholder no longer clips on `1440x900`.
+
+---
+
+## 8. Audit round 5 (Antigravity PR #1 Review Fixes, 13 Nov 2026)
+
+- **Decimal DoS & underflow hardening (`homomorphic.py`):** bounded exponent/digit lengths via `Decimal.as_tuple()` before `int()` or `normalize()`, preventing `int(Decimal("1e2000000"))` main-thread hangs, `decimal.Overflow` 500s, and `"1e-2000000"` silent underflow to `0%`.
+- **Echoed `[SECRET_…]` exfiltration block (`llm_client.py`, `blind_tokenizer.py`):** `SYSTEM_PROMPT` forbids echoing `[SECRET_XXXX]`, and `unblind_response()` keeps echoed secret tokens redacted (`[REDACTED:[SECRET_…]]`) by default unless `include_secrets=True`.
+- **Canonical ledger AAD & strict hex validation (`enclave_service.py`, `ledger.py`, `shamir.py`):** replaced colon-delimited AAD with canonical JSON `[seq, prev_hash, action, target]` (auto-migrating pre-v4 tables via `PRAGMA user_version = 4`), checked `ALLOWED_ACTIONS` during verification, and rejected short/malformed hex strings before `ctypes` buffer packing.
+- **Tokenizer hardening & O(L) regexes (`blind_tokenizer.py`):** added Unicode NFC normalization, a linear depth-tracking `<secret>` parser (whitespace & nested tags), escaped quotes, mid-word apostrophes in single quotes, mid-token `,`/`;` preservation, partitioned `O(L)` lookaheads eliminating `O(L^2)` ReDoS, and a 65,536-char prompt cap.
+- **Build & loopback CSRF guards (`zeroize.py`, `main.py`, `vaultcrypto.c`):** `load_native_lib()` rebuilds when `vaultcrypto.c` is newer than `libvaultcrypto.dylib`; HTTP middleware blocks cross-origin/cross-site browser `POST`s (`403`); `reconstruct_bytes_internal` rejects `k > 255` upfront. Suite: 44 tests, OK.

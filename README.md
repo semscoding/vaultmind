@@ -27,7 +27,7 @@ VaultMind lets a cloud LLM (Gemini, OpenAI or AWS Bedrock) plan actions on enter
 - A reader of the whole disk: in this demo all five shards live on one disk, plus a full backup copy in `database/runtime/.demo_clean_shards/` that powers the **↺ Restore Shards** button.
 - Secrets that have no label and no recognisable pattern and are not wrapped in `<secret>…</secret>` (blinding is heuristic, see §6).
 - Side channels other than those addressed by the constant-time $\mathbb{F}_{2^8}$ arithmetic and MAC comparison (the BFV code is not constant-time).
-- Other local users of the machine: the loopback API has no authentication (it only rejects foreign `Host` headers).
+- Other local users of the machine: the loopback API has no authentication (it rejects foreign `Host` headers and cross-origin/cross-site browser `POST`s).
 
 ---
 
@@ -104,9 +104,9 @@ The 8-byte big-endian length field fixes the boundary between AAD and IV, so byt
 
 ### 3.4 Hash-chained ledger
 
-Row $i$ stores $(i, \text{action}_i, \text{target}_i, IV_i, C_i, T_i, h_{i-1})$, sealed with
+Row $i$ stores $(i, \text{action}_i, \text{target}_i, IV_i, C_i, T_i, h_{i-1})$, sealed with canonical JSON AAD
 
-$$AAD_i = \texttt{"}i\texttt{:}h_{i-1}\texttt{:}\text{action}_i\texttt{:}\text{target}_i\texttt{"}, \qquad h_0 = \texttt{0}^{64}$$
+$$AAD_i = \operatorname{JSON}[\,i, h_{i-1}, \text{action}_i, \text{target}_i\,], \qquad h_0 = \texttt{0}^{64}$$
 
 $$h_i = \operatorname{SHA256}\big(\operatorname{JSON}[\,i, \text{action}_i, \text{target}_i, IV_i, C_i, T_i, h_{i-1}\,]\big)$$
 
@@ -195,8 +195,9 @@ All commands run from the repository root with the venv active. Test names refer
 | Non-integer percentages are not truncated | `test_offline_engine_keeps_decimal_percent` |
 | Ordinary business prose avoids false-positive sealing | `test_ordinary_business_prose_avoids_false_positives` |
 | Concurrent ledger writes preserve hash-chain integrity | `test_concurrent_enclave_seals_succeed_with_valid_hash_chain` |
+| Decimal DoS/underflow bounds, echoed-secret redaction, canonical AAD & CSRF guard | `TestAuditRound5Regressions` (`test_audit_regressions.py`) |
 | Dashboard makes no external requests | `grep -nE "https?://" frontend/static/index.html` → no output (Chart.js is in `frontend/static/vendor/`) |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 36 tests, OK |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 44 tests, OK |
 
 ---
 
@@ -204,7 +205,7 @@ All commands run from the repository root with the venv active. Test names refer
 
 - **Blinding is heuristic (regex-based).** Not detected: lower-case names (`jan jansen`), single first names without a role word (`Sem`, `Maria`), bare integers below 10, percentages, street names and cities without a label, company names made only of common business words (`Cloud Reserve`, `Master Audit`), and secrets without a label or a recognisable pattern. After a label such as `password` or `sleutel`, a value is sealed when it looks like a credential (digit mixed with letters, a symbol, or three or more hyphen-joined parts); a plain-word value after a policy word or an indefinite article (`a password is never shared`) is treated as prose and left alone. Wrap such secrets in `<secret>…</secret>`. The residual scan cannot flag what was never detected.
 - **Shares and $\alpha_0$ pass through Python** (see §3.7). The claim is limited to the reconstructed key and subkeys.
-- **Locally, plaintext is kept for unblinding and display.** The token map, the plaintext numbers and the local audit trail (`original_prompt`, token table) contain names and amounts; only the SECRET category is zero-retention.
+- **Locally, plaintext is kept for unblinding and display.** The token map, the plaintext numbers and the local audit trail (`original_prompt` redacted of secrets, token table) contain names and amounts. `SECRET` spans are never stored in token maps, logs, audit trails, or `unblinded_result` (though the caller's immutable input `prompt: str` and regex slices exist transiently on the Python heap until garbage-collected).
 - **BFV security is approximate:** uniform ternary errors instead of $\sigma \approx 3.2$; no lattice-estimator run.
 - **BFV is not constant-time:** `bfv_poly_mul_exact` skips zero coefficients of its first argument, which can be the secret key or the encryption randomness.
 - **BFV is depth 1 only**; 32-bit products are recombined in plaintext after decrypting up to 16 partial products.
@@ -231,7 +232,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (36 tests)
+# Run the test suite (44 tests)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -258,5 +259,5 @@ vaultmind/
 ├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / offline engine)
 ├── services/      # pipeline_service.py and enclave_service.py
 ├── monitoring/    # telemetry.py
-└── tests/         # test_security_audit.py and test_audit_regressions.py (36 tests)
+└── tests/         # test_security_audit.py and test_audit_regressions.py (44 tests)
 ```

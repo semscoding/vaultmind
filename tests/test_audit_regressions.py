@@ -514,5 +514,262 @@ class TestConcurrencyAndMigrationRegressions(unittest.TestCase):
             self.assertEqual(len(legacy_tables), 2)
 
 
+class TestAuditRound5Regressions(unittest.TestCase):
+    """Regression tests for Audit Round 5 (13 Nov 2026)."""
+
+    def test_decimal_dos_and_underflow_guards(self):
+        import time
+        from backend.crypto.homomorphic import HomomorphicEvaluator, PaillierKeypair
+        from main import app
+
+        t0 = time.perf_counter()
+        for bad_scalar in ["1e2000000", "-1e2000000", "1e1000000", "1e-2000000", "1.5", "9" * 2000]:
+            with self.subTest(bad_scalar=bad_scalar[:24]):
+                with self.assertRaises(ValueError):
+                    HomomorphicEvaluator.parse_scalar(bad_scalar)
+
+        for bad_pct in ["1e2000000", "1e1000000", "1e-2000000", "-0.01", "1000.01", "0.00001"]:
+            with self.subTest(bad_pct=bad_pct):
+                with self.assertRaises(ValueError):
+                    HomomorphicEvaluator.parse_percent(bad_pct)
+
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.2, f"Decimal bounds validation took too long: {elapsed:.3f}s")
+
+        # Valid scientific-notation integers & percents still work accurately
+        self.assertEqual(HomomorphicEvaluator.parse_scalar("1e3"), 1000)
+        self.assertEqual(HomomorphicEvaluator.parse_scalar("-100.00"), -100)
+        pct_dec, pct_int, factor = HomomorphicEvaluator.parse_percent("12.5000")
+        self.assertEqual((str(pct_dec), pct_int, factor), ("12.5", 125, 10))
+
+        kp = PaillierKeypair.generate(bits=512)
+        for huge_val in ["1e1000000", "1e2000", "-1e2000"]:
+            with self.assertRaises(ValueError):
+                kp.encrypt_fixed(huge_val)
+
+        client = TestClient(app)
+        res = client.post("/api/homomorphic-calc", json={"val1": 1e308, "val2": 1.0})
+        self.assertEqual(res.status_code, 400)
+
+    def test_echoed_secret_token_is_redacted_in_unblinded_response(self):
+        from apis.llm_client import SYSTEM_PROMPT
+
+        self.assertIn("NEVER echo [SECRET_XXXX]", SYSTEM_PROMPT)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipe = AgentPipeline(storage_dir=tmp, paillier_bits=1024, reset_vault=True)
+            prompt = (
+                "Authorize payment for client Nova Labs where password is correct-horse-battery-staple, "
+                "seed: <secret>root-seed-9988</secret>."
+            )
+            blinded, ctx = pipe.tokenizer.blind_prompt(prompt)
+            sec_tokens = list(ctx.sealed_secrets.keys())
+            self.assertEqual(len(sec_tokens), 2)
+
+            # Default unblind_response keeps echoed [SECRET_...] redacted; opt-in unseals
+            echo_text = f"Processed {ctx.primary_subject_token} using {sec_tokens[0]} and {sec_tokens[1]}."
+            redacted_out = pipe.tokenizer.unblind_response(echo_text, ctx)
+            self.assertNotIn("correct-horse-battery-staple", redacted_out)
+            self.assertNotIn("root-seed-9988", redacted_out)
+            self.assertIn(f"[REDACTED:{sec_tokens[0]}]", redacted_out)
+            self.assertIn("Nova Labs", redacted_out)
+
+            explicit_out = pipe.tokenizer.unblind_response(echo_text, ctx, include_secrets=True)
+            self.assertIn("correct-horse-battery-staple", explicit_out)
+
+            # Full pipeline run with mocked live LLM echoing every [SECRET_...] token
+            async def malicious_live_echo(blinded_prompt: str, *args, **kwargs):
+                found_sec = [tok for tok in blinded_prompt.split() if tok.startswith("[SECRET_")]
+                joined = " ".join(found_sec)
+                return {
+                    "provider": "Mocked Live Cloud Echo",
+                    "is_live_cloud": True,
+                    "raw_response": f"Echoing credentials back: {joined} for {blinded_prompt}",
+                    "fhe_compute": None,
+                    "action_intent": None,
+                    "wire_request": {"method": "POST", "url": "https://example.test", "headers_redacted": {}, "body": {}},
+                }
+
+            with mock.patch.object(pipe.llm, "generate_blind_reasoning", new=malicious_live_echo):
+                res = asyncio.run(pipe.process_prompt(prompt, provider="gemini", api_key=DUMMY_KEY))
+
+            serialized = json.dumps(res)
+            self.assertNotIn("correct-horse-battery-staple", res["unblinded_result"])
+            self.assertNotIn("root-seed-9988", res["unblinded_result"])
+            self.assertNotIn("correct-horse-battery-staple", serialized)
+            self.assertNotIn("root-seed-9988", serialized)
+
+    def test_ledger_aad_colon_shift_and_hex_truncation_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enclave = SecureEnclave(storage_dir=tmp, reset_on_init=True)
+            res = enclave.execute_privileged_intent(
+                {"action": "DB_WRITE_RECORD", "target": "URGENT:[ID_AABBCCDD]", "params": {}}
+            )
+            self.assertTrue(res["success"], res)
+            self.assertTrue(enclave.verify_ledger_entries()["verified"])
+
+            db_path = os.path.join(tmp, "vault_ledger.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE sealed_transactions SET action = ?, target_token = ? WHERE id = 1",
+                    ("DB_WRITE_RECORD:URGENT", "[ID_AABBCCDD]"),
+                )
+                conn.commit()
+
+            ver = enclave.verify_ledger_entries()
+            self.assertFalse(ver["verified"], "Colon-shifted action/target must fail canonical JSON AAD + policy check")
+
+        # Hex length & format validation in enclave_unseal_record (prevents ctypes zero-padding of truncated "00")
+        sss = ShamirSecretSharing()
+        bundle = sss.generate_and_split_master_key(threshold_k=3, total_n=5)
+        quorum = bundle["shards"][:3]
+        sealed = sss.enclave_seal_record(quorum, bundle["key_commitment_hex"], b"record", b'[1,"0","A","B"]')
+
+        for bad_iv, bad_ct, bad_mac in [
+            (sealed["iv_hex"][:-2], sealed["ciphertext_hex"], sealed["hmac_hex"]),
+            (sealed["iv_hex"], sealed["ciphertext_hex"], sealed["hmac_hex"][:-2]),
+            (sealed["iv_hex"], sealed["ciphertext_hex"][:-2], sealed["hmac_hex"]),
+            (" " + sealed["iv_hex"][:-1], sealed["ciphertext_hex"], sealed["hmac_hex"]),
+            (sealed["iv_hex"], "", sealed["hmac_hex"]),
+        ]:
+            with self.assertRaises(ValueError):
+                sss.enclave_unseal_record(quorum, bad_iv, bad_ct, bad_mac, b'[1,"0","A","B"]')
+
+    def test_tokenizer_unicode_nfd_secret_tag_variants_quotes_and_delimiters(self):
+        tok = BlindTokenizer(paillier_bits=512)
+
+        # 1. Unicode NFD decomposed names + residual_scan NFD awareness
+        nfd_prompt = "Pay employee Rene\u0301e Mu\u0308ller today"
+        blinded_nfd, ctx_nfd = tok.blind_prompt(nfd_prompt)
+        self.assertIn("[ID_", blinded_nfd)
+        self.assertNotIn("Ren", blinded_nfd)
+        self.assertNotIn("ller", blinded_nfd)
+        self.assertEqual(tok.residual_scan(blinded_nfd, ctx_nfd)["residual_matches"], 0)
+        # If an NFD-decomposed copy leaked into wire text, residual_scan must catch it
+        self.assertGreater(
+            tok.residual_scan(blinded_nfd + " rene\u0301e mu\u0308ller", ctx_nfd)["residual_matches"], 0
+        )
+
+        # 2. <secret> tag whitespace, nesting, and stray closing tag
+        tag_cases = [
+            ("Token < secret >ws-secret-99</ secret > done", ["ws-secret-99", "<", ">"]),
+            ("Token <secret >trail-space-88</secret > done", ["trail-space-88", "<", ">"]),
+            ("Nested <secret>outer <secret>inner-77</secret> tail-66</secret> end", ["outer", "inner-77", "tail-66", "<", ">"]),
+            ("Malformed secret>stray-leak-55</secret> end", ["stray-leak-55", "<", ">"]),
+        ]
+        for p, forbidden in tag_cases:
+            with self.subTest(prompt=p):
+                b, c = tok.blind_prompt(p)
+                for piece in forbidden:
+                    self.assertNotIn(piece, b.lower())
+                self.assertGreaterEqual(len(c.sealed_secrets), 1)
+
+        # 3. Escaped quotes, mid-word apostrophes in single quotes, unclosed quotes, and mid-token ',' / ';'
+        esc_prompt = 'Login where password is "say \\"hi\\" topsecret42" now'
+        sgl_prompt = "Login where password is 'p@ss'word99'! Please don't share."
+        sgl_plain_excl = "Login where password is 'hunter'! Please don't share."
+        unclosed_dbl = 'Login where password: "unclosed_secret_123'
+        unclosed_sgl = "Login where password: 'unclosed_secret_456"
+        comma_prompt = "Login where password is p@ss,word123 for staging"
+        semi_prompt = "Config secret = My;Pass123; pin = 4821"
+
+        for p, forbidden in [
+            (esc_prompt, ["topsecret42", "hi"]),
+            (sgl_prompt, ["p@ss", "word99"]),
+            (sgl_plain_excl, ["hunter"]),
+            (unclosed_dbl, ["unclosed_secret_123"]),
+            (unclosed_sgl, ["unclosed_secret_456"]),
+            (comma_prompt, ["p@ss", "word123"]),
+            (semi_prompt, ["My", "Pass123", "4821"]),
+        ]:
+            with self.subTest(prompt=p):
+                b, c = tok.blind_prompt(p)
+                for piece in forbidden:
+                    self.assertNotIn(piece, b)
+                self.assertGreaterEqual(len(c.sealed_secrets), 1)
+
+        # Contraction after single-quoted secret must remain intact, and exclamation in prose must not false-positive
+        b_sgl, _ = tok.blind_prompt(sgl_plain_excl)
+        self.assertIn("! Please don't share.", b_sgl)
+        prose_excl = "Remember that a password is required! Please check the handbook."
+        b_prose, c_prose = tok.blind_prompt(prose_excl)
+        self.assertEqual(b_prose, prose_excl)
+        self.assertEqual(len(c_prose.sealed_secrets), 0)
+
+    def test_tokenizer_linear_time_no_redos_and_prompt_length_bound(self):
+        import time
+        from main import app
+
+        tok = BlindTokenizer(paillier_bits=512)
+        long_word = "a" * 20_000
+        t0 = time.perf_counter()
+        tok.blind_prompt(f"password is {long_word} ")
+        tok.blind_prompt(f"De sleutel is {long_word} ")
+        tok.blind_prompt(f"password {long_word} ")
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.35, f"Tokenizer exhibited superlinear backtracking: {elapsed:.3f}s")
+
+        with self.assertRaises(ValueError):
+            tok.blind_prompt("x" * 70_000)
+
+        client = TestClient(app)
+        res = client.post("/api/process", json={"prompt": "x" * 70_000, "provider": "simulation"})
+        self.assertEqual(res.status_code, 400)
+
+    def test_stale_native_lib_mtime_triggers_rebuild(self):
+        import backend.crypto.zeroize as zeroize_mod
+
+        fake_lib = mock.MagicMock()
+        with (
+            mock.patch.object(zeroize_mod.os.path, "exists", return_value=True),
+            mock.patch.object(
+                zeroize_mod.os.path,
+                "getmtime",
+                side_effect=lambda p: 200.0 if p.endswith("vaultcrypto.c") else 100.0,
+            ),
+            mock.patch.object(zeroize_mod, "build_native_library", return_value="/tmp/rebuilt.dylib") as mock_build,
+            mock.patch.object(zeroize_mod.ctypes, "CDLL", return_value=fake_lib) as mock_cdll,
+        ):
+            zeroize_mod.load_native_lib()
+            mock_build.assert_called_once()
+            mock_cdll.assert_called_once_with("/tmp/rebuilt.dylib")
+
+    def test_loopback_csrf_middleware_blocks_cross_origin_posts(self):
+        from main import app
+
+        client = TestClient(app)
+        for bad_headers in [
+            {"Origin": "https://evil.example"},
+            {"Origin": "http://evil.example:8000"},
+            {"Origin": "null"},
+            {"Origin": "http://[::1"},
+            {"Sec-Fetch-Site": "cross-site"},
+        ]:
+            with self.subTest(headers=bad_headers):
+                r = client.post("/api/restore-nodes", headers=bad_headers)
+                self.assertEqual(r.status_code, 403)
+
+        ok = client.post(
+            "/api/restore-nodes",
+            headers={"Origin": "http://127.0.0.1:8000", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_native_c_reconstruct_rejects_k_above_255(self):
+        lib = ShamirSecretSharing().lib
+        dummy_x = (ctypes.c_uint8 * 256)(*([1] * 256))
+        dummy_shares = (ctypes.c_uint8 * (256 * 32))()
+        dummy_feld = (ctypes.c_uint8 * 32)()
+        dummy_iv = (ctypes.c_uint8 * 16)()
+        dummy_ct = (ctypes.c_uint8 * 16)()
+        dummy_mac = (ctypes.c_uint8 * 32)()
+        dummy_pt = (ctypes.c_uint8 * 32)()
+        pt_len = ctypes.c_size_t(0)
+        rc = lib.vault_enclave_unseal(
+            dummy_x, dummy_shares, 256, dummy_feld, None, 0, dummy_iv, dummy_ct, 16, dummy_mac, dummy_pt, 32, ctypes.byref(pt_len)
+        )
+        self.assertEqual(rc, -1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

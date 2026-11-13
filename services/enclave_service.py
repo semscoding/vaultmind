@@ -319,7 +319,11 @@ class SecureEnclave:
 
     @staticmethod
     def _ledger_aad(seq: int, prev_hash: str, action: str, target: str) -> bytes:
-        return f"{seq}:{prev_hash}:{action}:{target}".encode("utf-8")
+        return json.dumps(
+            [int(seq), prev_hash, action, target],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
 
     def execute_privileged_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(intent, dict):
@@ -478,6 +482,8 @@ class SecureEnclave:
                         reasons.append(f"Sequence out of order: expected row {expected_seq}, found {row['id']}")
                 if row["prev_hash"] != expected_prev:
                     reasons.append("Hash-chain break: prev_hash does not match SHA-256 of the previous row")
+                if row["action"] not in ALLOWED_ACTIONS:
+                    reasons.append(f"Policy violation: action '{row['action']}' is not in ALLOWED_ACTIONS")
                 chain_ok = not reasons
 
                 aad_bytes = self._ledger_aad(row["id"], row["prev_hash"], row["action"], row["target_token"])

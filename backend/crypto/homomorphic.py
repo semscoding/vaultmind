@@ -15,7 +15,7 @@ and LLM-supplied operands (percent, scalar) are range-checked before exponentiat
 import math
 import re
 import secrets
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from typing import Any, Dict, Tuple, Union
 from sympy import isprime
 
@@ -33,6 +33,7 @@ def normalize_fhe_handle(raw_ref: Any) -> str:
 MAX_ABS_SCALAR = 10**6
 MAX_PERCENT = Decimal(1000)
 MAX_OPERAND_DECIMALS = 4
+MAX_DECIMAL_INPUT_CHARS = 1024
 
 NumberLike = Union[int, float, str, Decimal]
 
@@ -41,32 +42,59 @@ def to_decimal(value: Any, what: str = "value") -> Decimal:
     """Convert int/float/str/Decimal to a finite Decimal. Floats go via repr() so 4.9 stays 4.9."""
     if isinstance(value, bool):
         raise ValueError(f"{what} must be a number, not a boolean.")
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"{what} cannot be NaN or Infinity.")
+        raw_str = repr(value)
+    elif isinstance(value, str):
+        raw_str = value.strip()
+        if len(raw_str) > MAX_DECIMAL_INPUT_CHARS:
+            raise ValueError(f"{what} exceeds maximum numeric input length ({MAX_DECIMAL_INPUT_CHARS} chars).")
+    elif isinstance(value, int):
+        if value.bit_length() > 4096:
+            raise ValueError(f"{what} integer magnitude exceeds 4096-bit limit.")
+        raw_str = str(value)
+    elif isinstance(value, Decimal):
+        raw_str = None
+    else:
+        raise ValueError(f"{what} must be a number, got {type(value).__name__}.")
+
     try:
-        if isinstance(value, Decimal):
-            dec = value
-        elif isinstance(value, float):
-            if math.isnan(value) or math.isinf(value):
-                raise ValueError(f"{what} cannot be NaN or Infinity.")
-            dec = Decimal(repr(value))
-        elif isinstance(value, (int, str)):
-            dec = Decimal(str(value).strip())
-        else:
-            raise ValueError(f"{what} must be a number, got {type(value).__name__}.")
-    except InvalidOperation:
+        dec = value if raw_str is None else Decimal(raw_str)
+    except (InvalidOperation, ArithmeticError):
         raise ValueError(f"{what} is not a valid number: {value!r}") from None
     if not dec.is_finite():
         raise ValueError(f"{what} cannot be NaN or Infinity.")
     return dec
 
 
+def _trimmed_decimal_parts(dec: Decimal) -> Tuple[int, Tuple[int, ...], int]:
+    """
+    Return (sign, non-trailing-zero digits, effective_exponent) directly from `dec.as_tuple()`
+    without calling `dec.normalize()` (which overflows or silently underflows to 0 on extreme exponents).
+    """
+    sign, digits, exp = dec.as_tuple()
+    exp_int = int(exp)
+    if not any(digits):
+        return 0, (0,), 0
+    nz_len = len(digits)
+    while nz_len > 0 and digits[nz_len - 1] == 0:
+        nz_len -= 1
+    eff_exp = exp_int + (len(digits) - nz_len)
+    return sign, digits[:nz_len], eff_exp
+
+
 def decimal_to_scaled_int(dec: Decimal, what: str) -> Tuple[int, int]:
     """Represent a Decimal exactly as (integer numerator, power-of-ten factor); max 4 decimals."""
-    exp = int(dec.normalize().as_tuple().exponent)
-    places = max(0, -exp)
+    sign, eff_digits, eff_exp = _trimmed_decimal_parts(dec)
+    if eff_digits == (0,):
+        return 0, 1
+    places = max(0, -eff_exp)
     if places > MAX_OPERAND_DECIMALS:
         raise ValueError(f"{what} {dec} has more than {MAX_OPERAND_DECIMALS} decimal places.")
     factor = 10**places
-    return int(dec * factor), factor
+    mag = int("".join(str(d) for d in eff_digits)) * (10 ** (eff_exp + places))
+    return (-mag if sign else mag), factor
 
 
 def generate_prime(bits: int = 1024) -> int:
@@ -137,8 +165,24 @@ class PaillierKeypair:
 
     def encrypt_fixed(self, value: NumberLike, scale: int = DEFAULT_SCALE) -> Tuple[int, int]:
         """Encrypt int/float/str/Decimal as round_half_even(value * scale), e.g. cents (S7)."""
+        if scale <= 0:
+            raise ValueError("Fixed-point scale must be positive.")
         dec = to_decimal(value, "Numeric value")
-        scaled_int = int((dec * scale).to_integral_value(rounding=ROUND_HALF_EVEN))
+        _, eff_digits, eff_exp = _trimmed_decimal_parts(dec)
+        max_decimal_digits = int(self.n.bit_length() * 0.31) + 4
+        scale_digits = int(scale.bit_length() * 0.31) + 2
+        if eff_digits != (0,) and (len(eff_digits) + eff_exp + scale_digits) > max_decimal_digits:
+            raise ValueError(
+                f"Plaintext magnitude exceeds {self.n.bit_length()}-bit Paillier message space."
+            )
+        try:
+            with localcontext() as ctx:
+                ctx.prec = max(64, max_decimal_digits + 16)
+                scaled_int = int((dec * scale).to_integral_value(rounding=ROUND_HALF_EVEN))
+        except ArithmeticError:
+            raise ValueError(
+                f"Plaintext magnitude exceeds {self.n.bit_length()}-bit Paillier message space."
+            ) from None
         return self.encrypt_int(scaled_int), scale
 
     def decrypt_fixed(self, ciphertext: int, scale: int = DEFAULT_SCALE) -> float:
@@ -147,7 +191,9 @@ class PaillierKeypair:
 
     def decrypt_fixed_decimal(self, ciphertext: int, scale: int = DEFAULT_SCALE) -> Decimal:
         """Exact fixed-point decryption (no float rounding), used for display formatting."""
-        return Decimal(self.decrypt_int(ciphertext)) / Decimal(scale)
+        with localcontext() as ctx:
+            ctx.prec = max(64, int(self.n.bit_length() * 0.31) + 16)
+            return Decimal(self.decrypt_int(ciphertext)) / Decimal(scale)
 
     def homomorphic_add(self, c1: int, c2: int) -> int:
         return (c1 * c2) % self.n_sq
@@ -206,15 +252,23 @@ class HomomorphicEvaluator:
         if pct < 0 or pct > MAX_PERCENT:
             raise ValueError(f"percent {pct} out of range [0, {MAX_PERCENT}].")
         pct_int, factor = decimal_to_scaled_int(pct, "percent")
-        return pct.normalize(), pct_int, factor
+        normalized_pct = (Decimal(pct_int) / Decimal(factor)).normalize()
+        return normalized_pct, pct_int, factor
 
     @staticmethod
     def parse_scalar(raw: Any) -> int:
         """Validate an LLM-supplied scalar (S14): an integer with |scalar| <= 10^6."""
         dec = to_decimal(raw, "scalar")
-        if dec != dec.to_integral_value():
+        sign, eff_digits, eff_exp = _trimmed_decimal_parts(dec)
+        if eff_digits == (0,):
+            return 0
+        if eff_exp < 0:
             raise ValueError(f"scalar {dec} must be an integer.")
-        scalar = int(dec)
+        max_digits = len(str(MAX_ABS_SCALAR))
+        if len(eff_digits) + eff_exp > max_digits:
+            raise ValueError(f"scalar {dec} out of range [-{MAX_ABS_SCALAR}, {MAX_ABS_SCALAR}].")
+        mag = int("".join(str(d) for d in eff_digits)) * (10**eff_exp)
+        scalar = -mag if sign else mag
         if abs(scalar) > MAX_ABS_SCALAR:
             raise ValueError(f"scalar {scalar} out of range [-{MAX_ABS_SCALAR}, {MAX_ABS_SCALAR}].")
         return scalar

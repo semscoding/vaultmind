@@ -1,8 +1,8 @@
--- VaultMind Encrypted Audit Ledger Schema (v3: hash-chained)
+-- VaultMind Encrypted Audit Ledger Schema (v4: hash-chained + canonical JSON AAD)
 -- Each row's prev_hash = SHA-256 over the previous row (id, action, target_token,
 -- iv_hex, ciphertext_hex, hmac_hex, prev_hash); row 1 links to a fixed genesis value.
--- The C enclave HMAC binds AAD = "id:prev_hash:action:target_token", so deleting,
--- duplicating or reordering rows breaks verification.
+-- The C enclave HMAC binds canonical JSON AAD = [id, prev_hash, action, target_token],
+-- so deleting, duplicating, reordering, or delimiter-shifting rows breaks verification.
 CREATE TABLE IF NOT EXISTS sealed_transactions (
     id INTEGER PRIMARY KEY,
     created_at REAL NOT NULL,

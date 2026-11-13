@@ -14,9 +14,12 @@ from backend.native.build import build_native_library
 
 def load_native_lib() -> ctypes.CDLL:
     native_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "native"))
+    src_path = os.path.join(native_dir, "vaultcrypto.c")
     ext = ".dylib" if sys.platform == "darwin" else ".so"
     lib_path = os.path.join(native_dir, f"libvaultcrypto{ext}")
-    if not os.path.exists(lib_path):
+    if not os.path.exists(lib_path) or (
+        os.path.exists(src_path) and os.path.getmtime(src_path) > os.path.getmtime(lib_path)
+    ):
         lib_path = build_native_library()
 
     lib = ctypes.CDLL(lib_path)
