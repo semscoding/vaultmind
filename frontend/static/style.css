@@ -684,9 +684,9 @@ button { font-family: inherit; }
 }
 
 .node-state {
-    font-weight: 700;
-    font-size: 0.75rem;
-    letter-spacing: 0.02em;
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 0.8125rem;
     color: var(--ink-3);
 }
 
@@ -696,23 +696,40 @@ button { font-family: inherit; }
     font-variant-numeric: tabular-nums;
 }
 
-.node-card.quorum-active { background: var(--ok-soft); }
+/* State is carried by the mark, the word and (for a rejected shard) the struck name; rows keep
+   the same quiet surface so the register reads as a table, not as a stack of alerts. */
 .node-card.quorum-active .node-status-dot { background: var(--ok); border-color: var(--ok); }
 .node-card.quorum-active .node-state { color: var(--ok); }
 
-.node-card.tampered {
-    background:
-        repeating-linear-gradient(-45deg, transparent 0 6px, rgba(180, 35, 24, 0.06) 6px 12px),
-        var(--bad-soft);
+.node-card.tampered .node-status-dot {
+    position: relative;
+    border: 0;
+    border-radius: 0;
+    background: none;
 }
-.node-card.tampered .node-status-dot { background: var(--bad); border-color: var(--bad); border-radius: 50%; }
+.node-card.tampered .node-status-dot::before,
+.node-card.tampered .node-status-dot::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: -10%;
+    width: 2px;
+    height: 120%;
+    background: var(--bad);
+}
+.node-card.tampered .node-status-dot::before { transform: translateX(-50%) rotate(45deg); }
+.node-card.tampered .node-status-dot::after { transform: translateX(-50%) rotate(-45deg); }
 .node-card.tampered .node-state { color: var(--bad); }
-.node-card.tampered strong { text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.node-card.tampered strong {
+    color: var(--ink-3);
+    text-decoration: line-through;
+    text-decoration-thickness: 1.5px;
+}
 
 .btn-corrupt {
     background: var(--surface);
-    border: 1px solid #C2675E;
-    color: var(--bad);
+    border: 1px solid var(--control-border);
+    color: var(--ink-2);
     font-family: var(--font-sans);
     font-size: 0.75rem;
     font-weight: 600;
@@ -721,7 +738,8 @@ button { font-family: inherit; }
     cursor: pointer;
     transition: background-color 0.15s var(--ease-out);
 }
-.btn-corrupt:hover { background: var(--bad-soft); border-color: var(--bad); }
+/* Destructive colour appears only when the pointer or focus is on the control. */
+.btn-corrupt:hover, .btn-corrupt:focus-visible { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
 .btn-corrupt:active { transform: translateY(1px); }
 
 .chart-canvas-box {
@@ -756,18 +774,35 @@ button { font-family: inherit; }
 .lg-bad::after { transform: translateX(-50%) rotate(-45deg); }
 
 .receipt-content {
-    font-family: var(--font-mono);
     font-size: 0.8125rem;
     color: var(--ink);
-    background: var(--surface-2);
-    border-radius: var(--r-control);
-    padding: 0.65rem 0.75rem;
-    line-height: 1.55;
-    white-space: pre-wrap;
+    line-height: 1.5;
     overflow-wrap: anywhere;
 }
 .receipt-content.placeholder { color: var(--ink-3); }
-.receipt-content.receipt-blocked { background: var(--bad-soft); color: var(--bad); font-weight: 600; }
+
+/* The receipt is a short record: labels in the text face, values in monospace. */
+.receipt-list {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    border-top: 1px solid var(--rule);
+}
+.receipt-list dt, .receipt-list dd {
+    padding: 0.3rem 0;
+    border-bottom: 1px solid var(--rule);
+}
+.receipt-list dt { color: var(--ink-3); padding-right: 0.9rem; }
+.receipt-list dd { font-family: var(--font-mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+.receipt-list dd.receipt-bad { color: var(--bad); font-weight: 600; }
+.receipt-list dd.receipt-prose { font-family: var(--font-sans); color: var(--ink-2); }
+
+.receipt-content.receipt-blocked {
+    background: var(--bad-soft);
+    border: 1px solid #E3A49D;
+    border-radius: var(--r-control);
+    padding: 0.6rem 0.75rem;
+}
+.receipt-content.receipt-blocked strong { display: block; color: var(--bad); font-weight: 650; margin-bottom: 0.15rem; }
 
 /* ---------- Bottom: playground + ledger ---------- */
 .bottom-grid {

@@ -155,6 +155,24 @@ function updatePolynomialChart(polyData) {
     shamirChart.update();
 }
 
+// Seal receipt as a definition list; every value goes in via textContent.
+function renderReceipt(container, rows) {
+    container.textContent = "";
+    const dl = document.createElement("dl");
+    dl.className = "receipt-list";
+    rows.forEach(([label, value, bad]) => {
+        const dt = document.createElement("dt");
+        dt.textContent = label;
+        const dd = document.createElement("dd");
+        dd.textContent = value === null || value === undefined ? "" : String(value);
+        if (bad === true) dd.className = "receipt-bad";
+        else if (typeof bad === "string") dd.className = bad;
+        dl.appendChild(dt);
+        dl.appendChild(dd);
+    });
+    container.appendChild(dl);
+}
+
 function renderVaultTopology(vaultData) {
     const grid = document.getElementById("nodesGrid");
     grid.innerHTML = "";
@@ -184,8 +202,8 @@ function renderVaultTopology(vaultData) {
         const stateSpan = document.createElement("span");
         stateSpan.className = "node-state";
         stateSpan.textContent = !node.vss_valid
-            ? "TAMPERED"
-            : (node.status === "QUORUM_ACTIVE" ? "QUORUM" : "VSS OK");
+            ? "Rejected"
+            : (node.status === "QUORUM_ACTIVE" ? "In quorum" : "Verified");
 
         const fpSpan = document.createElement("span");
         fpSpan.className = "node-fp";
@@ -578,22 +596,27 @@ async function runPipeline() {
 
         if (payload.enclave_receipt) {
             const r = payload.enclave_receipt;
+            const rejected = r.rejected_tampered_nodes && r.rejected_tampered_nodes.length > 0;
             receiptOutput.className = "receipt-content";
-            receiptOutput.textContent = [
-                `STATUS:      ${r.status} (SQLite Row #${r.ledger_row_id})`,
-                `ACTION:      ${r.action}`,
-                `TARGET:      ${r.target}`,
-                `QUORUM:      ${(r.quorum_nodes || []).join(", ")}`,
-                r.rejected_tampered_nodes && r.rejected_tampered_nodes.length > 0
-                    ? `REJECTED:    ${r.rejected_tampered_nodes.join(", ")} (Feldman VSS Failed!)`
-                    : `VSS_CHECK:   All inspected shards valid`,
-                `AES256_CT:   ${r.aes256_ciphertext_preview}`,
-                `HMAC_SHA256: ${r.hmac_sha256_tag}`,
-                `C_ZEROIZE:   ${r.c_enclave_zeroize}`
-            ].join("\n");
+            renderReceipt(receiptOutput, [
+                ["Status", `${r.status} (SQLite row #${r.ledger_row_id})`],
+                ["Action", r.action],
+                ["Target", r.target],
+                ["Quorum", (r.quorum_nodes || []).join(", ")],
+                rejected
+                    ? ["Rejected", `${r.rejected_tampered_nodes.join(", ")} (Feldman VSS failed)`, true]
+                    : ["VSS check", "All inspected shards valid"],
+                ["AES-256 ciphertext", r.aes256_ciphertext_preview],
+                ["HMAC-SHA256", r.hmac_sha256_tag],
+                ["Key wipe", r.c_enclave_zeroize, "receipt-prose"]
+            ]);
         } else if (payload.enclave_error) {
             receiptOutput.className = "receipt-content receipt-blocked";
-            receiptOutput.textContent = `❌ ENCLAVE BLOCKED:\n${payload.enclave_error}`;
+            receiptOutput.textContent = "";
+            const head = document.createElement("strong");
+            head.textContent = "Enclave blocked the write";
+            receiptOutput.appendChild(head);
+            receiptOutput.appendChild(document.createTextNode(String(payload.enclave_error)));
         } else {
             receiptOutput.className = "receipt-content placeholder";
             receiptOutput.textContent = "Read-only query: no privileged Enclave write required.";
