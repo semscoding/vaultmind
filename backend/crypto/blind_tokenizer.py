@@ -926,6 +926,17 @@ class BlindTokenizer:
             ):
                 candidates.append(SpanMatch(m.start(1), m.end(1), "ID", word, priority=6, is_role_subject=True))
 
+        # Priority 6: surname with a particle after a personal title ("mevr. de Wit", "dhr. van Dijk",
+        # "dr. van der Berg"). Only titles qualify: after a role noun the same shape is ordinary
+        # prose ("een klant van Microsoft").
+        for m in re.finditer(
+            rf"(?i:\b(?:mr|mrs|ms|dr|dhr|mevr|prof)\.?\s+)((?i:{NAME_PARTICLE})\s+{NAME_WORD})\b",
+            prompt,
+        ):
+            candidates.append(
+                SpanMatch(m.start(1), m.end(1), "ID", m.group(1), priority=6, is_role_subject=True)
+            )
+
         # Priority 7: Sensitive amounts (Paillier PHE; non-negative 32-bit integers also RLWE-BFV)
         for m in NUM_RE.finditer(prompt):
             val, has_dec = self._parse_number(m)

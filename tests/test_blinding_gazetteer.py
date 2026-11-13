@@ -392,6 +392,33 @@ class PresetRegressionTests(unittest.TestCase):
         self.assertIn("Amsterdam Central", ctx.token_to_plaintext.values())
         self.assertIn("clinic: [LOC_", blinded)
 
+class TestTitleWithParticleSurname(unittest.TestCase):
+    def test_surname_with_particle_after_title_is_blinded(self):
+        """M-A1: "mevr. de Wit" must not leave the surname in clear text."""
+        from backend.crypto.blind_tokenizer import BlindTokenizer
+
+        tok = BlindTokenizer(paillier_bits=1024)
+        for prompt, forbidden in [
+            ("meeting with dr. Pool and mevr. de Wit at Stationsplein 1", ["de Wit", "Pool"]),
+            ("Stuur de offerte naar dhr. van Dijk", ["van Dijk"]),
+            ("dr. van der Berg tekent het contract", ["van der Berg"]),
+            ("Mr. De Vries approved the budget", ["De Vries"]),
+        ]:
+            with self.subTest(prompt=prompt):
+                blinded, ctx = tok.blind_prompt(prompt)
+                for piece in forbidden:
+                    self.assertNotIn(piece, blinded)
+                self.assertEqual(tok.residual_scan(blinded, ctx)["residual_matches"], 0)
+        # A role noun followed by a particle is ordinary prose and stays untouched.
+        for sentence in [
+            "We zijn al jaren een klant van de leverancier.",
+            "The user de facto owns the account.",
+        ]:
+            with self.subTest(sentence=sentence):
+                blinded, _ = tok.blind_prompt(sentence)
+                self.assertEqual(blinded, sentence)
+
+
 class TestLowerCaseNameWithParticle(unittest.TestCase):
     def test_lower_case_name_with_particle_needs_no_cue(self):
         from backend.crypto.blind_tokenizer import BlindTokenizer

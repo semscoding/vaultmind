@@ -219,7 +219,7 @@ All commands run from the repository root with the venv active. Test names refer
 | Evaluator restart, fallback and manipulated answers | `test_killed_worker_is_restarted`, `test_fallback_when_worker_cannot_start`, `test_hanging_worker_times_out_and_falls_back`, `test_manipulated_responses_fail_cleanly` |
 | List-based blinding of names, addresses, places and cued organisations | `test_lowercase_full_names_after_a_person_cue`, `test_single_first_names`, `test_addresses_and_places`, `test_cued_organisations_keep_the_cue_word_in_clear`, `test_ambiguous_names_need_extra_evidence` |
 | Ordinary prose stays unchanged; hostile inputs stay fast | `test_ordinary_prose_is_unchanged`, `test_hostile_inputs_finish_within_one_second` |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 91 tests, OK (about 20 s) |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 92 tests, OK (about 20 s) |
 
 ---
 
@@ -256,7 +256,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (91 tests, about 20 s)
+# Run the test suite (92 tests, about 20 s)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -284,5 +284,5 @@ vaultmind/
 ├── services/      # pipeline_service.py, enclave_service.py and evaluator_worker.py (separate evaluator process)
 ├── monitoring/    # telemetry.py
 └── tests/         # test_security_audit.py, test_audit_regressions.py, test_c_share_files.py,
-                   # test_evaluator_process.py, test_blinding_gazetteer.py (91 tests)
+                   # test_evaluator_process.py, test_blinding_gazetteer.py (92 tests)
 ```
