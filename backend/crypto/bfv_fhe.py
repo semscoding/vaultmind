@@ -189,7 +189,17 @@ class BFVEvaluator:
     """
     Untrusted Cloud / Blind Evaluator for N=2048 RLWE-BFV ciphertexts.
     Holds ONLY the public relinearization key `rlk` — ZERO access to ternary secret key `s`.
+
+    The pipeline runs this class in a separate evaluator process (services/evaluator_worker.py)
+    that receives only `rlk` and ciphertexts. That process runs on the same machine: it is a
+    process boundary with public material only, not a network or hardware boundary.
+    The in-process API below stays available (playground endpoints, tests).
     """
+
+    @property
+    def public_rlk(self):
+        """The public relinearization key (16384 int64), e.g. for serialising to the evaluator process."""
+        return self._rlk
 
     def __init__(self, rlk_array):
         if len(rlk_array) != BFV_RLK_LEN:

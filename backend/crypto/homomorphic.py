@@ -218,6 +218,10 @@ class PaillierKeypair:
 class HomomorphicEvaluator:
     """
     Executes algebraic expressions on Paillier ciphertexts using ONLY the public key (n, n^2).
+
+    The pipeline runs this class in a separate evaluator process (services/evaluator_worker.py)
+    that receives only `n` and ciphertexts, never p, q, lambda or mu. That process runs on the
+    same machine: a process boundary with public material only, not a network or hardware boundary.
     """
 
     def __init__(self, n: int):
