@@ -157,6 +157,29 @@ class GazetteerBlindingTests(unittest.TestCase):
         _, ctx = self.blind("Move the office from Amsterdam to Den Haag.")
         self.assertEqual(ctx.primary_subject_token, "")
 
+    def test_name_place_disambiguation_and_apostropheless_dutch_cities(self):
+        # Role/person cues on city-homograph names classify as ID (and can be primary_subject_token).
+        for prompt, expected_subject in [
+            ("Evaluate a bonus for employee Austin today.", "Austin"),
+            ("Medewerker Milan werkt vandaag thuis.", "Milan"),
+            ("Send the report to Sofia tomorrow.", "Sofia"),
+            ("Stuur het rapport naar Anders voor controle.", "Anders"),
+            ("Anders Lindqvist approved the budget.", "Anders Lindqvist"),
+        ]:
+            with self.subTest(prompt=prompt):
+                blinded, ctx = self.assert_hidden(prompt, [expected_subject], "ID")
+                self.assertEqual(ctx.token_to_plaintext[ctx.primary_subject_token], expected_subject)
+                self.assertNotIn("[LOC_", blinded)
+
+        # Place prepositions classify ambiguous NL/world places and apostrophe-less s- cities as LOC.
+        for prompt, pieces in [
+            ("Our office in Sofia and branch at Austin are open.", ["Sofia", "Austin"]),
+            ("Kantoor in Houten, filiaal in Weert en opslag bij Duiven.", ["Houten", "Weert", "Duiven"]),
+            ("Overleg in s-Hertogenbosch en daarna in s-Gravenhage.", ["Hertogenbosch", "Gravenhage"]),
+        ]:
+            with self.subTest(prompt=prompt):
+                self.assert_hidden(prompt, pieces, "LOC")
+
     # --- ordinary prose stays literally the same --------------------------------------------------
     PROSE_UNCHANGED = [
         "Will the report be ready in May?",
@@ -204,6 +227,16 @@ class GazetteerBlindingTests(unittest.TestCase):
         "Leiden tot betere resultaten is ons doel.",
         "De sleutel tot succes is goede samenwerking met onze klanten.",
         "Het geheim van ons kwartaalresultaat is focus op kwaliteit.",
+        "Anders moeten we het project uitstellen.",
+        "Anders dan verwacht daalde de omzet.",
+        "Weert de nieuwe firewall dit verkeer?",
+        "Houten meubels zijn dit jaar duurder.",
+        "Duiven zorgen voor overlast op het dak.",
+        "Wenen heeft geen zin na een fout.",
+        "Hulst groeit goed in de winter.",
+        "Revenue grew from Jan to Mar.",
+        "The contract was signed in Jan.",
+        "Demand started to peter out.",
     ]
 
     def test_ordinary_prose_is_unchanged(self):

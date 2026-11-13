@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from backend.crypto.shamir import ShamirSecretSharing
+from backend.crypto.shamir import ShamirSecretSharing, ShareFileError
 from database.ledger import EncryptedLedger
 from services.enclave_service import SecureEnclave
 
@@ -242,6 +242,65 @@ class TestCShareFiles(unittest.TestCase):
         self.enclave.restore_all_shards()
         self.assertEqual(self._nodes()["vault-node-05"]["status"], "SECURE_VERIFIED")
 
+    def test_atomic_share_writes_use_fresh_inode_and_preserve_existing_on_failure(self):
+        orig_share1 = self._read_share(1)
+        spy_link = os.path.join(self.tmp, "hardlink_spy.bin")
+        os.link(self._share(1), spy_link)
+
+        # Re-provisioning must stage to a fresh inode + rename, never truncating/overwriting spy_link.
+        SecureEnclave(storage_dir=self.tmp, reset_on_init=True)
+        new_shares = [self._read_share(x) for x in range(1, 6)]
+        self.assertNotEqual(new_shares[0], orig_share1)
+        with open(spy_link, "rb") as f:
+            self.assertEqual(f.read(), orig_share1, "hard-linked old inode must not receive new share bytes")
+
+        # If staging fails on share 4 (symlink target), existing shares 1..5 must remain untouched.
+        decoy = os.path.join(self.tmp, "decoy_target.bin")
+        with open(decoy, "wb") as f:
+            f.write(b"A" * 32)
+        bad_symlink = os.path.join(self.tmp, "planted_link.gfshare")
+        os.symlink(decoy, bad_symlink)
+        paths = [self._share(1), self._share(2), self._share(3), bad_symlink, self._share(5)]
+        with self.assertRaises(ShareFileError) as ctx:
+            self.enclave.sss.generate_and_split_master_key_to_files(paths, threshold_k=3)
+        self.assertEqual(ctx.exception.bad_index, 3)
+        for idx, x in enumerate([1, 2, 3, 5]):
+            self.assertEqual(self._read_share(x), new_shares[x - 1], f"share {x} clobbered on failed provision")
+
+    def test_planted_symlinks_refused_in_status_and_tamper_and_cleared_on_reset(self):
+        decoy_json = os.path.join(self.tmp, "decoy_shard.json")
+        with open(decoy_json, "w", encoding="utf-8") as f:
+            json.dump(self._json(1), f)
+        os.unlink(os.path.join(self.tmp, "shards", "node_01.json"))
+        os.symlink(decoy_json, os.path.join(self.tmp, "shards", "node_01.json"))
+
+        node1 = self._nodes()["vault-node-01"]
+        self.assertEqual(node1["status"], "TAMPER_REJECTED")
+        self.assertIn("symbolic link", node1["reason"])
+
+        with open(decoy_json, "r", encoding="utf-8") as f:
+            before_decoy = f.read()
+        with self.assertRaises(ValueError):
+            self.enclave.tamper_shard_for_demo(1)
+        with open(decoy_json, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), before_decoy, "tamper_shard_for_demo must not follow symlinked JSON")
+
+        # Plant symlinks on .gfshare and manifest.json too: reset_on_init=True must replace them cleanly.
+        decoy_manifest = os.path.join(self.tmp, "decoy_manifest.json")
+        with open(decoy_manifest, "w", encoding="utf-8") as f:
+            f.write('{"decoy": true}')
+        os.unlink(self._share(2))
+        os.symlink(decoy_manifest, self._share(2))
+        os.unlink(os.path.join(self.tmp, "manifest.json"))
+        os.symlink(decoy_manifest, os.path.join(self.tmp, "manifest.json"))
+
+        fresh = SecureEnclave(storage_dir=self.tmp, reset_on_init=True)
+        self.assertTrue(fresh.get_public_vault_status()["quorum_healthy"])
+        self.assertFalse(os.path.islink(self._share(2)))
+        self.assertFalse(os.path.islink(os.path.join(self.tmp, "manifest.json")))
+        with open(decoy_manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"decoy": true}')
+
 
 class TestLegacyRuntimeMigration(unittest.TestCase):
     def test_legacy_runtime_is_reprovisioned_without_crash(self):
@@ -332,6 +391,43 @@ class TestLegacyRuntimeMigration(unittest.TestCase):
                 f.write("{not json")
             with self.assertRaises(ValueError):
                 SecureEnclave(storage_dir=tmp)
+
+    def test_legacy_migration_preserves_custom_quorum_and_removes_extra_legacy_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shards_dir = os.path.join(tmp, "shards")
+            backup_dir = os.path.join(tmp, ".demo_clean_shards")
+            os.makedirs(shards_dir)
+            os.makedirs(backup_dir)
+
+            sss = ShamirSecretSharing()
+            bundle = sss.generate_and_split_master_key(threshold_k=2, total_n=4)
+            for shard in bundle["shards"]:
+                with open(os.path.join(shards_dir, f"node_0{shard['x']}.json"), "w", encoding="utf-8") as f:
+                    json.dump(shard, f)
+            # Stale extra v1 shard with raw hex share that must not linger after migration.
+            with open(os.path.join(shards_dir, "node_05.json"), "w", encoding="utf-8") as f:
+                json.dump({"x": 5, "gf256_share_hex": "aa" * 32}, f)
+            with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "threshold_k": 2,
+                        "total_n": 4,
+                        "key_commitment_hex": bundle["key_commitment_hex"],
+                        "feldman_commitments_hex": bundle["feldman_commitments_hex"],
+                        "share_digests": {str(k): v for k, v in bundle["share_digests"].items()},
+                        "canary_expected_secret": bundle["canary_expected_secret"],
+                    },
+                    f,
+                )
+
+            with self.assertLogs("services.enclave_service", level="WARNING"):
+                enclave = SecureEnclave(storage_dir=tmp)
+            self.assertEqual(enclave.threshold, 2)
+            self.assertEqual(enclave.total_shares, 4)
+            self.assertFalse(os.path.exists(os.path.join(shards_dir, "node_05.json")))
+            res = enclave.execute_privileged_intent(_intent())
+            self.assertTrue(res["success"], res.get("error"))
+            self.assertEqual(len(res["receipt"]["quorum_nodes"]), 2)
 
 
 if __name__ == "__main__":

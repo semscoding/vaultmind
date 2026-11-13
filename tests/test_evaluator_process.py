@@ -39,6 +39,8 @@ while True:
     req = json.loads(inp.read(struct.unpack(">I", h)[0]))
     pid = os.getpid()
     meta = {"v": 1, "ok": True, "pid": pid, "engine": "e", "op": req["op"], "label": "l", "formula": "f"}
+    if "id" in req:
+        meta["id"] = req["id"]
     if mode == "notjson":
         send(b"\x80\x04 definitely not json")
     elif mode == "pickle":
@@ -59,6 +61,9 @@ while True:
         send(json.dumps(dict(meta, outputs=outs)).encode())
     elif mode == "wrong_pid":
         send(json.dumps(dict(meta, pid=1, outputs={})).encode())
+    elif mode == "wrong_id":
+        outs = {"[FHE_COMPUTED_BONUS]": {"c": "2", "scale": 10000}, "[FHE_COMPUTED_TOTAL]": {"c": "3", "scale": 10000}}
+        send(json.dumps(dict(meta, id=req.get("id", 0) + 999, outputs=outs)).encode())
 """
 
 
@@ -168,7 +173,7 @@ class EvaluatorProcessTests(unittest.TestCase):
             else:
                 self.assertTrue(msg["ok"])
                 self.assertLessEqual(
-                    set(msg), {"v", "ok", "pid", "engine", "op", "label", "formula", "outputs", "terms"}
+                    set(msg), {"v", "id", "ok", "pid", "engine", "op", "label", "formula", "outputs", "terms"}
                 )
 
     def test_worker_module_has_no_decryption_or_secret_key_code(self):
@@ -329,13 +334,60 @@ class EvaluatorProcessTests(unittest.TestCase):
             marker = os.path.join(tmp, "pwned")
             bomb = pickle.dumps(_PickleBomb(marker)).hex()
             cases = [("notjson", bonus), ("pickle", bonus), ("short_bfv", mult),
-                     ("big_paillier", bonus), ("wrong_scale", bonus), ("wrong_pid", bonus)]
+                     ("big_paillier", bonus), ("wrong_scale", bonus), ("wrong_pid", bonus), ("wrong_id", bonus)]
             for mode, spec in cases:
                 with self.subTest(mode=mode):
-                    with _SwapClient(ew.EvaluatorClient(argv=[sys.executable, "-c", FAKE_WORKER, mode, bomb])):
+                    client = ew.EvaluatorClient(argv=[sys.executable, "-c", FAKE_WORKER, mode, bomb])
+                    with _SwapClient(client):
                         with self.assertRaises(ew.EvaluatorProtocolError):
                             self.tok.execute_and_decrypt_fhe(spec, ctx)
+                        self.assertIsNone(client.pid, f"protocol-violating worker ({mode}) must be killed")
             self.assertFalse(os.path.exists(marker), "response bytes must never be unpickled")
+
+    def test_interrupted_exchange_kills_worker_preventing_cross_request_mixup(self):
+        ctx_first = self._ctx("Evaluate a 15% bonus for salary $200,000 this year.")
+        ctx_second = self._ctx("Evaluate a 15% bonus for salary $100,000 this year.")
+        spec = {"op": "PERCENT_BONUS", "ref": "[FHE_NUM_1]", "percent": 15}
+
+        client = ew.EvaluatorClient()
+        with _SwapClient(client):
+            first_pid = self.tok.execute_and_decrypt_fhe(spec, ctx_second)["evaluator_pid"]
+            real_recv = client._recv_frame
+
+            def abort_after_send(deadline):
+                raise RuntimeError("simulated mid-flight cancellation after request was written")
+
+            client._recv_frame = abort_after_send
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.tok.execute_and_decrypt_fhe(spec, ctx_first)
+            finally:
+                client._recv_frame = real_recv
+
+            # The interrupted exchange must have killed first_pid so $200k's unread reply cannot
+            # be read back as the answer to $100k.
+            self.assertIsNone(client.pid)
+            self.assertFalse(_pid_alive(first_pid))
+            res = self.tok.execute_and_decrypt_fhe(spec, ctx_second)
+            self.assertEqual(res["decrypted_outputs"]["[FHE_COMPUTED_TOTAL]"], "$115,000.00")
+            self.assertNotEqual(res["evaluator_pid"], first_pid)
+
+    def test_timeout_validation_handles_malformed_env_and_strict_args(self):
+        prev = os.environ.get("VAULTMIND_EVALUATOR_TIMEOUT")
+        try:
+            for bad_env in ("nan", "inf", "-5", "0", "not-a-float"):
+                os.environ["VAULTMIND_EVALUATOR_TIMEOUT"] = bad_env
+                c = ew.EvaluatorClient()
+                self.assertEqual(c.request_timeout, 20.0)
+        finally:
+            if prev is None:
+                os.environ.pop("VAULTMIND_EVALUATOR_TIMEOUT", None)
+            else:
+                os.environ["VAULTMIND_EVALUATOR_TIMEOUT"] = prev
+
+        for bad_arg in (0, -1.5, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                ew.EvaluatorClient(request_timeout=bad_arg)
 
     def test_no_worker_left_after_interpreter_exit(self):
         script = (

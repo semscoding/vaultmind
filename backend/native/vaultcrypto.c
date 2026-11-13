@@ -27,6 +27,7 @@
  */
 
 #define __STDC_WANT_LIB_EXT1__ 1
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -532,52 +533,110 @@ static int load_verified_share(const char *path, const uint8_t *expected_sha256,
     return 0;
 }
 
-/* Writes 32 share bytes to `path` (created/truncated, 0600, no symlink follow) and fsyncs. */
-static int write_share_file(const char *path, const uint8_t share[VAULT_KEY_LEN]) {
-    struct stat st;
+/*
+ * Stages 32 share bytes into a fresh sibling file `<path>.tmp.<random>` opened with
+ * O_CREAT | O_EXCL | O_NOFOLLOW (0600 from birth, never truncating an existing or hard-linked
+ * inode) and fsyncs it. Refuses a symlink or directory at `path`. Caller owns `*out_tmp_path`.
+ */
+static int stage_share_temp_file(
+    const char *path,
+    const uint8_t share[VAULT_KEY_LEN],
+    char **out_tmp_path
+) {
+    struct stat lst;
+    uint8_t rnd[8];
     size_t put = 0;
     int rc = 0;
 
-    if (path == NULL || share == NULL) return VAULT_SHARE_EINVAL;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
-                  S_IRUSR | S_IWUSR);
-    if (fd < 0) return (errno == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
-
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        rc = VAULT_SHARE_EWRITE;
-        goto done;
+    if (out_tmp_path != NULL) *out_tmp_path = NULL;
+    if (path == NULL || path[0] == '\0' || share == NULL || out_tmp_path == NULL) {
+        return VAULT_SHARE_EINVAL;
     }
-    /* The create mode only applies to new files and is masked by umask: force 0600. */
+    if (lstat(path, &lst) == 0) {
+        if (S_ISLNK(lst.st_mode)) return VAULT_SHARE_ESYMLINK;
+        if (S_ISDIR(lst.st_mode)) return VAULT_SHARE_EWRITE;
+    } else if (errno != ENOENT) {
+        return (errno == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
+    }
+
+    size_t plen = strlen(path);
+    size_t tcap = plen + 24;
+    if (tcap < plen) return VAULT_SHARE_EINVAL;
+    char *tmp = (char *)malloc(tcap);
+    if (tmp == NULL) return VAULT_SHARE_EWRITE;
+
+    arc4random_buf(rnd, sizeof(rnd));
+    int n = snprintf(
+        tmp, tcap, "%s.tmp.%02x%02x%02x%02x%02x%02x%02x%02x", path,
+        rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]
+    );
+    vault_secure_wipe(rnd, sizeof(rnd));
+    if (n < 0 || (size_t)n >= tcap) {
+        free(tmp);
+        return VAULT_SHARE_EWRITE;
+    }
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        int err = errno;
+        free(tmp);
+        return (err == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
+    }
+
+    /* Force exact 0600 even if the process umask masked owner bits. */
     if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
         rc = VAULT_SHARE_EWRITE;
-        goto done;
+        goto fail_fd;
     }
     while (put < VAULT_KEY_LEN) {
         ssize_t w = write(fd, share + put, VAULT_KEY_LEN - put);
         if (w < 0) {
             if (errno == EINTR) continue;
             rc = VAULT_SHARE_EWRITE;
-            goto done;
+            goto fail_fd;
         }
         if (w == 0) {
             rc = VAULT_SHARE_EWRITE;
-            goto done;
+            goto fail_fd;
         }
         put += (size_t)w;
     }
     if (fsync(fd) != 0) rc = VAULT_SHARE_EWRITE;
 
-done:
+fail_fd:
     if (close(fd) != 0 && rc == 0) rc = VAULT_SHARE_EWRITE;
-    return rc;
+    if (rc != 0) {
+        (void)unlink(tmp);
+        free(tmp);
+        return rc;
+    }
+    *out_tmp_path = tmp;
+    return 0;
+}
+
+/* Atomically writes 32 share bytes to `path` via a fresh 0600 sibling temp file + rename. */
+static int write_share_file(const char *path, const uint8_t share[VAULT_KEY_LEN]) {
+    char *tmp = NULL;
+    int rc = stage_share_temp_file(path, share, &tmp);
+    if (rc != 0) return rc;
+    if (rename(tmp, path) != 0) {
+        int err = errno;
+        (void)unlink(tmp);
+        free(tmp);
+        return (err == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
+    }
+    free(tmp);
+    return 0;
 }
 
 /*
  * Provisioning: draws K_GF (32 bytes) with arc4random_buf on the C stack, splits it
- * (k, n) over GF(2^8), writes share i (x = i + 1) to share_paths[i], returns per share
- * SHA-256(share) in out_share_sha256_flat (n * 32 bytes) and the key commitment (32 bytes).
- * No share byte is written to a caller-visible buffer. On failure the files written so far
- * are unlinked, the outputs are wiped, and *out_bad_index (may be NULL) names the failing share.
+ * (k, n) over GF(2^8), stages share i (x = i + 1) to a 0600 temp file and renames all n shares
+ * into share_paths[i], returning per share SHA-256(share) in out_share_sha256_flat (n * 32 bytes)
+ * and the key commitment (32 bytes). No share byte is written to a caller-visible buffer. On
+ * staging failure, pre-existing files at share_paths[] are left untouched, staged temp files are
+ * unlinked, outputs are wiped, and *out_bad_index (may be NULL) names the failing share.
  */
 int vault_generate_split_key_to_files(
     uint8_t threshold_k,
@@ -590,7 +649,8 @@ int vault_generate_split_key_to_files(
 ) {
     uint8_t gf_key[VAULT_KEY_LEN];
     uint8_t shares[VAULT_MAX_SHARES * VAULT_KEY_LEN];
-    size_t written = 0;
+    char *tmp_paths[VAULT_MAX_SHARES] = {0};
+    size_t committed = 0;
     int rc = 0;
 
     if (out_bad_index != NULL) *out_bad_index = SIZE_MAX;
@@ -599,9 +659,15 @@ int vault_generate_split_key_to_files(
     }
     if (threshold_k < 1 || threshold_k > total_n) return -1;
     for (size_t i = 0; i < (size_t)total_n; i++) {
-        if (share_paths[i] == NULL) {
+        if (share_paths[i] == NULL || share_paths[i][0] == '\0') {
             if (out_bad_index != NULL) *out_bad_index = i;
             return VAULT_SHARE_EINVAL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(share_paths[i], share_paths[j]) == 0) {
+                if (out_bad_index != NULL) *out_bad_index = i;
+                return VAULT_SHARE_EINVAL;
+            }
         }
     }
 
@@ -613,18 +679,35 @@ int vault_generate_split_key_to_files(
 
     for (size_t i = 0; i < (size_t)total_n; i++) {
         const uint8_t *share = &shares[i * VAULT_KEY_LEN];
-        rc = write_share_file(share_paths[i], share);
+        rc = stage_share_temp_file(share_paths[i], share, &tmp_paths[i]);
         if (rc != 0) {
             if (out_bad_index != NULL) *out_bad_index = i;
             goto cleanup;
         }
-        written++;
         CC_SHA256(share, (CC_LONG)VAULT_KEY_LEN, &out_share_sha256_flat[i * VAULT_KEY_LEN]);
     }
 
+    for (size_t i = 0; i < (size_t)total_n; i++) {
+        if (rename(tmp_paths[i], share_paths[i]) != 0) {
+            rc = (errno == ELOOP) ? VAULT_SHARE_ESYMLINK : VAULT_SHARE_EWRITE;
+            if (out_bad_index != NULL) *out_bad_index = i;
+            goto cleanup;
+        }
+        free(tmp_paths[i]);
+        tmp_paths[i] = NULL;
+        committed++;
+    }
+
 cleanup:
+    for (size_t j = 0; j < (size_t)total_n; j++) {
+        if (tmp_paths[j] != NULL) {
+            (void)unlink(tmp_paths[j]);
+            free(tmp_paths[j]);
+            tmp_paths[j] = NULL;
+        }
+    }
     if (rc != 0) {
-        for (size_t j = 0; j < written; j++) {
+        for (size_t j = 0; j < committed; j++) {
             (void)unlink(share_paths[j]);
         }
         vault_secure_wipe(out_share_sha256_flat, (size_t)total_n * VAULT_KEY_LEN);

@@ -28,31 +28,33 @@ Both sides validate types, lengths and ranges; the main process does not trust t
 
 Request::
 
-    {"v": 1, "kind": "paillier", "op": "PERCENT_BONUS" | "ADD" | "MUL_SCALAR",
+    {"v": 1, "id": 1, "kind": "paillier", "op": "PERCENT_BONUS" | "ADD" | "MUL_SCALAR",
      "public": {"n": "<hex>"},
      "params": {"ref": "[FHE_NUM_1]", "percent": "12.5"} | {"ref_a", "ref_b"} | {"ref", "scalar": int},
      "ciphertexts": {"[FHE_NUM_1]": {"c": "<hex>", "scale": 100}, ...}}
 
-    {"v": 1, "kind": "bfv", "op": "BFV_MULTIPLY",
+    {"v": 1, "id": 2, "kind": "bfv", "op": "BFV_MULTIPLY",
      "public": {"rlk": "<hex of 16384 int64>"},
      "params": {"ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"},
      "ciphertexts": {"limbs_a": ["<hex of 4096 int64>", ...], "limbs_b": [...]}}
 
 Response::
 
-    {"v": 1, "ok": true, "pid": 1234, "engine": str, "op": str, "label": str, "formula": str,
+    {"v": 1, "id": 1, "ok": true, "pid": 1234, "engine": str, "op": str, "label": str, "formula": str,
      "outputs": {"[FHE_COMPUTED_BONUS]": {"c": "<hex>", "scale": 10000}, ...}}   # Paillier
      "terms": [{"deg": 0, "c": "<hex>"}, ...]                                    # BFV
-    {"v": 1, "ok": false, "pid": 1234, "error": "..."}
+    {"v": 1, "id": 1, "ok": false, "pid": 1234, "error": "..."}
 
 The first frame the worker sends is a handshake: ``{"v": 1, "hello": "vaultmind-evaluator", "pid": ...}``.
 """
 
 import atexit
+import itertools
 import json
+import math
 import os
 import re
-import select
+import selectors
 import signal
 import struct
 import subprocess
@@ -84,7 +86,9 @@ _REF_RE = re.compile(r"^\[FHE_NUM_\d{1,6}\]$")
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _OUT_TOKEN_RE = re.compile(r"^\[FHE_COMPUTED_[A-Z]{1,16}\]$")
 
-REQUEST_KEYS = {"v", "kind", "op", "public", "params", "ciphertexts"}
+REQUEST_KEYS = {"v", "id", "kind", "op", "public", "params", "ciphertexts"}
+_LEGACY_REQUEST_KEYS = REQUEST_KEYS - {"id"}
+_REQ_IDS = itertools.count(1)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER_PATH = os.path.abspath(__file__)
@@ -263,9 +267,17 @@ def evaluate_request(req: Any) -> Dict[str, Any]:
     Never raises; failures become {"ok": false, "error": ...}.
     """
     pid = os.getpid()
+    has_id = isinstance(req, dict) and "id" in req and _is_int(req["id"]) and 0 < req["id"] < (1 << 53)
+    id_field = {"id": req["id"]} if has_id else {}
     try:
         _require(isinstance(req, dict), "request must be a JSON object")
-        _require(set(req) == REQUEST_KEYS, f"request fields must be exactly {sorted(REQUEST_KEYS)}")
+        keys = set(req)
+        _require(
+            keys == REQUEST_KEYS or keys == _LEGACY_REQUEST_KEYS,
+            f"request fields must be {sorted(REQUEST_KEYS)}",
+        )
+        if "id" in req:
+            _require(has_id, "request id must be a positive integer")
         _require(req["v"] == PROTOCOL_VERSION, "unsupported protocol version")
         kind, op = req["kind"], req["op"]
         if kind == "paillier" and op in PAILLIER_OPS:
@@ -275,8 +287,14 @@ def evaluate_request(req: Any) -> Dict[str, Any]:
         else:
             raise FrameError(f"unsupported operation: {str(kind)[:32]}/{str(op)[:32]}")
     except Exception as exc:  # noqa: BLE001 - the worker must answer, not crash
-        return {"v": PROTOCOL_VERSION, "ok": False, "pid": pid, "error": f"{type(exc).__name__}: {exc}"[:MAX_TEXT_CHARS]}
-    return dict(body, v=PROTOCOL_VERSION, ok=True, pid=pid)
+        return dict(
+            id_field,
+            v=PROTOCOL_VERSION,
+            ok=False,
+            pid=pid,
+            error=f"{type(exc).__name__}: {exc}"[:MAX_TEXT_CHARS],
+        )
+    return dict(body, **id_field, v=PROTOCOL_VERSION, ok=True, pid=pid)
 
 
 def _read_exact_blocking(stream, n: int) -> Optional[bytes]:
@@ -404,6 +422,7 @@ def build_paillier_request(
 
     req = {
         "v": PROTOCOL_VERSION,
+        "id": next(_REQ_IDS),
         "kind": "paillier",
         "op": op,
         "public": {"n": int_to_hex(n)},
@@ -416,6 +435,7 @@ def build_paillier_request(
 def build_bfv_request(ref_a: str, ref_b: str, limbs_a: List[Any], limbs_b: List[Any], rlk: Any) -> Dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,
+        "id": next(_REQ_IDS),
         "kind": "bfv",
         "op": "BFV_MULTIPLY",
         "public": {"rlk": i64_to_hex(rlk, BFV_RLK_LEN)},
@@ -439,7 +459,7 @@ def describe_inputs(req: Dict[str, Any], request_bytes: int) -> Dict[str, Any]:
         for side in ("limbs_a", "limbs_b"):
             sizes[f"ciphertexts.{side}"] = f"{len(req['ciphertexts'][side])} × {BFV_CT_LEN} int64 BFV ciphertexts"
     return {
-        "fields": ["op"] + [f"params.{k}" for k in req["params"]] + list(sizes),
+        "fields": (["id"] if "id" in req else []) + ["op"] + [f"params.{k}" for k in req["params"]] + list(sizes),
         "sizes": sizes,
         "request_bytes": request_bytes,
         "never_sent": "p, q, lambda, mu (Paillier); sk (BFV)",
@@ -453,9 +473,13 @@ def _check_response_header(resp: Dict[str, Any], req: Dict[str, Any], expected_p
         raise EvaluatorProtocolError("evaluator response pid does not match the worker process")
     ok = resp.get("ok")
     if ok is False:
+        if "id" in req and resp.get("id") != req["id"]:
+            raise EvaluatorProtocolError("evaluator response id does not match the request")
         raise EvaluatorRejected(f"evaluator rejected the request: {safe_text(str(resp.get('error'))[:MAX_TEXT_CHARS], 'error')}")
     if ok is not True:
         raise EvaluatorProtocolError("evaluator response has no ok flag")
+    if "id" in req and resp.get("id") != req["id"]:
+        raise EvaluatorProtocolError("evaluator response id does not match the request")
 
 
 def decode_paillier_response(
@@ -463,10 +487,10 @@ def decode_paillier_response(
 ) -> Dict[str, Any]:
     try:
         _check_response_header(resp, req, expected_pid)
-        _require(
-            set(resp) == {"v", "ok", "pid", "engine", "op", "label", "formula", "outputs"},
-            "unexpected response fields",
+        expected_fields = {"v", "ok", "pid", "engine", "op", "label", "formula", "outputs"} | (
+            {"id"} if "id" in req else set()
         )
+        _require(set(resp) == expected_fields, "unexpected response fields")
         _require(resp["op"] == req["op"], "response op does not match the request")
         outputs = resp["outputs"]
         _require(isinstance(outputs, dict) and set(outputs) == set(expected_scales), "unexpected output handles")
@@ -495,10 +519,10 @@ def decode_bfv_response(resp: Dict[str, Any], req: Dict[str, Any], expected_pid:
 
     try:
         _check_response_header(resp, req, expected_pid)
-        _require(
-            set(resp) == {"v", "ok", "pid", "engine", "op", "label", "formula", "terms"},
-            "unexpected response fields",
+        expected_fields = {"v", "ok", "pid", "engine", "op", "label", "formula", "terms"} | (
+            {"id"} if "id" in req else set()
         )
+        _require(set(resp) == expected_fields, "unexpected response fields")
         _require(resp["op"] == "BFV_MULTIPLY", "response op does not match the request")
         la, lb = len(req["ciphertexts"]["limbs_a"]), len(req["ciphertexts"]["limbs_b"])
         expected_degs = [i + j for i in range(la) for j in range(lb)]
@@ -525,6 +549,22 @@ class _TransportError(Exception):
     pass
 
 
+def _validated_timeout(raw: Any, default: float = 20.0, strict: bool = False) -> float:
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        if strict:
+            raise ValueError(f"invalid evaluator timeout: {raw!r}") from None
+        return default
+    if not math.isfinite(val) or val <= 0:
+        if strict:
+            raise ValueError(f"evaluator timeout must be positive and finite, got {raw!r}")
+        return default
+    return val
+
+
 class EvaluatorClient:
     """
     One long-lived worker process, started lazily on first use and shared by every pipeline in
@@ -540,11 +580,11 @@ class EvaluatorClient:
     ):
         self._argv = list(argv) if argv else [sys.executable, WORKER_PATH]
         self.request_timeout = (
-            request_timeout
+            _validated_timeout(request_timeout, strict=True)
             if request_timeout is not None
-            else float(os.environ.get("VAULTMIND_EVALUATOR_TIMEOUT", "20"))
+            else _validated_timeout(os.environ.get("VAULTMIND_EVALUATOR_TIMEOUT"), default=20.0, strict=False)
         )
-        self.start_timeout = start_timeout
+        self.start_timeout = _validated_timeout(start_timeout, default=15.0, strict=True)
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.RLock()
         # Optional observer for every frame crossing the boundary: tap(direction, payload_bytes).
@@ -575,19 +615,21 @@ class EvaluatorClient:
         except OSError as exc:
             raise _TransportError(f"could not start evaluator process: {exc}") from None
         self._proc = proc
-        os.set_blocking(proc.stdin.fileno(), False)
-        os.set_blocking(proc.stdout.fileno(), False)
+        handshake_ok = False
         try:
+            os.set_blocking(proc.stdin.fileno(), False)
+            os.set_blocking(proc.stdout.fileno(), False)
             hello = decode_message(self._recv_frame(time.monotonic() + self.start_timeout))
+            if hello.get("hello") != HELLO_TAG or hello.get("pid") != proc.pid or hello.get("v") != PROTOCOL_VERSION:
+                raise _TransportError("evaluator handshake failed: unexpected hello")
+            handshake_ok = True
         except FrameError as exc:
-            self._kill()
             raise _TransportError(f"evaluator handshake failed: {exc}") from None
-        except _TransportError:
-            self._kill()
-            raise
-        if hello.get("hello") != HELLO_TAG or hello.get("pid") != proc.pid or hello.get("v") != PROTOCOL_VERSION:
-            self._kill()
-            raise _TransportError("evaluator handshake failed: unexpected hello")
+        except OSError as exc:
+            raise _TransportError(f"evaluator pipe setup failed: {exc}") from None
+        finally:
+            if not handshake_ok:
+                self._kill()
 
     def _kill(self) -> None:
         proc, self._proc = self._proc, None
@@ -606,6 +648,12 @@ class EvaluatorClient:
             proc.wait(timeout=5)  # reap: no zombie left behind
         except subprocess.TimeoutExpired:
             pass
+
+    def invalidate(self, expected_pid: Optional[int] = None) -> None:
+        """Kill the worker if it is still the active process (e.g. after a protocol violation)."""
+        with self._lock:
+            if self._proc is not None and (expected_pid is None or self._proc.pid == expected_pid):
+                self._kill()
 
     def close(self) -> None:
         """Graceful shutdown: close stdin (worker exits on EOF), then make sure it is gone."""
@@ -635,40 +683,52 @@ class EvaluatorClient:
     def _send_frame(self, payload: bytes, deadline: float) -> None:
         fd = self._proc.stdin.fileno()
         view = memoryview(struct.pack(">I", len(payload)) + payload)
-        while view:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _TransportError("timed out writing to the evaluator process")
-            _, writable, _ = select.select([], [fd], [], remaining)
-            if not writable:
-                continue
-            try:
-                written = os.write(fd, view)
-            except BlockingIOError:
-                continue
-            except OSError as exc:  # BrokenPipeError when the worker died
-                raise _TransportError(f"evaluator process pipe closed: {exc}") from None
-            view = view[written:]
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_WRITE)
+                while view:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _TransportError("timed out writing to the evaluator process")
+                    if not sel.select(remaining):
+                        continue
+                    try:
+                        written = os.write(fd, view)
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:  # BrokenPipeError when the worker died
+                        raise _TransportError(f"evaluator process pipe closed: {exc}") from None
+                    view = view[written:]
+        except _TransportError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _TransportError(f"evaluator selector error: {exc}") from None
 
     def _recv_exact(self, n: int, deadline: float) -> bytes:
         fd = self._proc.stdout.fileno()
         buf = bytearray()
-        while len(buf) < n:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _TransportError("timed out waiting for the evaluator process")
-            readable, _, _ = select.select([fd], [], [], remaining)
-            if not readable:
-                continue
-            try:
-                chunk = os.read(fd, min(n - len(buf), 1 << 20))
-            except BlockingIOError:
-                continue
-            except OSError as exc:
-                raise _TransportError(f"evaluator process pipe error: {exc}") from None
-            if not chunk:
-                raise _TransportError("evaluator process exited (EOF)")
-            buf.extend(chunk)
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_READ)
+                while len(buf) < n:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _TransportError("timed out waiting for the evaluator process")
+                    if not sel.select(remaining):
+                        continue
+                    try:
+                        chunk = os.read(fd, min(n - len(buf), 1 << 20))
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:
+                        raise _TransportError(f"evaluator process pipe error: {exc}") from None
+                    if not chunk:
+                        raise _TransportError("evaluator process exited (EOF)")
+                    buf.extend(chunk)
+        except _TransportError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _TransportError(f"evaluator selector error: {exc}") from None
         return bytes(buf)
 
     def _recv_frame(self, deadline: float) -> bytes:
@@ -684,6 +744,7 @@ class EvaluatorClient:
         with self._lock:
             last_error: Optional[Exception] = None
             for attempt in range(2):
+                completed = False
                 try:
                     if self._proc is None or self._proc.poll() is not None:
                         self._kill()
@@ -695,12 +756,16 @@ class EvaluatorClient:
                         self.tap("request", payload)
                     self._send_frame(payload, deadline)
                     raw = self._recv_frame(deadline)
+                    completed = True
                     if self.tap:
                         self.tap("response", raw)
                     return raw, pid
                 except _TransportError as exc:
                     last_error = exc
-                    self._kill()
+                finally:
+                    # Never leave a half-written request or unread response buffered in the pipe.
+                    if not completed:
+                        self._kill()
             raise EvaluatorUnavailable(str(last_error))
 
     def call(self, req: Dict[str, Any]) -> Tuple[Dict[str, Any], int, int]:
@@ -777,7 +842,11 @@ def run_evaluation(req: Dict[str, Any], decode: Callable[[Dict[str, Any], int], 
             evaluator_inputs=describe_inputs(req, len(payload)),
         )
         return result
-    result = decode(resp, pid)
+    try:
+        result = decode(resp, pid)
+    except EvaluatorProtocolError:
+        client.invalidate(pid)
+        raise
     result.update(
         evaluated_by=f"untrusted evaluator process (pid {pid}; holds only {holder})",
         evaluator_pid=pid,

@@ -43,12 +43,14 @@ from .gazetteer import (
     AMBIGUOUS_FIRST_NAMES,
     AMBIGUOUS_PLACES,
     CALENDAR_WORDS,
+    CONTACT_WORDS,
     FIRST_NAMES,
     NAME_PARTICLE_PAIRS,
     NAME_PARTICLES,
     NAME_STOP,
     ORG_CUE_PATTERN,
     PERSON_CUES,
+    PERSON_PREPOSITIONS,
     PLACE_INDEX,
     PLACE_PREPOSITIONS,
     ROLE_WORDS,
@@ -385,15 +387,30 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
 
         if not cap:
             # A lower-case first name alone counts only right after a person cue ("ask lisa",
-            # "stuur naar sem"), and never when it is also an everyday word ("to mark", "met max").
+            # "stuur naar sem"), and never when it is also an everyday word ("to mark", "met max")
+            # or an English infinitive phrasal verb ("to peter out").
             if cued and not amb:
+                if (
+                    prev_in(i, {"to"})
+                    and i + 1 < n
+                    and adjacent(i, i + 1)
+                    and lows[i + 1] in {"out", "off", "away", "down"}
+                ):
+                    continue
                 out.append(SpanMatch(toks[i][0], toks[i][1], "ID", tok, priority=6,
                                      is_role_subject=prev_in(i, ROLE_WORDS)))
             continue
         if amb and (not cued or low in CALENDAR_WORDS):
             continue
-        if low == "jan" and re.match(r"[ \t]?\d", prompt[toks[i][1] : toks[i][1] + 2]):
-            continue  # "Jan 15": English month abbreviation
+        if low == "jan":
+            if re.match(r"[ \t]?\d|\.", prompt[toks[i][1] : toks[i][1] + 2]):
+                continue  # "Jan 15", "Jan. 2026": English month abbreviation
+            if prev_in(i, {"in", "during", "since", "until", "before", "after", "through", "per"}):
+                continue  # "in Jan", "since Jan": temporal preposition, not a person
+            if (i + 2 < n and lows[i + 1] in {"to", "through", "and", "or"} and lows[i + 2] in CALENDAR_WORDS) or (
+                i >= 2 and lows[i - 1] in {"to", "through", "and", "or"} and lows[i - 2] in CALENDAR_WORDS
+            ):
+                continue  # "from Jan to Mar", "Dec and Jan"
         out.append(SpanMatch(toks[i][0], toks[i][1], "ID", tok, priority=6, is_role_subject=prev_in(i, ROLE_WORDS)))
 
     # 3: addresses ---------------------------------------------------------------------------
@@ -436,6 +453,7 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
             out.append(SpanMatch(m.start(1), m.end(1), "LOC", m.group(1), priority=4))
 
     # 4: places --------------------------------------------------------------------------------
+    place_only_preps = PLACE_PREPOSITIONS - PERSON_PREPOSITIONS
     i = 0
     while i < n:
         key = lows[i]
@@ -444,6 +462,8 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
         if key.startswith("s-") and start_off > 0 and prompt[start_off - 1] in "'’":
             capital_ok = len(tok) > 2 and tok[2].isupper()  # 's-Hertogenbosch
             start_off -= 1
+        elif key.startswith("s-"):
+            capital_ok = len(tok) > 2 and tok[2].isupper()  # s-Hertogenbosch / s-Gravenhage
         else:
             capital_ok = tok[0].isupper() and not tok.isupper()
         entries = PLACE_INDEX.get(key) if capital_ok else None
@@ -461,9 +481,18 @@ def _gazetteer_spans(prompt: str) -> List["SpanMatch"]:
             continue
         words, last = matched
         name = " ".join(words)
+        if len(words) == 1 and prev_in(i, ROLE_WORDS | CONTACT_WORDS):
+            # "employee Austin", "medewerker Milan", "Dear Sofia": person role/contact cue, not a city.
+            i = last + 1
+            continue
         if name in AMBIGUOUS_PLACES:
             in_address = _ADDRESS_TAIL_RE.search(prompt[max(0, start_off - 12) : start_off]) is not None
-            if not (prev_in(i, PLACE_PREPOSITIONS) or in_address):
+            preps = (
+                place_only_preps
+                if (len(words) == 1 and name in FIRST_NAMES and name not in AMBIGUOUS_FIRST_NAMES)
+                else PLACE_PREPOSITIONS
+            )
+            if not (prev_in(i, preps) or in_address):
                 i = last + 1
                 continue
         out.append(SpanMatch(start_off, toks[last][1], "LOC", prompt[start_off : toks[last][1]], priority=5))
@@ -816,7 +845,11 @@ class BlindTokenizer:
             phrase = m.group(1)
             words = phrase.split()
             start_offset = m.start(1)
-            while words and (words[0] in STOPWORD_CAPITALS or words[0] in _LEADING_CUE_CAPITALS):
+            while words and (
+                words[0] in STOPWORD_CAPITALS
+                or words[0] in _LEADING_CUE_CAPITALS
+                or words[0].lower() in ROLE_WORDS
+            ):
                 removed = words.pop(0)
                 start_offset = prompt.index(words[0], start_offset + len(removed)) if words else start_offset
             if len(words) >= 2:
@@ -842,7 +875,7 @@ class BlindTokenizer:
         # Priority 6: Single proper name after a role/title word (e.g. "patient O'Connor", "dhr. Müller")
         for m in re.finditer(
             rf"(?i:\b(?:employee|patient|patiënt|client|klant|vendor|customer|lead|recipient|user|medewerker|werknemer|"
-            rf"leverancier|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)({NAME_WORD})\b",
+            rf"leverancier|subject|mr\.?|mrs\.?|ms\.?|dr\.?|dhr\.?|mevr\.?)\s+)({NAME_WORD})\b",
             prompt,
         ):
             word = m.group(1)

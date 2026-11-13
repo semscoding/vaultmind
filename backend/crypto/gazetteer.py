@@ -106,6 +106,7 @@ _AMBIGUOUS_FIRST_NAMES = """
     greet lies toon ton mees job merel harm christian roger randy oscar leo jordan victoria
     virginia madison charlotte brittany poppy carol nova ada julia joyce hunter mason harper
     autumn stella sander heather sterling luna isis lotus kelly bob chad aria paisley robin rosa ties
+    anders
 """
 
 FIRST_NAMES: FrozenSet[str] = _words(_FIRST_NAMES_NL) | _words(_FIRST_NAMES_EN) | _words(_FIRST_NAMES_INTL)
@@ -249,7 +250,7 @@ AMBIGUOUS_PLACES: FrozenSet[str] = _words(
     nice reading mobile best born echt made bath split sale goes putten huizen buren hoorn
     sluis grave beek bergen kampen assen leiden edam gouda doorn essen bordeaux porto cork
     oxford cambridge phoenix washington santiago sofia wellington hull derby wells lima
-    perth york son_en_breugel drunen gent
+    perth york son_en_breugel drunen gent houten duiven weert wenen hulst austin
     """
 )
 

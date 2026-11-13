@@ -7,6 +7,7 @@ The cloud-wire leak flags are computed by a post-blinding scan of the detected s
 the blinding itself is regex/heuristic, which `wire_payload["leak_check"]` states explicitly.
 """
 
+import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -114,7 +115,9 @@ class AgentPipeline:
         fhe_computation_report = None
         if fhe_spec:
             try:
-                fhe_computation_report = self.tokenizer.execute_and_decrypt_fhe(fhe_spec, ctx)
+                fhe_computation_report = await asyncio.to_thread(
+                    self.tokenizer.execute_and_decrypt_fhe, fhe_spec, ctx
+                )
             except Exception as exc:
                 fhe_computation_report = {"error": str(exc)}
         # Where the homomorphic evaluation ran: the separate evaluator process (public n / rlk only)

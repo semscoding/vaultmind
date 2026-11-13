@@ -91,7 +91,7 @@ Run it. Show `[ID_…]`, `[FHE_NUM_1]`, `[IBAN_…]`, `[SECRET_…]` in the payl
 
 ## Scene 7: Tests and close (2:30 – 2:45)
 
-**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 85 tests` and `OK`.
+**On screen:** terminal: `python3 -m unittest discover -s tests -v`, scroll to `Ran 91 tests` and `OK`.
 
 **Say:**
-> "Eighty-five tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, C-only share files, the separate evaluator process, concurrent ledger writes, BFV at depth one, provider errors, name and address blinding, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."
+> "Ninety-one tests cover the field arithmetic, uniform sharing, canonical AAD and length framing, shard failover, C-only share files, the separate evaluator process, concurrent ledger writes, BFV at depth one, provider errors, name and address blinding, prose false-positive guards and the leak check. The known limitations are listed in the README. Thanks for watching."

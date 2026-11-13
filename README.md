@@ -176,7 +176,7 @@ and commit to database.
 
 Tokens: `[ID_…]`, `[IBAN_…]`, `[GOV_ID_…]`, `[EMAIL_…]`, `[LOC_…]`, `[PHONE_…]` (HMAC-SHA256, 32-bit prefix, fresh key per prompt), `[SECRET_…]` (sealed in C with AES-256-CBC + HMAC-SHA256, never stored in plaintext token maps or logs), `[FHE_NUM_n]` (Paillier and, for integers, BFV ciphertexts; only a truncated preview of the Paillier ciphertext is sent: its first 12 and last 8 hex digits).
 
-Names, places, addresses and some organisations are also found with a bundled list (`backend/crypto/gazetteer.py`): 859 first names (111 of them ambiguous, such as `Will` or `Mark`), 463 places (45 ambiguous, such as `Best` or `Nice`), Dutch street suffixes and English street words. Lookup is per word; there is no ML model and nothing is downloaded. This detects single first names (`Sem`, `Maria`), lower-case names after a person word (`transfer to jan jansen`) or with a surname particle (`maria van dijk approved`), addresses as one `[LOC_…]` token including the house number (`Keizersgracht 12`, `12 Baker Street`), place names (`Amsterdam`), and organisations after a cue word (`Pay …`, `Invoice from …`, `vendor …`). Ambiguous names and places are only blinded with extra context (a person word, or a preposition such as `in Best`).
+Names, places, addresses and some organisations are also found with a bundled list (`backend/crypto/gazetteer.py`): 859 first names (112 of them ambiguous, such as `Will`, `Mark` or `Anders`), 463 places (51 ambiguous, such as `Best`, `Nice` or `Houten`), Dutch street suffixes and English street words. Lookup is per word; there is no ML model and nothing is downloaded. This detects single first names (`Sem`, `Maria`), lower-case names after a person word (`transfer to jan jansen`) or with a surname particle (`maria van dijk approved`), addresses as one `[LOC_…]` token including the house number (`Keizersgracht 12`, `12 Baker Street`), place names (`Amsterdam`), and organisations after a cue word (`Pay …`, `Invoice from …`, `vendor …`). Ambiguous names and places are only blinded with extra context (a person word, or a preposition such as `in Best`).
 
 After blinding, a residual scan checks whether any detected value still appears in the outgoing text (case-insensitive). The result is `contains_raw_pii`, `contains_raw_secrets` and `leak_check` in the response, and is shown above the payload. The scan can only find values the tokenizer detected in the first place.
 
@@ -219,7 +219,7 @@ All commands run from the repository root with the venv active. Test names refer
 | Evaluator restart, fallback and manipulated answers | `test_killed_worker_is_restarted`, `test_fallback_when_worker_cannot_start`, `test_hanging_worker_times_out_and_falls_back`, `test_manipulated_responses_fail_cleanly` |
 | List-based blinding of names, addresses, places and cued organisations | `test_lowercase_full_names_after_a_person_cue`, `test_single_first_names`, `test_addresses_and_places`, `test_cued_organisations_keep_the_cue_word_in_clear`, `test_ambiguous_names_need_extra_evidence` |
 | Ordinary prose stays unchanged; hostile inputs stay fast | `test_ordinary_prose_is_unchanged`, `test_hostile_inputs_finish_within_one_second` |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 85 tests, OK (about 19 s) |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 91 tests, OK (about 20 s) |
 
 ---
 
@@ -256,7 +256,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (85 tests, about 19 s)
+# Run the test suite (91 tests, about 20 s)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -284,5 +284,5 @@ vaultmind/
 ├── services/      # pipeline_service.py, enclave_service.py and evaluator_worker.py (separate evaluator process)
 ├── monitoring/    # telemetry.py
 └── tests/         # test_security_audit.py, test_audit_regressions.py, test_c_share_files.py,
-                   # test_evaluator_process.py, test_blinding_gazetteer.py (85 tests)
+                   # test_evaluator_process.py, test_blinding_gazetteer.py (91 tests)
 ```
