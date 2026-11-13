@@ -795,6 +795,14 @@ class BlindTokenizer:
         }
 
     def execute_and_decrypt_fhe(self, op_spec: Dict[str, Any], ctx: BlindContext) -> Dict[str, Any]:
+        """
+        Validate the LLM's op_spec here, send ONLY public material (Paillier n / BFV rlk) plus the
+        ciphertexts to the separate evaluator process, then decrypt the returned ciphertexts locally.
+        Same machine: a process boundary with public material only, not a network/hardware boundary.
+        """
+        # Lazy import: services/ imports this module (avoids an import cycle).
+        from services import evaluator_worker as ew
+
         op = str(op_spec.get("op", "")).upper()
 
         if op in ("BFV_MULTIPLY", "MULTIPLY"):
@@ -807,7 +815,9 @@ class BlindTokenizer:
             if ea.get("bfv_limbs") is None or eb.get("bfv_limbs") is None:
                 raise ValueError("Selected operands are non-integers or exceed 32-bit unsigned BFV limb domain.")
 
-            prod_terms = self.bfv.evaluator.multiply_limbs(ea["bfv_limbs"], eb["bfv_limbs"])
+            req = ew.build_bfv_request(ref_a, ref_b, ea["bfv_limbs"], eb["bfv_limbs"], self.bfv.evaluator.public_rlk)
+            res = ew.run_evaluation(req, lambda resp, pid: ew.decode_bfv_response(resp, req, pid))
+            prod_terms = res["terms"]
             dec_int = self.bfv.decrypt_limbs_product(prod_terms)
             sym = ea.get("prefix_symbol") or eb.get("prefix_symbol") or ""
             formatted = _format_amount(sym, dec_int, "{:,}")
@@ -821,6 +831,7 @@ class BlindTokenizer:
                 "scale": 1,
             }
             ctx.token_to_plaintext[out_token] = formatted
+            ctx.log(f"RLWE-BFV product evaluated by {res['evaluated_by']}")
             ctx.log(
                 f"Native C RLWE-BFV (leveled, depth 1, N=2048) product {out_token}: "
                 f"D(Relin({ref_a} ⊗ {ref_b})) decrypted locally"
@@ -832,9 +843,14 @@ class BlindTokenizer:
                 "formula": f"c_prod = Relin(round((t/q) · ({ref_a} ⊗ {ref_b}))) in R_q (N=2048)",
                 "decrypted_outputs": {out_token: formatted},
                 "ciphertext_previews": {out_token: preview},
+                **ew.provenance(res),
             }
 
-        eval_res = self.evaluator.evaluate_operation(op_spec, ctx.encrypted_numbers)
+        req, expected_scales = ew.build_paillier_request(op_spec, ctx.encrypted_numbers, self.paillier.n)
+        eval_res = ew.run_evaluation(
+            req, lambda resp, pid: ew.decode_paillier_response(resp, req, self.paillier.n, expected_scales, pid)
+        )
+        ctx.log(f"{self.phe_label} {eval_res['op']} evaluated by {eval_res['evaluated_by']}")
         decrypted_summary: Dict[str, str] = {}
 
         ref_key = normalize_fhe_handle(op_spec.get("ref") or op_spec.get("ref_a") or "")
@@ -867,6 +883,7 @@ class BlindTokenizer:
             "ciphertext_previews": {
                 k: v["hex_preview"] for k, v in ctx.computed_numbers.items()
             },
+            **ew.provenance(eval_res),
         }
 
     def unblind_response(self, response_text: str, ctx: BlindContext, include_secrets: bool = False) -> str:
