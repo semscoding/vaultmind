@@ -189,7 +189,7 @@ select:hover, input:hover, textarea:hover { border-color: var(--ink-2); }
 
 ::placeholder { color: var(--ink-3); opacity: 1; }
 
-#apiKeyInput { width: 15rem; }
+#apiKeyInput { width: 19rem; }
 
 /* ---------- Telemetry strip ---------- */
 .telemetry-bar {
