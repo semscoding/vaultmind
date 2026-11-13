@@ -1,7 +1,7 @@
 """
 Comprehensive Security, Cryptographic & Red-Team Verification Suite for VaultMind v2.
 Tests all 6 architectural layers: frontend, backend, database, apis, services, and monitoring,
-including N=2048 128-bit Lattice RLWE-BFV FHE, Dual-Field Feldman VSS, and Zero-Retention Secret Sealing.
+including N=2048 RLWE-BFV (leveled, depth 1), Dual-Field Feldman VSS, and Zero-Retention Secret Sealing.
 """
 
 import json
@@ -187,7 +187,7 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
         self.assertEqual(res_metrics.status_code, 200)
         self.assertGreaterEqual(res_metrics.json()["counters"]["total_requests"], 1)
 
-    def test_07_native_c_128bit_pq_rlwe_bfv_n2048_multiplication(self):
+    def test_07_native_c_rlwe_bfv_n2048_leveled_multiplication(self):
         import asyncio
 
         bfv = BFVContext()
@@ -221,9 +221,13 @@ class VaultMindSecurityAuditTests(unittest.TestCase):
                 )
                 self.assertIn("$36,000", res["unblinded_result"])
                 serialized = json.dumps(res)
-                for secret_piece in ["correct-horse-battery-staple", "master-seed-alpha-99", "<secret>"]:
+                # The secret values must not appear anywhere in the response.
+                for secret_piece in ["correct-horse-battery-staple", "master-seed-alpha-99"]:
                     self.assertNotIn(secret_piece, res["blinded_prompt"])
                     self.assertNotIn(secret_piece, serialized)
+                # The <secret> tag itself must be gone from the wire prompt; it may legitimately
+                # appear in explanatory text elsewhere (e.g. cloud_wire_payload.leak_check.note).
+                self.assertNotIn("<secret>", res["blinded_prompt"])
 
         asyncio.run(_run_pipeline_bfv())
 

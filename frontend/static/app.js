@@ -50,6 +50,10 @@ function loadScenario(type) {
 }
 
 function initChart() {
+    if (typeof Chart === "undefined") {
+        console.error("Chart.js failed to load from /static/vendor/chart.umd.min.js");
+        return;
+    }
     const ctx = document.getElementById("shamirChart").getContext("2d");
     shamirChart = new Chart(ctx, {
         type: "line",
@@ -101,13 +105,13 @@ function initChart() {
                     type: "linear",
                     min: 0,
                     max: 5,
-                    ticks: { stepSize: 1, color: "#64748B" },
+                    ticks: { stepSize: 1, color: "#7C8BA1" },
                     grid: { color: "rgba(255, 255, 255, 0.05)" }
                 },
                 y: {
                     min: 0,
                     max: 260,
-                    ticks: { color: "#64748B" },
+                    ticks: { color: "#7C8BA1" },
                     grid: { color: "rgba(255, 255, 255, 0.05)" }
                 }
             }
@@ -159,14 +163,14 @@ function renderVaultTopology(vaultData) {
 
         const stateSpan = document.createElement("span");
         stateSpan.style.color = !node.vss_valid
-            ? "var(--red-accent)"
+            ? "var(--red-text)"
             : (node.status === "QUORUM_ACTIVE" ? "var(--green-accent)" : "var(--text-muted)");
         stateSpan.textContent = !node.vss_valid
             ? "TAMPERED"
             : (node.status === "QUORUM_ACTIVE" ? "QUORUM" : "VSS OK");
 
         const fpSpan = document.createElement("span");
-        fpSpan.style.color = "var(--purple-accent)";
+        fpSpan.style.color = "var(--purple-text)";
         fpSpan.textContent = `#${node.fingerprint}`;
 
         const corruptBtn = document.createElement("button");
@@ -225,25 +229,179 @@ async function restoreShards() {
     }
 }
 
-function formatSafeHighlightedWire(blindedPrompt, paillierBits) {
-    // 1. Escape ALL HTML entities first to guarantee 0% XSS risk
-    const safeText = escapeHtml(blindedPrompt);
-
-    // 2. Highlight strictly alphanumeric cryptographic token patterns
-    const highlighted = safeText
-        .replace(/(\[(?:ID|EMAIL|IBAN|GOV_ID|LOC|SECRET)_[A-F0-9]{8}\])/g, '<span class="token-highlight-id">$1</span>')
+// Highlight blinded tokens. Input MUST already be HTML-escaped; the regexes only
+// match fixed alphanumeric token shapes, so no user data is turned into markup.
+function highlightTokens(escapedText) {
+    return escapedText
+        .replace(/(\[(?:ID|EMAIL|IBAN|GOV_ID|LOC|SECRET|PHONE|PERSON)_[A-Za-z0-9]{1,16}\])/g, '<span class="token-highlight-id">$1</span>')
         .replace(/(\[FHE_NUM_\d+\]\(ENC:0x[0-9a-fA-F\.]+\))/g, '<span class="token-highlight-fhe">$1</span>');
+}
 
-    return (
-        `<strong>POST /v1/zero-knowledge/reason</strong>\n\n` +
-        `${highlighted}\n\n` +
-        `// SECURITY INVARIANTS:\n` +
-        `"contains_master_key": false,\n` +
-        `"contains_raw_pii": false,\n` +
-        `"contains_raw_secrets": false,\n` +
-        `"paillier_phe_modulus_bits": ${Number(paillierBits) || 1024},\n` +
-        `"bfv_fhe_ring": "Z_{2^54}[X]/(X^2048 + 1) [128-bit Lattice Security]"`
-    );
+function prettyBody(body) {
+    if (body === null || body === undefined) return "";
+    if (typeof body === "string") {
+        try {
+            return JSON.stringify(JSON.parse(body), null, 2);
+        } catch (_) {
+            return body;
+        }
+    }
+    try {
+        return JSON.stringify(body, null, 2);
+    } catch (_) {
+        return String(body);
+    }
+}
+
+// B4: show the request that was actually sent to the provider (no API key),
+// never a made-up endpoint. Returns an HTML string in which every dynamic value
+// is escaped with escapeHtml() before token highlighting.
+function formatSafeHighlightedWire(payload) {
+    const wire = (payload && payload.cloud_wire_payload) || {};
+    const req = wire.actual_request;
+    const blinded = (payload && payload.blinded_prompt) || wire.transmitted_prompt || "";
+    const parts = [];
+
+    if (req && req.url) {
+        const method = escapeHtml(req.method || "POST");
+        // Defence in depth: never display a key that slipped into the query string.
+        const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
+        parts.push(`<strong class="wire-section-label">${method} ${escapeHtml(shownUrl)}</strong>`);
+        if (req.headers_redacted && typeof req.headers_redacted === "object") {
+            const hdrs = Object.entries(req.headers_redacted)
+                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
+                .join("\n");
+            if (hdrs) parts.push(hdrs);
+        }
+        parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
+    } else if (req) {
+        // Offline engine: backend reports method/url/body = null.
+        parts.push('<strong class="wire-local-only">✔ LOCAL ONLY: offline engine, nothing left this machine</strong>');
+        if (req.note) parts.push(`// ${escapeHtml(req.note)}`);
+        parts.push('<span class="wire-section-label">Blinded prompt processed locally:</span>');
+        parts.push(highlightTokens(escapeHtml(blinded)));
+    } else {
+        // Older backend without actual_request: show only the blinded prompt.
+        parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request):</span>');
+        parts.push(highlightTokens(escapeHtml(blinded)));
+    }
+    return parts.join("\n\n");
+}
+
+function countOf(v) {
+    if (Array.isArray(v)) return v.length;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+}
+
+// B1: show the computed leak check instead of an absolute promise.
+function renderLeakCheck(payload) {
+    const badge = document.getElementById("wireLockBadge");
+    const box = document.getElementById("leakCheckStatus");
+    const wire = (payload && payload.cloud_wire_payload) || {};
+    const lc = wire.leak_check;
+
+    box.classList.remove("hidden", "leak-ok", "leak-bad");
+    badge.classList.remove("leak-ok", "leak-bad", "leak-unknown");
+    box.textContent = "";
+
+    const flagged = [];
+    if (wire.contains_master_key === true) flagged.push("master key");
+    if (wire.contains_raw_pii === true) flagged.push("raw PII");
+    if (wire.contains_raw_secrets === true) flagged.push("raw secrets");
+
+    const head = document.createElement("strong");
+    const lines = [];
+
+    if (lc && typeof lc === "object") {
+        const spans = countOf(lc.detected_spans);
+        const residual = countOf(lc.residual_matches);
+        const spansTxt = spans === null ? "?" : spans;
+        const residualTxt = residual === null ? "?" : residual;
+        const bad = (residual !== null && residual > 0) || flagged.length > 0;
+        head.textContent = bad
+            ? `⚠ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`
+            : `✔ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`;
+        if (bad) {
+            lines.push("WARNING: detected values are still present in the outgoing payload.");
+        }
+        if (flagged.length) lines.push(`Flagged by backend: ${flagged.join(", ")}.`);
+        if (lc.method) lines.push(`Method: ${lc.method}`);
+        if (lc.note) lines.push(String(lc.note));
+        else if (lc.heuristic !== false) {
+            lines.push("Blinding is heuristic: only detected spans are checked. Wrap unlabeled secrets in <secret>…</secret>.");
+        }
+        box.classList.add(bad ? "leak-bad" : "leak-ok");
+        badge.classList.add(bad ? "leak-bad" : "leak-ok");
+        badge.textContent = bad ? `⚠ ${residualTxt} RESIDUAL MATCH(ES)` : `✔ 0 RESIDUAL MATCHES (heuristic)`;
+    } else {
+        head.textContent = flagged.length
+            ? `⚠ Backend flags: ${flagged.join(", ")}`
+            : "Leak check not reported by backend";
+        lines.push("Blinding is heuristic: only detected spans are replaced. Wrap unlabeled secrets in <secret>…</secret>.");
+        if (flagged.length) {
+            box.classList.add("leak-bad");
+            badge.classList.add("leak-bad");
+            badge.textContent = "⚠ LEAK FLAGGED";
+        } else {
+            badge.classList.add("leak-unknown");
+            badge.textContent = "Leak check: not reported";
+        }
+    }
+
+    box.appendChild(head);
+    if (lines.length) {
+        box.appendChild(document.createTextNode("\n" + lines.join("\n")));
+    }
+}
+
+function resetLeakCheck(text) {
+    const badge = document.getElementById("wireLockBadge");
+    const box = document.getElementById("leakCheckStatus");
+    badge.classList.remove("leak-ok", "leak-bad");
+    badge.classList.add("leak-unknown");
+    badge.textContent = text;
+    box.classList.add("hidden");
+    box.textContent = "";
+}
+
+function setPaillierBits(bits) {
+    const n = Number(bits);
+    if (!Number.isFinite(n) || n <= 0) return;
+    document.getElementById("paillierBitsText").textContent =
+        `Paillier ${n}-bit PHE + RLWE-BFV (leveled, depth 1)`;
+}
+
+// Turn any FastAPI error body into readable text.
+function detailText(body, fallback) {
+    if (!body) return fallback;
+    const d = body.detail;
+    if (typeof d === "string" && d) return d;
+    if (Array.isArray(d)) {
+        return d.map(e => (e && e.msg) ? e.msg : JSON.stringify(e)).join("; ");
+    }
+    if (d && typeof d === "object") return JSON.stringify(d);
+    return fallback;
+}
+
+async function readJsonSafe(res) {
+    try {
+        return await res.json();
+    } catch (_) {
+        return null;
+    }
+}
+
+function restoreRunButton(runBtn) {
+    runBtn.disabled = false;
+    runBtn.removeAttribute("aria-busy");
+    runBtn.textContent = "";
+    const icon = document.createElement("span");
+    icon.className = "btn-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "⚡";
+    runBtn.appendChild(icon);
+    runBtn.appendChild(document.createTextNode(" Execute Zero-Trust Pipeline"));
 }
 
 async function runPipeline() {
@@ -262,38 +420,89 @@ async function runPipeline() {
     const text = promptInput.value.trim();
     if (!text) return;
 
+    const parseWarning = document.getElementById("parseWarning");
+
     runBtn.disabled = true;
-    runBtn.textContent = "⏳ Running C Enclave & PHE/FHE...";
+    runBtn.setAttribute("aria-busy", "true");
+    runBtn.textContent = "⏳ Running C Enclave, Paillier & RLWE-BFV...";
     decryptedOutput.className = "content-output placeholder";
-    decryptedOutput.textContent = "Blinding sensitive spans, running Paillier PHE / C Lattice RLWE-BFV FHE, and verifying 2048-bit Feldman shards...";
+    decryptedOutput.textContent = "Blinding sensitive spans, running Paillier PHE / C RLWE-BFV (leveled, depth 1), and verifying 2048-bit Feldman shards...";
     fheBanner.classList.add("hidden");
+    parseWarning.classList.add("hidden");
+    parseWarning.textContent = "";
 
     try {
-        const res = await fetch("/api/process", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                prompt: text,
-                provider: provider,
-                api_key: apiKey || null
-            })
-        });
+        let res;
+        try {
+            res = await fetch("/api/process", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    prompt: text,
+                    provider: provider,
+                    api_key: apiKey || null
+                })
+            });
+        } catch (netErr) {
+            const e = new Error("Network error: could not reach the local VaultMind server (127.0.0.1). Is it running?");
+            e.kind = "network";
+            throw e;
+        }
 
-        const payload = await res.json();
+        const payload = await readJsonSafe(res);
         if (!res.ok) {
-            throw new Error(payload.detail || "Pipeline execution failed.");
+            let msg;
+            if (res.status === 400) {
+                msg = `Request rejected (400): ${detailText(payload, "missing or invalid API key / input.")}`;
+            } else if (res.status === 502) {
+                msg = `LLM provider error (502): ${detailText(payload, "the provider returned an error or no usable answer.")}`;
+            } else {
+                msg = `Server error (${res.status}): ${detailText(payload, res.statusText || "pipeline execution failed.")}`;
+            }
+            const e = new Error(msg);
+            e.status = res.status;
+            if (payload && typeof payload === "object" && payload.wire_request) {
+                e.wireRequest = payload.wire_request;
+            }
+            throw e;
+        }
+        if (!payload || typeof payload !== "object") {
+            throw new Error("Server returned an unreadable response.");
         }
 
         // Column 1: Local Decrypted Output (strict textContent)
         decryptedOutput.className = payload.status === "SUCCESS" ? "content-output" : "content-output error-state";
-        decryptedOutput.textContent = payload.unblinded_result;
+        decryptedOutput.textContent = payload.unblinded_result ?? "";
         providerUsedTag.textContent = payload.provider_used || provider;
-        latencyBadge.textContent = `${payload.duration_ms} ms`;
+        latencyBadge.textContent = `${payload.duration_ms ?? "--"} ms`;
         latencyBadge.classList.remove("hidden");
 
-        if (payload.paillier_public_key && payload.paillier_public_key.modulus_bits) {
-            document.getElementById("paillierBitsText").textContent =
-                `Paillier ${payload.paillier_public_key.modulus_bits}-bit PHE + C RLWE-BFV FHE`;
+        const wirePayload = payload.cloud_wire_payload || {};
+        setPaillierBits(
+            (payload.paillier_public_key && payload.paillier_public_key.modulus_bits) ||
+            wirePayload.paillier_phe_modulus_bits
+        );
+
+        // M3: surface parser warnings from the LLM phase, only when present.
+        const phase3 = (payload.audit_trail || []).find(p => p && typeof p.phase === "string" && p.phase.startsWith("PHASE_3"));
+        const pw = (phase3 && phase3.details && phase3.details.parse_warning) || payload.parse_warning;
+        // Untrusted-LLM-output warnings (list of strings), from the response and/or audit phase 3.
+        const warnList = [];
+        [payload.llm_output_warnings, phase3 && phase3.details && phase3.details.llm_output_warnings].forEach(src => {
+            (Array.isArray(src) ? src : []).forEach(w => {
+                const s = typeof w === "string" ? w : JSON.stringify(w);
+                if (s && !warnList.includes(s)) warnList.push(s);
+            });
+        });
+        const warnLines = [];
+        if (pw) {
+            warnLines.push(`⚠ LLM output parse warning: ${typeof pw === "string" ? pw : JSON.stringify(pw)}`);
+        }
+        warnList.forEach(w => warnLines.push(`⚠ LLM output warning: ${w}`));
+        if (warnLines.length > 0) {
+            parseWarning.textContent = warnLines.join("\n");
+            parseWarning.style.whiteSpace = "pre-wrap";
+            parseWarning.classList.remove("hidden");
         }
 
         // Homomorphic Agent Computation Proof Banner
@@ -301,7 +510,7 @@ async function runPipeline() {
             const outs = Object.entries(payload.fhe_computation.decrypted_outputs || {})
                 .map(([k, v]) => `${k} → ${v}`)
                 .join("  |  ");
-            const eng = payload.fhe_computation.engine || "Homomorphic Engine";
+            const eng = payload.fhe_computation.engine || "Homomorphic engine";
             fheBanner.textContent =
                 `🧮 [${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
             fheBanner.classList.remove("hidden");
@@ -309,10 +518,9 @@ async function runPipeline() {
 
         // Column 2: Escaped & Highlighted Wire View
         wireOutput.className = "wire-code-block";
-        wireOutput.innerHTML = formatSafeHighlightedWire(
-            payload.blinded_prompt,
-            payload.cloud_wire_payload ? payload.cloud_wire_payload.paillier_phe_modulus_bits : 1024
-        );
+        // Safe: formatSafeHighlightedWire escapes every dynamic value first.
+        wireOutput.innerHTML = formatSafeHighlightedWire(payload);
+        renderLeakCheck(payload);
 
         // Mapping Tokens Table (DOM construction with textContent — zero innerHTML injection!)
         mappingTokens.innerHTML = "";
@@ -360,7 +568,7 @@ async function runPipeline() {
                 `STATUS:      ${r.status} (SQLite Row #${r.ledger_row_id})`,
                 `ACTION:      ${r.action}`,
                 `TARGET:      ${r.target}`,
-                `QUORUM:      ${r.quorum_nodes.join(", ")}`,
+                `QUORUM:      ${(r.quorum_nodes || []).join(", ")}`,
                 r.rejected_tampered_nodes && r.rejected_tampered_nodes.length > 0
                     ? `REJECTED:    ${r.rejected_tampered_nodes.join(", ")} (Feldman VSS Failed!)`
                     : `VSS_CHECK:   All inspected shards valid`,
@@ -379,10 +587,24 @@ async function runPipeline() {
         await verifyLedger(false);
     } catch (err) {
         decryptedOutput.className = "content-output error-state";
-        decryptedOutput.textContent = `Pipeline Error: ${err.message}`;
+        decryptedOutput.textContent = `❌ ${err.message}`;
+        providerUsedTag.textContent = "Error";
+        latencyBadge.classList.add("hidden");
+        if (err.wireRequest && typeof err.wireRequest === "object") {
+            wireOutput.className = "wire-code-block";
+            wireOutput.textContent =
+                `// Provider returned HTTP ${err.status || 502}: no answer was used and nothing was sealed.\n` +
+                `// Actual outbound request transmitted (API key redacted):\n\n` +
+                JSON.stringify(err.wireRequest, null, 2);
+        } else {
+            wireOutput.className = "wire-code-block placeholder";
+            wireOutput.textContent = err.status === 502
+                ? "The provider returned an error, so no answer was used. Nothing was sealed."
+                : "No request completed.";
+        }
+        resetLeakCheck("Leak check: no result");
     } finally {
-        runBtn.disabled = false;
-        runBtn.innerHTML = '<span class="btn-icon">⚡</span> Execute Zero-Trust Pipeline';
+        restoreRunButton(runBtn);
     }
 }
 
@@ -397,7 +619,11 @@ async function calcHomomorphic() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ val1, val2 })
         });
-        const data = await res.json();
+        const data = await readJsonSafe(res);
+        if (!res.ok || !data) {
+            throw new Error(detailText(data, `HTTP ${res.status}`));
+        }
+        setPaillierBits(data.modulus_bits);
         resultBox.classList.remove("hidden");
         resultBox.textContent =
             `[${data.modulus_bits}-bit Paillier PHE]  ` +
@@ -422,9 +648,9 @@ async function calcBFV() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ m1, m2 })
         });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.detail || "BFV calculation error.");
+        const data = await readJsonSafe(res);
+        if (!res.ok || !data) {
+            throw new Error(detailText(data, "BFV calculation error."));
         }
         resultBox.classList.remove("hidden");
         resultBox.textContent =
@@ -438,62 +664,105 @@ async function calcBFV() {
     }
 }
 
+// Per-row failure reason, if the backend sends one (field name tolerant).
+function ledgerRowReason(row) {
+    const r = row.verification_reason ?? row.verify_reason ?? row.failure_reason ?? row.reason ?? row.error ?? row.verification_error;
+    if (r === null || r === undefined || r === "") return "";
+    return typeof r === "string" ? r : JSON.stringify(r);
+}
+
 async function verifyLedger(showBanner = true) {
     const wrap = document.getElementById("ledgerTableWrap");
     const banner = document.getElementById("ledgerStatusBanner");
 
     try {
         const res = await fetch("/api/ledger");
-        const data = await res.json();
+        const data = await readJsonSafe(res);
+        if (!res.ok || !data) {
+            throw new Error(detailText(data, `HTTP ${res.status}`));
+        }
 
         if (showBanner) {
             banner.classList.remove("hidden");
+            banner.classList.toggle("banner-bad", !data.verified);
+            const totalChecked = data.chain_length ?? (data.entries || []).length;
             if (data.verified) {
                 banner.textContent =
-                    `✔ C Enclave Constant-Time HMAC-SHA256 Verified across ${data.entries.length} row(s) using quorum [${(data.quorum_used || []).join(", ")}].`;
+                    `✔ C Enclave Constant-Time HMAC-SHA256 Verified across ${totalChecked} row(s) using quorum [${(data.quorum_used || []).join(", ")}].`;
             } else {
-                banner.textContent = `❌ Ledger Verification Failed: ${data.error || "HMAC mismatch detected!"}`;
+                let failDetail = data.error;
+                if (!failDetail && Array.isArray(data.chain_errors) && data.chain_errors.length > 0) {
+                    const firstErr = data.chain_errors[0];
+                    const reasons = Array.isArray(firstErr.reasons) ? firstErr.reasons.join("; ") : String(firstErr.reasons || "");
+                    failDetail = `Row #${firstErr.id} (${reasons || "chain/HMAC mismatch"})`;
+                }
+                banner.textContent = `❌ Ledger Verification Failed: ${failDetail || "HMAC mismatch detected!"}`;
             }
         }
 
         const entries = data.entries || [];
+        wrap.textContent = "";
         if (entries.length === 0) {
-            wrap.innerHTML = '<p class="placeholder">No sealed transactions in vault_ledger.db yet.</p>';
+            const p = document.createElement("p");
+            p.className = "placeholder";
+            p.textContent = "No sealed transactions in vault_ledger.db yet.";
+            wrap.appendChild(p);
             return;
         }
 
         const table = document.createElement("table");
         table.className = "ledger-table";
-        table.innerHTML = `
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Action</th>
-                    <th>Target</th>
-                    <th>AES-256 Ciphertext</th>
-                    <th>HMAC</th>
-                </tr>
-            </thead>
-        `;
+        const caption = document.createElement("caption");
+        caption.className = "visually-hidden";
+        caption.textContent = "Sealed ledger rows and HMAC verification status";
+        table.appendChild(caption);
+        const thead = document.createElement("thead");
+        const headRow = document.createElement("tr");
+        ["ID", "Action", "Target", "AES-256 Ciphertext", "HMAC"].forEach(label => {
+            const th = document.createElement("th");
+            th.scope = "col";
+            th.textContent = label;
+            headRow.appendChild(th);
+        });
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
         const tbody = document.createElement("tbody");
         entries.forEach(row => {
             const tr = document.createElement("tr");
+            const ct = String(row.ciphertext_hex ?? "");
+            const hm = String(row.hmac_hex ?? "");
             const cols = [
                 `#${row.id}`,
-                row.action,
-                row.target_token,
-                `${row.ciphertext_hex.slice(0, 16)}...`,
-                row.hmac_verified === true ? "✔ VALID" : (row.hmac_verified === false ? "❌ BAD" : `${row.hmac_hex.slice(0, 10)}...`)
+                row.action ?? "",
+                row.target_token ?? "",
+                `${ct.slice(0, 16)}...`
             ];
             cols.forEach(val => {
                 const td = document.createElement("td");
                 td.textContent = val;
                 tr.appendChild(td);
             });
+
+            const hmacTd = document.createElement("td");
+            if (row.hmac_verified === true) {
+                hmacTd.textContent = "✔ VALID";
+            } else if (row.hmac_verified === false) {
+                hmacTd.textContent = "❌ BAD";
+                const reason = ledgerRowReason(row);
+                if (reason) {
+                    const why = document.createElement("span");
+                    why.className = "ledger-reason";
+                    why.textContent = reason;
+                    hmacTd.appendChild(why);
+                }
+            } else {
+                hmacTd.textContent = `${hm.slice(0, 10)}...`;
+            }
+            tr.appendChild(hmacTd);
             tbody.appendChild(tr);
         });
         table.appendChild(tbody);
-        wrap.innerHTML = "";
         wrap.appendChild(table);
     } catch (err) {
         wrap.textContent = `Failed to read ledger: ${err.message}`;

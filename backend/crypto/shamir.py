@@ -7,11 +7,16 @@ Combines:
 2. Publicly verifiable Feldman VSS over RFC 3526 Group 14 (2048-bit MODP Safe Prime P = 2q + 1),
    mathematically bound into C-stack key derivation via K_master = HMAC-SHA256(K_GF256, SHA256(alpha_0))
    so BOTH the 2048-bit Feldman Z_q shares AND the C-stack GF(2^8) shares are required to unseal.
+
+Key handling, stated precisely: by default the 256-bit GF(2^8) key is generated with
+arc4random_buf on the C stack, split and wiped in C (vault_generate_and_split_key); the
+reconstructed key and the AES/HMAC subkeys exist only on the C stack. Shares do pass through
+Python as bytes/hex, and the Feldman secret alpha_0 is a Python int (generated and re-interpolated
+in Python), so a Python heap dump plus k shards is enough to recompute the master key.
 """
 
 import ctypes
 import hashlib
-import os
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,6 +66,15 @@ def _bind_native_functions() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint8),
     ]
     lib.vault_split_secret.restype = ctypes.c_int
+
+    lib.vault_generate_and_split_key.argtypes = [
+        ctypes.c_uint8,
+        ctypes.c_uint8,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.vault_generate_and_split_key.restype = ctypes.c_int
 
     lib.vault_reconstruct_bytes.argtypes = [
         ctypes.POINTER(ctypes.c_uint8),
@@ -122,7 +136,8 @@ class FeldmanVSS:
         if not (1 <= threshold_k <= total_n):
             raise ValueError("Invalid threshold parameters.")
         a0 = secret_int % self.q
-        coeffs = [a0] + [secrets.randbelow(self.q - 1) + 1 for _ in range(threshold_k - 1)]
+        # Higher coefficients are uniform over all of Z_q (including 0), as Shamir's proof requires.
+        coeffs = [a0] + [secrets.randbelow(self.q) for _ in range(threshold_k - 1)]
 
         commitments = [pow(self.g, c, self.p) for c in coeffs]
         shares: List[Tuple[int, int]] = []
@@ -229,34 +244,49 @@ class ShamirSecretSharing:
         if not (1 <= threshold_k <= total_n <= 255):
             raise ValueError("Require 1 <= threshold_k <= total_n <= 255.")
 
-        with NativeBufferGuard(32) as gf_buf, NativeBufferGuard(32) as feldman_buf:
-            raw_source = bytearray(seed_bytes if seed_bytes is not None else os.urandom(32))
-            if len(raw_source) != 32:
-                secure_zero(raw_source)
-                raise ValueError("GF(2^8) key share seed must be 32 bytes (256 bits).")
+        vss_alpha0 = secrets.randbelow(self.vss.q - 1) + 1
+        vss_bundle = self.vss.split_verifiable(vss_alpha0, threshold_k, total_n)
+        shares_flat = (ctypes.c_uint8 * (total_n * 32))()
+        key_commitment = (ctypes.c_uint8 * 32)()
 
-            for i in range(32):
-                gf_buf[i] = raw_source[i]
-            secure_zero(raw_source)
-
-            vss_alpha0 = secrets.randbelow(self.vss.q - 1) + 1
-            vss_bundle = self.vss.split_verifiable(vss_alpha0, threshold_k, total_n)
+        with NativeBufferGuard(32) as feldman_buf:
             self._fill_feldman_component(vss_alpha0, feldman_buf)
 
-            shares_flat = (ctypes.c_uint8 * (total_n * 32))()
-            key_commitment = (ctypes.c_uint8 * 32)()
+            if seed_bytes is None:
+                # Default path: the 256-bit GF(2^8) key is drawn with arc4random_buf on the
+                # C stack, split, committed and wiped inside C; it never enters Python.
+                rc = self.lib.vault_generate_and_split_key(
+                    threshold_k,
+                    total_n,
+                    feldman_buf,
+                    shares_flat,
+                    key_commitment,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"Native vault_generate_and_split_key failed with code {rc}")
+            else:
+                # Deterministic path (explicit seed, e.g. tests): the seed is caller-supplied.
+                with NativeBufferGuard(32) as gf_buf:
+                    raw_source = bytearray(seed_bytes)
+                    if len(raw_source) != 32:
+                        secure_zero(raw_source)
+                        raise ValueError("GF(2^8) key share seed must be 32 bytes (256 bits).")
 
-            rc = self.lib.vault_split_secret(
-                gf_buf,
-                32,
-                threshold_k,
-                total_n,
-                feldman_buf,
-                shares_flat,
-                key_commitment,
-            )
-            if rc != 0:
-                raise RuntimeError(f"Native vault_split_secret failed with code {rc}")
+                    for i in range(32):
+                        gf_buf[i] = raw_source[i]
+                    secure_zero(raw_source)
+
+                    rc = self.lib.vault_split_secret(
+                        gf_buf,
+                        32,
+                        threshold_k,
+                        total_n,
+                        feldman_buf,
+                        shares_flat,
+                        key_commitment,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"Native vault_split_secret failed with code {rc}")
 
         canary_in = (ctypes.c_uint8 * 1)(self.CANARY_SECRET_BYTE)
         canary_out = (ctypes.c_uint8 * total_n)()
@@ -421,6 +451,26 @@ class ShamirSecretSharing:
 
                 alpha_0 = self.vss.interpolate_zero(feld_pts)
                 self._fill_feldman_component(alpha_0, feldman_buf)
+
+                if not (
+                    isinstance(iv_hex, str)
+                    and isinstance(ciphertext_hex, str)
+                    and isinstance(hmac_hex, str)
+                ):
+                    raise ValueError("Ledger hex fields (iv_hex, ciphertext_hex, hmac_hex) must be strings.")
+                hex_chars = frozenset("0123456789abcdefABCDEF")
+                if len(iv_hex) != 32 or not all(ch in hex_chars for ch in iv_hex):
+                    raise ValueError("Invalid AES-CBC IV hex: expected exactly 32 hexadecimal characters (16 bytes).")
+                if len(hmac_hex) != 64 or not all(ch in hex_chars for ch in hmac_hex):
+                    raise ValueError("Invalid HMAC-SHA256 hex: expected exactly 64 hexadecimal characters (32 bytes).")
+                if (
+                    len(ciphertext_hex) < 32
+                    or len(ciphertext_hex) % 32 != 0
+                    or not all(ch in hex_chars for ch in ciphertext_hex)
+                ):
+                    raise ValueError(
+                        "Invalid AES-CBC ciphertext hex: expected a non-empty multiple of 32 hexadecimal characters."
+                    )
 
                 iv_b = bytes.fromhex(iv_hex)
                 ct_b = bytes.fromhex(ciphertext_hex)
