@@ -32,6 +32,10 @@ function escapeHtml(unsafe) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+    const hostBadge = document.getElementById("enclaveHostBadge");
+    if (hostBadge && window.location && window.location.host) {
+        hostBadge.textContent = `${window.location.host} · libvaultcrypto.dylib ACTIVE`;
+    }
     initChart();
     loadScenario("salary");
     detectLiveLLMConfig();
@@ -292,6 +296,22 @@ function prettyBody(body) {
     }
 }
 
+function formatSafeRequestParts(req) {
+    const parts = [];
+    const method = escapeHtml(req.method || "POST");
+    // Defence in depth: never display a key that slipped into the query string.
+    const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
+    parts.push(`<strong class="wire-request-line">${method} ${escapeHtml(shownUrl)}</strong>`);
+    if (req.headers_redacted && typeof req.headers_redacted === "object") {
+        const hdrs = Object.entries(req.headers_redacted)
+            .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
+            .join("\n");
+        if (hdrs) parts.push(`<span class="wire-headers">${hdrs}</span>`);
+    }
+    parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
+    return parts;
+}
+
 // B4: show the request that was actually sent to the provider (no API key),
 // never a made-up endpoint. Returns an HTML string in which every dynamic value
 // is escaped with escapeHtml() before token highlighting.
@@ -302,17 +322,7 @@ function formatSafeHighlightedWire(payload) {
     const parts = [];
 
     if (req && req.url) {
-        const method = escapeHtml(req.method || "POST");
-        // Defence in depth: never display a key that slipped into the query string.
-        const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
-        parts.push(`<strong class="wire-request-line">${method} ${escapeHtml(shownUrl)}</strong>`);
-        if (req.headers_redacted && typeof req.headers_redacted === "object") {
-            const hdrs = Object.entries(req.headers_redacted)
-                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
-                .join("\n");
-            if (hdrs) parts.push(`<span class="wire-headers">${hdrs}</span>`);
-        }
-        parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
+        parts.push(...formatSafeRequestParts(req));
     } else if (req) {
         // Offline engine: backend reports method/url/body = null.
         parts.push('<strong class="wire-local-only">Local only: nothing left this machine</strong>');
@@ -323,6 +333,19 @@ function formatSafeHighlightedWire(payload) {
         // Older backend without actual_request: show only the blinded prompt.
         parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request)</span>');
         parts.push(highlightTokens(escapeHtml(blinded)));
+    }
+    return parts.join("\n\n");
+}
+
+function formatSafeFailedWire(err) {
+    const status = escapeHtml(err.status || 502);
+    const parts = [
+        `<span class="wire-note">Provider returned HTTP ${status}: no answer was used and nothing was sealed. Outbound request sent (API key redacted):</span>`
+    ];
+    if (err.wireRequest && err.wireRequest.url) {
+        parts.push(...formatSafeRequestParts(err.wireRequest));
+    } else {
+        parts.push(highlightTokens(escapeHtml(prettyBody(err.wireRequest))));
     }
     return parts.join("\n\n");
 }
@@ -390,7 +413,11 @@ function renderLeakCheck(payload) {
 
     box.appendChild(head);
     if (lines.length) {
-        box.appendChild(document.createTextNode(lines.join("\n")));
+        box.appendChild(document.createTextNode("\n"));
+        const detail = document.createElement("p");
+        detail.className = "leak-status-detail";
+        detail.textContent = lines.join("\n");
+        box.appendChild(detail);
     }
 }
 
@@ -429,6 +456,14 @@ async function readJsonSafe(res) {
     } catch (_) {
         return null;
     }
+}
+
+function resetTokenMap(container, message = "No active session tokens.") {
+    container.textContent = "";
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = message;
+    container.appendChild(empty);
 }
 
 function restoreRunButton(runBtn) {
@@ -589,6 +624,10 @@ async function runPipeline() {
             });
         }
 
+        if (!mappingTokens.firstChild) {
+            resetTokenMap(mappingTokens, "No sensitive spans detected in this prompt.");
+        }
+
         // Column 3: Vault Topology & C Enclave Receipt
         if (payload.vault_topology) {
             renderVaultTopology(payload.vault_topology);
@@ -615,8 +654,11 @@ async function runPipeline() {
             receiptOutput.textContent = "";
             const head = document.createElement("strong");
             head.textContent = "Enclave blocked the write";
+            const detail = document.createElement("p");
+            detail.textContent = String(payload.enclave_error);
             receiptOutput.appendChild(head);
-            receiptOutput.appendChild(document.createTextNode(String(payload.enclave_error)));
+            receiptOutput.appendChild(document.createTextNode("\n"));
+            receiptOutput.appendChild(detail);
         } else {
             receiptOutput.className = "receipt-content placeholder";
             receiptOutput.textContent = "Read-only query: no privileged Enclave write required.";
@@ -630,10 +672,8 @@ async function runPipeline() {
         latencyBadge.classList.add("hidden");
         if (err.wireRequest && typeof err.wireRequest === "object") {
             wireOutput.className = "wire-code-block";
-            wireOutput.textContent =
-                `// Provider returned HTTP ${err.status || 502}: no answer was used and nothing was sealed.\n` +
-                `// Actual outbound request transmitted (API key redacted):\n\n` +
-                JSON.stringify(err.wireRequest, null, 2);
+            // Safe: formatSafeFailedWire escapes every dynamic value before highlighting tokens.
+            wireOutput.innerHTML = formatSafeFailedWire(err);
         } else {
             wireOutput.className = "wire-code-block placeholder";
             wireOutput.textContent = err.status === 502
@@ -641,6 +681,9 @@ async function runPipeline() {
                 : "No request completed.";
         }
         resetLeakCheck("Leak check: no result");
+        resetTokenMap(mappingTokens);
+        receiptOutput.className = "receipt-content placeholder";
+        receiptOutput.textContent = "No enclave write: request did not complete.";
     } finally {
         restoreRunButton(runBtn);
     }
