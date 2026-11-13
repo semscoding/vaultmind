@@ -1,6 +1,6 @@
 /* VaultMind v2: "instrument sheet" theme.
    One light, cool-neutral page (locked: the dashboard is recorded for a demo video).
-   The only dark surface is the EXTERNAL CLOUD WIRE column: dark = what leaves this machine.
+   The EXTERNAL CLOUD WIRE column is an outbound sheet on warm paper with a solid ink band.
    Shape rule: controls and inner boxes 6px radius, panels 8px. No glows, no glass. */
 :root {
     color-scheme: light;
@@ -332,7 +332,7 @@ select:hover, input:hover, textarea:hover { border-color: var(--ink-2); }
     gap: 0.75rem;
 }
 
-/* The untrusted wire: the one dark surface on the page */
+/* The untrusted wire: warm outbound document set apart from the cool local panels */
 .wire-panel {
     background: var(--wire-bg);
     border-color: var(--wire-border);
@@ -393,19 +393,19 @@ textarea#promptInput {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    gap: 0.75rem;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.75rem;
 }
 
 .box-title .secure-tag {
     min-width: 0;
+    margin-left: auto;
     white-space: normal;
     text-align: right;
     overflow-wrap: anywhere;
 }
 
 .box-title h3, .wire-header h3 {
-    flex: none;
-    max-width: 70%;
     font-size: 0.8125rem;
     font-weight: 600;
     color: var(--ink-2);
@@ -558,11 +558,11 @@ button { font-family: inherit; }
     font-size: 0.8125rem;
     line-height: 1.5;
     color: var(--wire-ink-2);
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
     max-width: 62ch;
 }
 .leak-status strong { display: block; font-weight: 650; color: var(--wire-ink); }
+.leak-status-detail { white-space: pre-wrap; }
 /* Only a real leak earns a filled block. */
 .leak-status.leak-bad {
     background: var(--bad-soft);
@@ -1017,6 +1017,12 @@ select:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 
 /* ---------- Responsive ---------- */
+@media (min-width: 1101px) and (max-width: 1380px) {
+    .node-card { grid-template-columns: 0.75rem auto minmax(0, 1fr) auto; row-gap: 0.15rem; }
+    .node-fp { grid-column: 2 / 4; grid-row: 2; }
+    .node-card .btn-corrupt { grid-column: 4; grid-row: 1 / span 2; }
+}
+
 @media (max-width: 1240px) {
     .telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .telemetry-item:nth-child(3) { border-left: 0; padding-left: 0; }
