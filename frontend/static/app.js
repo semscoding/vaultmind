@@ -1,5 +1,18 @@
 // VaultMind v2 Zero-Trust Frontend Controller (Strict XSS-Safe DOM Handling)
 let shamirChart = null;
+// Last known VSS state per node index, so a node that has just been rejected can be marked once.
+const lastNodeValid = {};
+const REDUCED_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Chart colours mirror the CSS tokens in style.css (ink, ok, bad).
+const CHART_COLORS = {
+    curve: "#3D4553",
+    ok: "#0B6E37",
+    bad: "#B42318",
+    ring: "#FCFCFD",
+    tick: "#555E6D",
+    grid: "rgba(18, 22, 29, 0.08)"
+};
 
 const SCENARIOS = {
     salary: "Evaluate a 15% annual bonus for employee Marcus Vance (salary: $130,000, rating: 4.9) and commit to database with master key.",
@@ -62,29 +75,30 @@ function initChart() {
                 {
                     label: "GF(2⁸) Interpolated Polynomial f(x)",
                     data: [],
-                    borderColor: "#8B5CF6",
-                    borderWidth: 2,
+                    borderColor: CHART_COLORS.curve,
+                    borderWidth: 1.5,
                     tension: 0.25,
-                    pointBackgroundColor: "#8B5CF6",
-                    pointRadius: 3,
+                    pointBackgroundColor: CHART_COLORS.curve,
+                    pointRadius: 2.5,
                     fill: false
                 },
                 {
                     label: "Feldman VSS Verified Shards",
                     data: [],
-                    pointBackgroundColor: "#10B981",
-                    pointBorderColor: "#FFFFFF",
+                    pointBackgroundColor: CHART_COLORS.ok,
+                    pointBorderColor: CHART_COLORS.ring,
+                    pointBorderWidth: 2,
                     pointRadius: 6,
                     showLine: false
                 },
                 {
                     label: "Tampered / Rejected Shards",
                     data: [],
-                    pointBackgroundColor: "#EF4444",
-                    pointBorderColor: "#FFFFFF",
+                    pointBackgroundColor: CHART_COLORS.bad,
+                    pointBorderColor: CHART_COLORS.bad,
                     pointStyle: "crossRot",
                     pointRadius: 8,
-                    pointBorderWidth: 2,
+                    pointBorderWidth: 2.5,
                     showLine: false
                 }
             ]
@@ -92,6 +106,7 @@ function initChart() {
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            animation: REDUCED_MOTION ? false : { duration: 250 },
             plugins: {
                 legend: { display: false },
                 tooltip: {
@@ -105,14 +120,14 @@ function initChart() {
                     type: "linear",
                     min: 0,
                     max: 5,
-                    ticks: { stepSize: 1, color: "#7C8BA1" },
-                    grid: { color: "rgba(255, 255, 255, 0.05)" }
+                    ticks: { stepSize: 1, color: CHART_COLORS.tick, font: { size: 12 } },
+                    grid: { color: CHART_COLORS.grid }
                 },
                 y: {
                     min: 0,
                     max: 260,
-                    ticks: { color: "#7C8BA1" },
-                    grid: { color: "rgba(255, 255, 255, 0.05)" }
+                    ticks: { color: CHART_COLORS.tick, font: { size: 12 } },
+                    grid: { color: CHART_COLORS.grid }
                 }
             }
         }
@@ -153,29 +168,35 @@ function renderVaultTopology(vaultData) {
         let cls = "node-card";
         if (!node.vss_valid) cls += " tampered";
         else if (node.status === "QUORUM_ACTIVE") cls += " quorum-active";
+        // Mark a shard that was valid on the previous render and is now rejected (one short jolt).
+        if (!node.vss_valid && lastNodeValid[node.index] === true && !REDUCED_MOTION) cls += " just-rejected";
+        lastNodeValid[node.index] = !!node.vss_valid;
         card.className = cls;
 
         const dot = document.createElement("span");
         dot.className = "node-status-dot";
+        dot.setAttribute("aria-hidden", "true");
 
+        const nodeName = `node-0${node.index}`;
         const title = document.createElement("strong");
-        title.textContent = `node-0${node.index}`;
+        title.textContent = nodeName;
 
         const stateSpan = document.createElement("span");
-        stateSpan.style.color = !node.vss_valid
-            ? "var(--red-text)"
-            : (node.status === "QUORUM_ACTIVE" ? "var(--green-accent)" : "var(--text-muted)");
+        stateSpan.className = "node-state";
         stateSpan.textContent = !node.vss_valid
             ? "TAMPERED"
             : (node.status === "QUORUM_ACTIVE" ? "QUORUM" : "VSS OK");
 
         const fpSpan = document.createElement("span");
-        fpSpan.style.color = "var(--purple-text)";
+        fpSpan.className = "node-fp";
         fpSpan.textContent = `#${node.fingerprint}`;
 
         const corruptBtn = document.createElement("button");
+        corruptBtn.type = "button";
         corruptBtn.className = "btn-corrupt";
-        corruptBtn.textContent = "⚡ Corrupt";
+        corruptBtn.textContent = "Corrupt";
+        // Visible label stays "Corrupt"; the accessible name also says which node.
+        corruptBtn.setAttribute("aria-label", `Corrupt ${nodeName}`);
         corruptBtn.onclick = () => tamperNode(node.index);
 
         card.appendChild(dot);
@@ -395,13 +416,7 @@ async function readJsonSafe(res) {
 function restoreRunButton(runBtn) {
     runBtn.disabled = false;
     runBtn.removeAttribute("aria-busy");
-    runBtn.textContent = "";
-    const icon = document.createElement("span");
-    icon.className = "btn-icon";
-    icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "⚡";
-    runBtn.appendChild(icon);
-    runBtn.appendChild(document.createTextNode(" Execute Zero-Trust Pipeline"));
+    runBtn.textContent = "Execute Zero-Trust Pipeline";
 }
 
 async function runPipeline() {
@@ -424,7 +439,7 @@ async function runPipeline() {
 
     runBtn.disabled = true;
     runBtn.setAttribute("aria-busy", "true");
-    runBtn.textContent = "⏳ Running C Enclave, Paillier & RLWE-BFV...";
+    runBtn.textContent = "Running C Enclave, Paillier & RLWE-BFV...";
     decryptedOutput.className = "content-output placeholder";
     decryptedOutput.textContent = "Blinding sensitive spans, running Paillier PHE / C RLWE-BFV (leveled, depth 1), and verifying 2048-bit Feldman shards...";
     fheBanner.classList.add("hidden");
@@ -512,7 +527,7 @@ async function runPipeline() {
                 .join("  |  ");
             const eng = payload.fhe_computation.engine || "Homomorphic engine";
             fheBanner.textContent =
-                `🧮 [${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
+                `[${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
             fheBanner.classList.remove("hidden");
         }
 
@@ -577,7 +592,7 @@ async function runPipeline() {
                 `C_ZEROIZE:   ${r.c_enclave_zeroize}`
             ].join("\n");
         } else if (payload.enclave_error) {
-            receiptOutput.className = "receipt-content";
+            receiptOutput.className = "receipt-content receipt-blocked";
             receiptOutput.textContent = `❌ ENCLAVE BLOCKED:\n${payload.enclave_error}`;
         } else {
             receiptOutput.className = "receipt-content placeholder";
