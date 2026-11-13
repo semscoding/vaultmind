@@ -271,7 +271,7 @@ def _value_occurs(value: str, text: str) -> bool:
     v = unicodedata.normalize("NFC", value).strip()
     if not v:
         return False
-    norm_text = unicodedata.normalize("NFC", text)
+    norm_text = text if unicodedata.is_normalized("NFC", text) else unicodedata.normalize("NFC", text)
     pat = re.escape(v)
     if re.match(r"\w", v[0]):
         pat = r"(?<!\w)" + pat
@@ -323,6 +323,11 @@ class BlindTokenizer:
                 quoted = offset < 2
                 start = m.start(idx) - (1 if quoted else 0)
                 end = m.end(idx) + (1 if quoted else 0)
+                if not quoted:
+                    # A "!" glued to an unquoted value is far more often the last character of the
+                    # password than sentence punctuation, so it is sealed with it (fail closed).
+                    while end < len(m.string) and m.string[end] == "!":
+                        val, end = val + "!", end + 1
                 return SpanMatch(start, end, "SECRET", val, priority=priority, unseal_value=val)
         raise ValueError("no value group matched")
 
@@ -430,7 +435,7 @@ class BlindTokenizer:
             prompt,
         ):
             val, end = m.group(1), m.end(1)
-            while len(val) > 1 and val[-1] in ".!?" and (end >= len(prompt) or prompt[end].isspace()):
+            while len(val) > 1 and val[-1] in ".?" and (end >= len(prompt) or prompt[end].isspace()):
                 val, end = val[:-1], end - 1
             if val.upper() in ALNUM_STOPLIST or _TECH_CODE_RE.fullmatch(val.upper()):
                 continue
@@ -453,7 +458,7 @@ class BlindTokenizer:
             prompt,
         ):
             val, end = m.group(1), m.end(1)
-            while len(val) > 1 and val[-1] in ".!?" and (end >= len(prompt) or prompt[end].isspace()):
+            while len(val) > 1 and val[-1] in ".?" and (end >= len(prompt) or prompt[end].isspace()):
                 val, end = val[:-1], end - 1
             candidates.append(SpanMatch(m.start(1), end, "SECRET", val, priority=1, unseal_value=val))
 
@@ -767,7 +772,10 @@ class BlindTokenizer:
 
         # B1: secrets are compared NOW (at blinding time) and only the count is kept.
         scan_text = _TOKEN_STRIP_RE.sub(" ", blinded)
-        ctx.residual_secret_matches = sum(1 for v in secret_values_for_scan if _value_occurs(v, scan_text))
+        scan_text = unicodedata.normalize("NFC", scan_text)
+        occurs = {v: _value_occurs(v, scan_text) for v in set(secret_values_for_scan)}
+        ctx.residual_secret_matches = sum(1 for v in secret_values_for_scan if occurs[v])
+        occurs.clear()
         secret_values_for_scan.clear()
         return blinded, ctx
 
@@ -874,8 +882,7 @@ class BlindTokenizer:
                 if include_secrets:
                     replacement = self.secret_vault.unseal(blob)
                 else:
-                    # Verify C-vault HMAC integrity without exposing the raw secret in output.
-                    _ = self.secret_vault.unseal(blob)
+                    # Redaction never decrypts: the plaintext must not be recreated on the Python heap.
                     replacement = f"[REDACTED:{sec_token}]"
                 cleaned = cleaned.replace(sec_token, replacement)
 

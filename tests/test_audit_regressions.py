@@ -453,6 +453,39 @@ class TestPipelineRegressions(unittest.TestCase):
                 self.assertNotIn("[LOC_", blinded)
                 self.assertEqual(len(ctx.sealed_secrets), 0)
 
+    def test_trailing_exclamation_mark_is_sealed_with_the_password(self):
+        """S-6c: "Welkom2026!" must not leave the "!" outside the token."""
+        tok: BlindTokenizer = self.pipe.tokenizer
+        for prompt in [
+            "Het wachtwoord is Welkom2026!",
+            "Password reset: TempPass123!",
+            "password is not-my-real-one!",
+            "login with password Hunter2Geheim! now",
+        ]:
+            with self.subTest(prompt=prompt):
+                blinded, ctx = tok.blind_prompt(prompt)
+                self.assertNotIn("]!", blinded)
+                self.assertTrue(any(tok.secret_vault.unseal(b).endswith("!") for b in ctx.sealed_secrets.values()))
+
+    def test_redacted_echo_never_decrypts_the_secret(self):
+        """S-6b: redacting an echoed [SECRET_…] token must not call unseal()."""
+        tok: BlindTokenizer = self.pipe.tokenizer
+        blinded, ctx = tok.blind_prompt("password is Tr0ub4dor&3")
+        token = next(iter(ctx.sealed_secrets))
+        with mock.patch.object(tok.secret_vault, "unseal", side_effect=AssertionError("unseal called")):
+            out = tok.unblind_response(f"echo {token}", ctx)
+        self.assertEqual(out, f"echo [REDACTED:{token}]")
+
+    def test_large_prompt_with_many_secrets_stays_fast(self):
+        """S-6d: the residual scan is linear in the number of distinct secret values."""
+        import time as _time
+
+        tok: BlindTokenizer = self.pipe.tokenizer
+        prompt = ("password: 'x' " * 4700)[:65536]
+        started = _time.perf_counter()
+        tok.blind_prompt(prompt)
+        self.assertLess(_time.perf_counter() - started, 1.5)
+
 
 class TestConcurrencyAndMigrationRegressions(unittest.TestCase):
     def test_concurrent_enclave_seals_succeed_with_valid_hash_chain(self):
@@ -743,6 +776,8 @@ class TestAuditRound5Regressions(unittest.TestCase):
             {"Origin": "http://evil.example:8000"},
             {"Origin": "null"},
             {"Origin": "http://[::1"},
+            {"Origin": "http://localhost:3000"},
+            {"Origin": "http://127.0.0.1:8000"},
             {"Sec-Fetch-Site": "cross-site"},
         ]:
             with self.subTest(headers=bad_headers):
@@ -751,7 +786,7 @@ class TestAuditRound5Regressions(unittest.TestCase):
 
         ok = client.post(
             "/api/restore-nodes",
-            headers={"Origin": "http://127.0.0.1:8000", "Sec-Fetch-Site": "same-origin"},
+            headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
         )
         self.assertEqual(ok.status_code, 200)
 

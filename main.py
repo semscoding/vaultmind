@@ -48,7 +48,15 @@ async def reject_cross_origin_mutations(request: Request, call_next):
             has_extra_parts = bool(
                 parsed.username or parsed.password or parsed.path or parsed.params or parsed.query or parsed.fragment
             )
-            if scheme not in ("http", "https") or hostname not in ALLOWED_LOOPBACK_HOSTS or has_extra_parts:
+            # Same-origin means the Origin's host:port equals the Host header of this request, so
+            # another local app on a different port (http://localhost:3000) is rejected too.
+            same_host_port = parsed.netloc.lower() == (request.headers.get("host") or "").strip().lower()
+            if (
+                scheme not in ("http", "https")
+                or hostname not in ALLOWED_LOOPBACK_HOSTS
+                or has_extra_parts
+                or not same_host_port
+            ):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Cross-origin requests to the loopback API are forbidden."},

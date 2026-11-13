@@ -197,7 +197,7 @@ All commands run from the repository root with the venv active. Test names refer
 | Concurrent ledger writes preserve hash-chain integrity | `test_concurrent_enclave_seals_succeed_with_valid_hash_chain` |
 | Decimal DoS/underflow bounds, echoed-secret redaction, canonical AAD & CSRF guard | `TestAuditRound5Regressions` (`test_audit_regressions.py`) |
 | Dashboard makes no external requests | `grep -nE "https?://" frontend/static/index.html` → no output (Chart.js is in `frontend/static/vendor/`) |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 44 tests, OK |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 47 tests, OK |
 
 ---
 
@@ -205,6 +205,7 @@ All commands run from the repository root with the venv active. Test names refer
 
 - **Blinding is heuristic (regex-based).** Not detected: lower-case names (`jan jansen`), single first names without a role word (`Sem`, `Maria`), bare integers below 10, percentages, street names and cities without a label, company names made only of common business words (`Cloud Reserve`, `Master Audit`), and secrets without a label or a recognisable pattern. After a label such as `password` or `sleutel`, a value is sealed when it looks like a credential (digit mixed with letters, a symbol, or three or more hyphen-joined parts); a plain-word value after a policy word or an indefinite article (`a password is never shared`) is treated as prose and left alone. Wrap such secrets in `<secret>…</secret>`. The residual scan cannot flag what was never detected.
 - **Shares and $\alpha_0$ pass through Python** (see §3.7). The claim is limited to the reconstructed key and subkeys.
+- **Sealed secrets are never put back into the output.** If the model echoes a `[SECRET_…]` token, the local answer shows `[REDACTED:[SECRET_…]]`; names, IBANs and amounts are restored, secrets are not, and redaction does not decrypt them.
 - **Locally, plaintext is kept for unblinding and display.** The token map, the plaintext numbers and the local audit trail (`original_prompt` redacted of secrets, token table) contain names and amounts. `SECRET` spans are never stored in token maps, logs, audit trails, or `unblinded_result` (though the caller's immutable input `prompt: str` and regex slices exist transiently on the Python heap until garbage-collected).
 - **BFV security is approximate:** uniform ternary errors instead of $\sigma \approx 3.2$; no lattice-estimator run.
 - **BFV is not constant-time:** `bfv_poly_mul_exact` skips zero coefficients of its first argument, which can be the secret key or the encryption randomness.
@@ -232,7 +233,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (44 tests)
+# Run the test suite (47 tests)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -259,5 +260,5 @@ vaultmind/
 ├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / offline engine)
 ├── services/      # pipeline_service.py and enclave_service.py
 ├── monitoring/    # telemetry.py
-└── tests/         # test_security_audit.py and test_audit_regressions.py (44 tests)
+└── tests/         # test_security_audit.py and test_audit_regressions.py (47 tests)
 ```

@@ -116,7 +116,7 @@ cd /Users/sem/.gemini/antigravity/scratch/vaultmind
 ./venv/bin/python3 backend/native/build.py
 nm -u backend/native/libvaultcrypto.dylib | grep memset_s
 
-# 2. Full test suite: 44 tests
+# 2. Full test suite: 47 tests
 ./venv/bin/python3 -m unittest discover -s tests -v
 
 # 3. Smoke-test the TUI
@@ -164,4 +164,4 @@ Peer-review verification (`T-378`) + follow-up fixes on `claude/victory-audit-fi
 - **Echoed `[SECRET_…]` exfiltration block (`llm_client.py`, `blind_tokenizer.py`):** `SYSTEM_PROMPT` forbids echoing `[SECRET_XXXX]`, and `unblind_response()` keeps echoed secret tokens redacted (`[REDACTED:[SECRET_…]]`) by default unless `include_secrets=True`.
 - **Canonical ledger AAD & strict hex validation (`enclave_service.py`, `ledger.py`, `shamir.py`):** replaced colon-delimited AAD with canonical JSON `[seq, prev_hash, action, target]` (auto-migrating pre-v4 tables via `PRAGMA user_version = 4`), checked `ALLOWED_ACTIONS` during verification, and rejected short/malformed hex strings before `ctypes` buffer packing.
 - **Tokenizer hardening & O(L) regexes (`blind_tokenizer.py`):** added Unicode NFC normalization, a linear depth-tracking `<secret>` parser (whitespace & nested tags), escaped quotes, mid-word apostrophes in single quotes, mid-token `,`/`;` preservation, partitioned `O(L)` lookaheads eliminating `O(L^2)` ReDoS, and a 65,536-char prompt cap.
-- **Build & loopback CSRF guards (`zeroize.py`, `main.py`, `vaultcrypto.c`):** `load_native_lib()` rebuilds when `vaultcrypto.c` is newer than `libvaultcrypto.dylib`; HTTP middleware blocks cross-origin/cross-site browser `POST`s (`403`); `reconstruct_bytes_internal` rejects `k > 255` upfront. Suite: 44 tests, OK.
+- **Build & loopback CSRF guards (`zeroize.py`, `main.py`, `vaultcrypto.c`):** `load_native_lib()` rebuilds when `vaultcrypto.c` is newer than `libvaultcrypto.dylib`; HTTP middleware blocks cross-origin/cross-site browser `POST`s (`403`); `reconstruct_bytes_internal` rejects `k > 255` upfront. Suite: 47 tests, OK.
