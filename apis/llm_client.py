@@ -5,6 +5,8 @@ External Cloud LLM API Connectors:
 - AWS Bedrock Converse API (`AWS_BEARER_TOKEN_BEDROCK`); default model
   `amazon.nova-lite-v1:0` (Amazon Nova Lite), override with `AWS_BEDROCK_MODEL_ID`
   (e.g. a Claude model ID enabled in your Bedrock account)
+- Anthropic Messages API (`ANTHROPIC_API_KEY`); default model `claude-haiku-5-5`,
+  override with `ANTHROPIC_MODEL`
 - Offline Deterministic Zero-Knowledge Engine (air-gapped fallback / CI testing)
 
 Every result carries `wire_request`: the request that actually left this machine
@@ -79,6 +81,7 @@ INSTRUCTIONS:
    - Sum of two encrypted numbers: emit "fhe_compute": {"op": "ADD", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_SUM] in your summary.
    - Non-linear product of two encrypted integers (e.g. hours * rate or units * price): emit "fhe_compute": {"op": "BFV_MULTIPLY", "ref_a": "[FHE_NUM_1]", "ref_b": "[FHE_NUM_2]"} and reference [FHE_COMPUTED_PRODUCT] in your summary.
 3. If the prompt requests committing, updating, authorizing, transferring, or storing privileged data, emit "action_intent" with action in ["GRANT_COMPLIANCE_BONUS", "UPDATE_EHR_LEDGER", "TRANSFER_EXECUTE", "DB_WRITE_RECORD"].
+   Emitting "action_intent" is a proposal, not the action itself: the local enclave validates it against its whitelist and executes it with its own key quorum. You never need a key to propose it, so always emit it when such a change is requested, even though you hold no key shares.
 
 Always include one fenced ```json block at the end of your response using this schema:
 ```json
@@ -95,6 +98,27 @@ Set "fhe_compute" or "action_intent" to null if not needed.
 """
 
 
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"
+ANTHROPIC_PLAN_TOOL = {
+    "name": "emit_plan",
+    "description": (
+        "Return your answer for the client: a concise summary over the blinded tokens, plus the "
+        "optional homomorphic computation and the optional privileged action, exactly as specified "
+        "in the system prompt. Use null for a part that is not needed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Concise reasoning over the blinded tokens."},
+            "fhe_compute": {"type": ["object", "null"], "description": "Homomorphic operation or null."},
+            "action_intent": {"type": ["object", "null"], "description": "Privileged action or null."},
+        },
+        "required": ["summary", "fhe_compute", "action_intent"],
+    },
+}
+_MASKED_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{0,24}\*{4,}[A-Za-z0-9_\-*]{0,160}")
+
+
 class LLMClient:
     @staticmethod
     def get_env_config() -> Dict[str, Any]:
@@ -103,6 +127,7 @@ class LLMClient:
         has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
         has_openai = bool(os.getenv("OPENAI_API_KEY", "").strip())
         has_bedrock = bool(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip())
+        has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
 
         if has_gemini:
             recommended = "gemini"
@@ -110,6 +135,8 @@ class LLMClient:
             recommended = "openai"
         elif has_bedrock:
             recommended = "bedrock"
+        elif has_anthropic:
+            recommended = "anthropic"
         else:
             recommended = "simulation"
 
@@ -117,7 +144,9 @@ class LLMClient:
             "gemini_configured": has_gemini,
             "openai_configured": has_openai,
             "bedrock_configured": has_bedrock,
-            "any_live_configured": has_gemini or has_openai or has_bedrock,
+            "anthropic_configured": has_anthropic,
+            "anthropic_model": os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+            "any_live_configured": has_gemini or has_openai or has_bedrock or has_anthropic,
             "recommended_default": recommended,
             "bedrock_region": os.getenv("AWS_REGION", "us-east-1"),
             "bedrock_model": os.getenv("AWS_BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
@@ -135,12 +164,37 @@ class LLMClient:
         if mode == "auto":
             if api_key and api_key.startswith("AIza"):
                 mode = "gemini"
+            elif api_key and api_key.startswith("sk-ant-"):
+                mode = "anthropic"  # must be tested before the generic OpenAI "sk-" prefix
             elif api_key and api_key.startswith("sk-"):
                 mode = "openai"
             elif api_key and api_key.startswith("ABSK"):
                 mode = "bedrock"
             else:
                 mode = self.get_env_config()["recommended_default"]
+
+        if mode == "anthropic":
+            key = (api_key or os.getenv("ANTHROPIC_API_KEY") or "").strip()
+            if not key:
+                raise ValueError(
+                    "Anthropic selected, but no ANTHROPIC_API_KEY was provided in the UI or `.env`."
+                )
+            return await self._call_anthropic(blinded_prompt, key)
+
+        # Never send a credential to a provider it does not belong to: an Anthropic key in the
+        # Gemini/OpenAI/Bedrock slot is refused locally instead of being posted to that provider.
+        if mode in ("gemini", "openai", "bedrock"):
+            wrong_slot = {
+                "gemini": "GEMINI_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+            }[mode]
+            candidate = (api_key or os.getenv(wrong_slot) or "").strip()
+            if candidate.startswith("sk-ant-"):
+                raise ValueError(
+                    f"The key configured for {mode} looks like an Anthropic key (sk-ant-…). It was NOT sent. "
+                    "Put it in ANTHROPIC_API_KEY and select Anthropic, or use a key for the selected provider."
+                )
 
         if mode == "gemini":
             key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -184,7 +238,10 @@ class LLMClient:
         text = str(text)
         if secret:
             text = text.replace(secret, "<redacted>")
-        return text
+        # Providers echo a partially masked key in auth errors ("sk-abc*********wxyz"). The exact
+        # replacement above cannot catch that, so any run of asterisks with key-like characters
+        # around it is removed as well.
+        return _MASKED_KEY_RE.sub("<redacted>", text)
 
     async def _post_json(self, label: str, url: str, headers: Dict[str, str],
                          payload: Dict[str, Any], secret: str,
@@ -294,6 +351,64 @@ class LLMClient:
             ) from None
         result = self._parse_structured_output(
             text, provider_label="OpenAI GPT-4o-mini (Live Cloud API)", is_live=True
+        )
+        result["wire_request"] = wire
+        return result
+
+    async def _call_anthropic(self, blinded_prompt: str, api_key: str) -> Dict[str, Any]:
+        model_id = (os.getenv("ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL).strip()
+        label = f"Anthropic ({model_id})"
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_id,
+            "max_tokens": 1024,
+            # No `temperature`: current Claude models reject the parameter as deprecated.
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": blinded_prompt}],
+            # The plan is requested as a forced tool call, so the structured part cannot be
+            # omitted or malformed the way a free-text JSON block can (temperature is not settable).
+            "tools": [ANTHROPIC_PLAN_TOOL],
+            "tool_choice": {"type": "tool", "name": ANTHROPIC_PLAN_TOOL["name"]},
+        }
+        wire = self._wire_request(url, headers, payload, "x-api-key")
+        data = await self._post_json(label, url, headers, payload, api_key, wire)
+        try:
+            blocks = data["content"]
+            plan = next(
+                (
+                    b.get("input")
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == ANTHROPIC_PLAN_TOOL["name"]
+                ),
+                None,
+            )
+            if isinstance(plan, dict):
+                summary = plan.get("summary")
+                summary = summary if isinstance(summary, str) else ""
+                structured = {
+                    "fhe_compute": plan.get("fhe_compute"),
+                    "action_intent": plan.get("action_intent"),
+                }
+                # Re-use the one validated parser: the tool input is untrusted model output too.
+                text = f"{summary}\n```json\n{json.dumps(structured)}\n```"
+            else:
+                text = "".join(
+                    b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text" and "text" in b
+                )
+            if not text.strip():
+                raise TypeError(f"empty content (stop_reason={data.get('stop_reason')})")
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise LLMProviderError(
+                f"{label}: unusable response ({type(exc).__name__}: {self._scrub(exc, api_key)[:160]}).",
+                wire_request=wire,
+            ) from None
+        result = self._parse_structured_output(
+            text, provider_label=f"Anthropic ({model_id} Live Cloud API)", is_live=True
         )
         result["wire_request"] = wire
         return result

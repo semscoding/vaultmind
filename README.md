@@ -6,7 +6,7 @@
 > **Stack:** Python 3 (FastAPI loopback dashboard, Rich TUI, cloud LLM adapters) + compiled C11 (`libvaultcrypto.dylib`, built with `clang` against Apple CommonCrypto).
 > **Platform:** macOS only (Apple CommonCrypto + `arc4random_buf`).
 
-VaultMind lets a cloud LLM (Gemini, OpenAI or AWS Bedrock) plan actions on enterprise prompts without seeing the names, account numbers, passwords or amounts in them, and without ever holding a share of the master key. Sensitive spans are replaced by tokens or ciphertext handles before the request leaves the machine. Privileged actions are sealed into an encrypted, hash-chained ledger by a C enclave that reconstructs the master key from a $k=3$ of $n=5$ quorum on the C stack and wipes it after each seal.
+VaultMind lets a cloud LLM (Gemini, OpenAI, AWS Bedrock or Anthropic) plan actions on enterprise prompts without seeing the names, account numbers, passwords or amounts in them, and without ever holding a share of the master key. Sensitive spans are replaced by tokens or ciphertext handles before the request leaves the machine. Privileged actions are sealed into an encrypted, hash-chained ledger by a C enclave that reconstructs the master key from a $k=3$ of $n=5$ quorum on the C stack and wipes it after each seal.
 
 ---
 
@@ -219,7 +219,7 @@ All commands run from the repository root with the venv active. Test names refer
 | Evaluator restart, fallback and manipulated answers | `test_killed_worker_is_restarted`, `test_fallback_when_worker_cannot_start`, `test_hanging_worker_times_out_and_falls_back`, `test_manipulated_responses_fail_cleanly` |
 | List-based blinding of names, addresses, places and cued organisations | `test_lowercase_full_names_after_a_person_cue`, `test_single_first_names`, `test_addresses_and_places`, `test_cued_organisations_keep_the_cue_word_in_clear`, `test_ambiguous_names_need_extra_evidence` |
 | Ordinary prose stays unchanged; hostile inputs stay fast | `test_ordinary_prose_is_unchanged`, `test_hostile_inputs_finish_within_one_second` |
-| Whole suite | `python3 -m unittest discover -s tests -v` → 92 tests, OK (about 20 s) |
+| Whole suite | `python3 -m unittest discover -s tests -v` → 102 tests, OK (about 20 s) |
 
 ---
 
@@ -237,7 +237,8 @@ All commands run from the repository root with the venv active. Test names refer
 - **Ledger:** truncation of the newest rows is only detectable against an externally stored `chain_head_hash`; `created_at` and `quorum_nodes` are not authenticated.
 - **Shard storage:** all shards (JSON and `.gfshare`) are on one disk, plus the demo backup copy in `.demo_clean_shards/`. The $\mathbb{F}_{2^8}$ share digest in `manifest.json` is an unkeyed SHA-256; integrity of that half ultimately rests on the key commitment checked in C.
 - **macOS only** (CommonCrypto, `arc4random_buf`).
-- **Live cloud path:** request bodies and error handling are tested with mocked HTTP responses only; the live Gemini, OpenAI and Bedrock calls have not yet been run with real keys.
+- **Provider keys:** a key that looks like an Anthropic key (`sk-ant-…`) is refused locally when it sits in the Gemini, OpenAI or Bedrock slot, so it is not posted to the wrong provider; other mix-ups are not detected. Provider error messages are scrubbed of the key and of partially masked echoes of it.
+- **Live cloud path:** the Anthropic path was run live on 13 Nov 2026 (`claude-haiku-5-5`): 20 preset runs out of 20 returned the expected amounts and an enclave action, plus failover with a corrupted shard, the refusal with three corrupted shards, and a typed prompt with a `<secret>` tag. The Gemini, OpenAI and Bedrock paths are tested with mocked HTTP responses only and have not been run with real keys. Model output varies between runs: Anthropic returns its plan through a forced tool call, the other providers through a JSON block that a model can omit, in which case nothing is executed and a warning is shown.
 - **No API authentication** on the loopback server.
 
 ---
@@ -256,7 +257,7 @@ pip install -r requirements.txt
 # Optional: compile the C library explicitly (it is also built automatically on first import)
 python3 backend/native/build.py
 
-# Run the test suite (92 tests, about 20 s)
+# Run the test suite (102 tests, about 20 s)
 python3 -m unittest discover -s tests -v
 
 # Optional: live cloud provider (otherwise the offline engine is used; nothing leaves the machine)
@@ -280,9 +281,9 @@ vaultmind/
 │   ├── native/    # vaultcrypto.c (GF(2^8) Shamir, share files, enclave seal/unseal, session vault, RLWE-BFV) and build.py
 │   └── crypto/    # shamir.py (Feldman VSS + ctypes), homomorphic.py (Paillier), bfv_fhe.py, blind_tokenizer.py, gazetteer.py (name/place lists), zeroize.py
 ├── database/      # schema.sql and ledger.py (hash-chained sealed ledger)
-├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / offline engine)
+├── apis/          # routes.py (FastAPI) and llm_client.py (Gemini / OpenAI / Bedrock / Anthropic / offline engine)
 ├── services/      # pipeline_service.py, enclave_service.py and evaluator_worker.py (separate evaluator process)
 ├── monitoring/    # telemetry.py
 └── tests/         # test_security_audit.py, test_audit_regressions.py, test_c_share_files.py,
-                   # test_evaluator_process.py, test_blinding_gazetteer.py (92 tests)
+                   # test_evaluator_process.py, test_blinding_gazetteer.py, test_anthropic_provider.py (102 tests)
 ```
