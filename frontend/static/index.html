@@ -3,35 +3,41 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VaultMind v2 | Native C Enclave &amp; Zero-Knowledge AI Pipeline</title>
+    <meta name="color-scheme" content="light">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23FCFCFD'/%3E%3Ccircle cx='16' cy='16' r='11.5' fill='none' stroke='%2312161D' stroke-width='1.8'/%3E%3Ccircle cx='16' cy='4.5' r='3' fill='%2312161D'/%3E%3Ccircle cx='26.9' cy='12.4' r='3' fill='%2312161D'/%3E%3Ccircle cx='22.8' cy='25.3' r='3' fill='%2312161D'/%3E%3Ccircle cx='9.2' cy='25.3' r='3' fill='%23FCFCFD' stroke='%2312161D' stroke-width='1.6'/%3E%3Ccircle cx='5.1' cy='12.4' r='3' fill='%23FCFCFD' stroke='%2312161D' stroke-width='1.6'/%3E%3C/svg%3E">
+    <title>VaultMind v2 | Native C Enclave &amp; Blinded AI Pipeline</title>
     <!-- No external requests: Chart.js is vendored locally, fonts use the system stack. -->
     <script src="/static/vendor/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+    <a class="skip-link" href="#workspace">Skip to workspace</a>
+
     <header class="app-header">
-        <div class="header-left">
-            <div class="logo-mark">
-                <span class="logo-icon" aria-hidden="true">🛡️</span>
-                <div class="logo-text">
-                    <h1>VaultMind <span class="v-tag">v2</span></h1>
-                    <span class="sub-badge">Native C Enclave • 2048-bit Feldman VSS • Paillier PHE + RLWE-BFV (leveled, depth 1)</span>
-                </div>
+        <div class="brand">
+            <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+                <circle cx="16" cy="16" r="12.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <circle cx="16" cy="3.5" r="3" fill="currentColor"/>
+                <circle cx="27.9" cy="12.1" r="3" fill="currentColor"/>
+                <circle cx="23.3" cy="26.1" r="3" fill="currentColor"/>
+                <circle cx="8.7" cy="26.1" r="3" fill="var(--paper)" stroke="currentColor" stroke-width="1.5"/>
+                <circle cx="4.1" cy="12.1" r="3" fill="var(--paper)" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <div class="brand-text">
+                <h1>VaultMind <span class="v-tag">v2</span></h1>
+                <p class="brand-sub">Detected sensitive spans are blinded on this machine before a cloud LLM sees the prompt.</p>
             </div>
-            <div class="enclave-badge">
-                <span class="pulse-dot" aria-hidden="true"></span>
-                <span>127.0.0.1:8000 • libvaultcrypto.dylib ACTIVE</span>
-            </div>
+            <span class="enclave-badge" id="enclaveHostBadge">127.0.0.1:8000 · libvaultcrypto.dylib ACTIVE</span>
         </div>
 
-        <div class="header-right">
-            <div class="model-select-wrapper">
-                <label for="providerSelect">LLM Host:</label>
+        <div class="host-controls">
+            <div class="field-inline">
+                <label for="providerSelect">LLM Host</label>
                 <select id="providerSelect">
-                    <option value="gemini">✨ Google Gemini 2.5 Flash (Live API)</option>
-                    <option value="openai">🤖 OpenAI GPT-4o-mini (Live API)</option>
-                    <option value="bedrock">☁️ AWS Bedrock Converse (Live API)</option>
-                    <option value="simulation" selected>⚡ Offline Deterministic Engine (nothing leaves this machine)</option>
+                    <option value="gemini">Google Gemini 2.5 Flash (Live API)</option>
+                    <option value="openai">OpenAI GPT-4o-mini (Live API)</option>
+                    <option value="bedrock">AWS Bedrock Converse (Live API)</option>
+                    <option value="simulation" selected>Offline Deterministic Engine (nothing leaves this machine)</option>
                 </select>
             </div>
             <label for="apiKeyInput" class="visually-hidden">Provider API key (optional, or configure .env)</label>
@@ -41,161 +47,172 @@
 
     <main id="main" class="app-main">
         <section class="telemetry-bar" aria-label="Enclave telemetry">
-            <div class="telemetry-card">
-                <span class="label">RECONSTRUCTED MASTER KEY</span>
-                <span class="value green">C stack only · wiped after each seal</span>
-            </div>
-            <div class="telemetry-card">
-                <span class="label">VERIFIABLE SECRET SHARING</span>
-                <span class="value purple" id="quorumText">k=3 of n=5 (2048-bit Feldman VSS)</span>
-            </div>
-            <div class="telemetry-card">
-                <span class="label">HOMOMORPHIC CRYPTO</span>
-                <span class="value cyan" id="paillierBitsText">Paillier PHE + RLWE-BFV (leveled, depth 1)</span>
-            </div>
-            <div class="telemetry-card">
-                <span class="label">KEY ZEROIZATION</span>
-                <span class="value green">C11 memset_s() + CommonCrypto</span>
-            </div>
+            <dl class="telemetry">
+                <div class="telemetry-item">
+                    <dt>Reconstructed master key</dt>
+                    <dd>C stack only · wiped after each seal</dd>
+                </div>
+                <div class="telemetry-item">
+                    <dt>Verifiable secret sharing</dt>
+                    <dd id="quorumText">k=3 of n=5 (2048-bit Feldman VSS)</dd>
+                </div>
+                <div class="telemetry-item">
+                    <dt>Homomorphic crypto</dt>
+                    <dd id="paillierBitsText">Paillier PHE + RLWE-BFV (leveled, depth 1)</dd>
+                </div>
+                <div class="telemetry-item">
+                    <dt>Key zeroization</dt>
+                    <dd>C11 memset_s() + CommonCrypto</dd>
+                </div>
+            </dl>
         </section>
 
         <section class="scenario-bar" aria-labelledby="scenarioTitle">
-            <span class="scenario-title" id="scenarioTitle">Verified Scenarios:</span>
-            <button class="chip" onclick="loadScenario('salary')">💼 15% Bonus Paillier PHE &amp; DB Seal</button>
-            <button class="chip" onclick="loadScenario('bfv_secrets')">🔐 RLWE-BFV Product &amp; Password Seal</button>
-            <button class="chip" onclick="loadScenario('health')">🏥 Patient BSN &amp; Biomarker EHR Update</button>
-            <button class="chip" onclick="loadScenario('finance')">💳 Executive IBAN Wire Transfer Auth</button>
-            <button class="chip" onclick="loadScenario('xss')">🧪 XSS &amp; Secret Key Leak Stress Test</button>
+            <h2 class="scenario-title" id="scenarioTitle">Scenarios</h2>
+            <div class="scenario-list">
+                <button type="button" class="chip" onclick="loadScenario('salary')">15% Bonus Paillier PHE &amp; DB Seal</button>
+                <button type="button" class="chip" onclick="loadScenario('bfv_secrets')">RLWE-BFV Product &amp; Password Seal</button>
+                <button type="button" class="chip" onclick="loadScenario('health')">Patient BSN &amp; Biomarker EHR Update</button>
+                <button type="button" class="chip" onclick="loadScenario('finance')">Executive IBAN Wire Transfer Auth</button>
+                <button type="button" class="chip" onclick="loadScenario('xss')">XSS &amp; Secret Key Leak Stress Test</button>
+            </div>
         </section>
 
-        <div class="workspace-grid">
-            <!-- COLUMN 1: Local Client -->
+        <div class="workspace-grid" id="workspace" tabindex="-1">
+            <!-- COLUMN 1: Local Client (trusted) -->
             <section class="column-panel client-panel" aria-labelledby="clientHeading">
-                <div class="panel-header">
-                    <span class="panel-tag tag-client">LOCAL CLIENT (TRUSTED)</span>
+                <div class="zone-band">
+                    <span class="panel-tag">LOCAL CLIENT (TRUSTED)</span>
+                    <span class="zone-where">this machine</span>
+                </div>
+                <div class="panel-body">
                     <h2 id="clientHeading">Plaintext Input &amp; Decrypted Verdict</h2>
-                </div>
 
-                <div class="input-container">
-                    <label for="promptInput">Confidential Enterprise Prompt (supports free-text passwords &amp; &lt;secret&gt;...&lt;/secret&gt;):</label>
-                    <textarea id="promptInput" rows="5" aria-describedby="promptHint"></textarea>
-                    <p id="promptHint" class="input-hint">Blinding is heuristic: wrap any secret that has no label (password, token, key…) in <code>&lt;secret&gt;…&lt;/secret&gt;</code> so it is always sealed.</p>
+                    <div class="input-container">
+                        <label for="promptInput">Confidential prompt</label>
+                        <textarea id="promptInput" rows="5" aria-describedby="promptHint" spellcheck="false"></textarea>
+                        <p id="promptHint" class="input-hint">Blinding is heuristic: wrap any secret that has no label (password, token, key…) in <code>&lt;secret&gt;…&lt;/secret&gt;</code> so it is always sealed.</p>
 
-                    <div class="action-row">
-                        <button id="runBtn" class="btn-primary" onclick="runPipeline()">
-                            <span class="btn-icon" aria-hidden="true">⚡</span> Execute Zero-Trust Pipeline
-                        </button>
-                        <span id="latencyBadge" class="latency-badge hidden">-- ms</span>
-                    </div>
-                </div>
-
-                <div id="fheAgentBanner" class="fhe-inline-banner hidden" role="status" aria-live="polite"></div>
-
-                <div class="result-box">
-                    <div class="box-title">
-                        <span>Unblinded Local Output</span>
-                        <span id="providerUsedTag" class="secure-tag">Ready</span>
-                    </div>
-                    <div id="decryptedOutput" class="content-output placeholder" aria-live="polite">
-                        Click "Execute Zero-Trust Pipeline" to run blind reasoning, Paillier / RLWE-BFV math, and native C enclave sealing...
-                    </div>
-                    <div id="parseWarning" class="parse-warning hidden" role="status" aria-live="polite"></div>
-                </div>
-            </section>
-
-            <!-- COLUMN 2: Cloud Network Wire -->
-            <section class="column-panel wire-panel" aria-labelledby="wireHeading">
-                <div class="panel-header">
-                    <span class="panel-tag tag-wire">EXTERNAL CLOUD WIRE</span>
-                    <h2 id="wireHeading">What Host Provider (Gemini/OpenAI/Bedrock) Sees</h2>
-                </div>
-
-                <div class="wire-box">
-                    <div class="wire-header">
-                        <span>TRANSMITTED PAYLOAD</span>
-                        <span class="wire-lock" id="wireLockBadge">Leak check: awaiting run</span>
-                    </div>
-                    <div id="leakCheckStatus" class="leak-status hidden" role="status" aria-live="polite"></div>
-                    <div id="wireOutput" class="wire-code-block placeholder" tabindex="0" role="region" aria-label="Transmitted payload">
-                        Awaiting transmission...
-                    </div>
-                </div>
-
-                <div class="crypto-meta-box">
-                    <div class="box-title">
-                        <span>Local Ephemeral Blinding, C-AES256 Secrets &amp; Ciphertext Map</span>
-                    </div>
-                    <div id="mappingTokens" class="tokens-list">
-                        <p class="empty-state">No active session tokens.</p>
-                    </div>
-                </div>
-            </section>
-
-            <!-- COLUMN 3: Native C Enclave & Feldman VSS -->
-            <section class="column-panel vault-panel" aria-labelledby="vaultHeading">
-                <div class="panel-header">
-                    <div class="header-split">
-                        <div>
-                            <span class="panel-tag tag-vault">NATIVE C ENCLAVE &amp; FELDMAN VSS</span>
-                            <h2 id="vaultHeading">Distributed Shard Quorum (k=3, n=5)</h2>
+                        <div class="action-row">
+                            <button type="button" id="runBtn" class="btn-primary" onclick="runPipeline()">Execute Zero-Trust Pipeline</button>
+                            <span id="latencyBadge" class="latency-badge hidden">-- ms</span>
                         </div>
-                        <button class="btn-restore" onclick="restoreShards()" title="Restore clean shard files">↺ Restore Shards</button>
+                    </div>
+
+                    <div id="fheAgentBanner" class="fhe-inline-banner hidden" role="status" aria-live="polite"></div>
+
+                    <div class="result-box">
+                        <div class="box-title">
+                            <h3>Unblinded Local Output</h3>
+                            <span id="providerUsedTag" class="secure-tag">Ready</span>
+                        </div>
+                        <div id="decryptedOutput" class="content-output placeholder" aria-live="polite" tabindex="0" role="region" aria-label="Unblinded local output">Run the pipeline to see the answer, unblinded on this machine.</div>
+                        <div id="parseWarning" class="parse-warning hidden" role="status" aria-live="polite"></div>
                     </div>
                 </div>
+            </section>
 
-                <div class="vault-nodes-container">
-                    <span class="sub-label">Isolated Disk Shards — click <strong>Corrupt</strong> to test live 2048-bit Feldman VSS defense:</span>
-                    <div class="nodes-grid" id="nodesGrid" aria-live="polite"></div>
+            <!-- COLUMN 2: Cloud wire (untrusted) -->
+            <section class="column-panel wire-panel" aria-labelledby="wireHeading">
+                <div class="zone-band">
+                    <span class="panel-tag">EXTERNAL CLOUD WIRE</span>
+                    <span class="zone-where">leaves for the provider</span>
                 </div>
+                <div class="panel-body">
+                    <h2 id="wireHeading">What Host Provider (Gemini/OpenAI/Bedrock) Sees</h2>
 
-                <div class="chart-wrapper">
-                    <div class="box-title">
-                        <span>Live GF(2⁸) Canary Polynomial f(x) vs. Disk Shards</span>
-                        <span class="secure-tag">f(0) = 42</span>
+                    <div class="wire-box">
+                        <div class="wire-header">
+                            <h3>Transmitted payload</h3>
+                            <span class="wire-lock leak-unknown" id="wireLockBadge">Leak check: awaiting run</span>
+                        </div>
+                        <div id="leakCheckStatus" class="leak-status hidden" role="status" aria-live="polite"></div>
+                        <div id="wireOutput" class="wire-code-block placeholder" tabindex="0" role="region" aria-label="Transmitted payload">Awaiting transmission...</div>
                     </div>
-                    <div class="chart-canvas-box">
-                        <canvas id="shamirChart" role="img" aria-label="Line chart of the GF(2^8) canary polynomial f(x) for x from 0 to 5, with verified disk shards as green points and rejected shards as red crosses. f(0) = 42."></canvas>
+
+                    <div class="crypto-meta-box">
+                        <div class="box-title">
+                            <h3>Token map (kept locally)</h3>
+                        </div>
+                        <p class="box-note">Ephemeral blinding tokens, C AES-256 sealed secrets and ciphertext handles. This table never leaves the machine.</p>
+                        <div id="mappingTokens" class="tokens-list" tabindex="0" role="region" aria-label="Token map">
+                            <p class="empty-state">No active session tokens.</p>
+                        </div>
                     </div>
                 </div>
+            </section>
 
-                <div class="receipt-box">
-                    <div class="box-title">
-                        <span>Native C Enclave Seal Receipt</span>
+            <!-- COLUMN 3: Native C Enclave & Feldman VSS (trusted) -->
+            <section class="column-panel vault-panel" aria-labelledby="vaultHeading">
+                <div class="zone-band">
+                    <span class="panel-tag">NATIVE C ENCLAVE &amp; FELDMAN VSS</span>
+                    <span class="zone-where">this machine</span>
+                </div>
+                <div class="panel-body">
+                    <div class="header-split">
+                        <h2 id="vaultHeading">Distributed Shard Quorum (k=3, n=5)</h2>
+                        <button type="button" class="btn-ghost" onclick="restoreShards()" title="Restore clean shard files">↺ Restore Shards</button>
                     </div>
-                    <div id="receiptOutput" class="receipt-content placeholder" aria-live="polite">
-                        Awaiting authenticated ActionPlan...
+
+                    <div class="vault-nodes-container">
+                        <p class="sub-label">Isolated disk shards. Press <strong>Corrupt</strong> on a node to test the 2048-bit Feldman VSS check.</p>
+                        <div class="nodes-grid" id="nodesGrid" aria-live="polite"></div>
+                    </div>
+
+                    <div class="chart-wrapper">
+                        <div class="box-title">
+                            <h3>GF(2⁸) canary polynomial f(x) vs. disk shards</h3>
+                            <span class="secure-tag">f(0) = 42</span>
+                        </div>
+                        <div class="chart-canvas-box">
+                            <canvas id="shamirChart" role="img" aria-label="Line chart of the GF(2^8) canary polynomial f(x) for x from 0 to 5, with verified disk shards as filled points and rejected shards as red crosses. f(0) = 42."></canvas>
+                        </div>
+                        <ul class="chart-legend" aria-hidden="true">
+                            <li><span class="lg lg-curve"></span>f(x)</li>
+                            <li><span class="lg lg-ok"></span>verified shard</li>
+                            <li><span class="lg lg-bad"></span>rejected shard</li>
+                        </ul>
+                    </div>
+
+                    <div class="receipt-box">
+                        <div class="box-title">
+                            <h3>Native C Enclave Seal Receipt</h3>
+                        </div>
+                        <div id="receiptOutput" class="receipt-content placeholder" aria-live="polite">Awaiting authenticated ActionPlan...</div>
                     </div>
                 </div>
             </section>
         </div>
 
-        <!-- Bottom Dual Section: Interactive Paillier PHE + RLWE-BFV Math + Encrypted SQLite Ledger -->
+        <!-- Bottom: Paillier PHE + RLWE-BFV playground and encrypted SQLite ledger -->
         <div class="bottom-grid">
             <section class="fhe-drawer" aria-labelledby="playgroundHeading">
-                <div class="fhe-header">
-                    <h2 id="playgroundHeading">🧮 Dual Homomorphic Playground: Paillier PHE &amp; RLWE-BFV (leveled, depth 1)</h2>
-                    <span class="fhe-formula">Z_{n²}* addition &amp; R_q = Z_q[X]/(X²⁰⁴⁸+1) multiplication · N=2048, log q=54</span>
+                <div class="drawer-header">
+                    <h2 id="playgroundHeading">Homomorphic Playground: Paillier PHE &amp; RLWE-BFV (leveled, depth 1)</h2>
+                    <p class="fhe-formula">Z_{n²}* addition &amp; R_q = Z_q[X]/(X²⁰⁴⁸+1) multiplication · N=2048, log q=54</p>
                 </div>
                 <div class="fhe-controls">
                     <div class="input-pair">
-                        <label for="fheVal1">m₁:</label>
+                        <label for="fheVal1">m₁</label>
                         <input type="number" step="1" id="fheVal1" value="160">
                     </div>
-                    <div class="plus-sign" aria-hidden="true">⊕ / ⊗</div>
+                    <span class="op-sign" aria-hidden="true">⊕ / ⊗</span>
                     <div class="input-pair">
-                        <label for="fheVal2">m₂:</label>
+                        <label for="fheVal2">m₂</label>
                         <input type="number" step="1" id="fheVal2" value="225">
                     </div>
-                    <button class="btn-secondary" onclick="calcHomomorphic()">Paillier PHE Sum (mod n²)</button>
-                    <button class="btn-secondary" onclick="calcBFV()">C RLWE-BFV Product (in R_q)</button>
+                    <div class="fhe-buttons">
+                        <button type="button" class="btn-secondary" onclick="calcHomomorphic()">Paillier PHE Sum (mod n²)</button>
+                        <button type="button" class="btn-secondary" onclick="calcBFV()">C RLWE-BFV Product (in R_q)</button>
+                    </div>
                 </div>
                 <div id="fheResult" class="fhe-result-box hidden" role="status" aria-live="polite"></div>
             </section>
 
             <section class="ledger-drawer" aria-labelledby="ledgerHeading">
-                <div class="fhe-header">
-                    <h2 id="ledgerHeading">🗄️ Encrypted SQLite Audit Ledger (AES-256 + HMAC-SHA256)</h2>
-                    <button class="btn-secondary" onclick="verifyLedger()">✔ Verify HMACs in C Enclave</button>
+                <div class="drawer-header drawer-header-row">
+                    <h2 id="ledgerHeading">Encrypted SQLite Audit Ledger (AES-256 + HMAC-SHA256)</h2>
+                    <button type="button" class="btn-secondary" onclick="verifyLedger()">Verify HMACs in C Enclave</button>
                 </div>
                 <div id="ledgerStatusBanner" class="ledger-banner hidden" role="status" aria-live="polite"></div>
                 <div id="ledgerTableWrap" class="ledger-table-wrap" tabindex="0" role="region" aria-label="Sealed ledger rows">
@@ -206,8 +223,8 @@
     </main>
 
     <footer class="app-footer">
-        <p>Built for <strong>Mathematics for Systems Security Hackathon</strong> • Track: <em>AI Pipeline Secret Sharing</em></p>
-        <p>Native C Constant-Time GF(2⁸) Shamir • Key zeroization via memset_s() • RFC 3526 2048-bit Feldman VSS • Paillier PHE • C RLWE-BFV (leveled, depth 1), N=2048, log q=54</p>
+        <p>Built for <strong>Mathematics for Systems Security Hackathon</strong> · Track: <em>AI Pipeline Secret Sharing</em></p>
+        <p>Native C constant-time GF(2⁸) Shamir · key zeroization via memset_s() · RFC 3526 2048-bit Feldman VSS · Paillier PHE · C RLWE-BFV (leveled, depth 1), N=2048, log q=54</p>
     </footer>
 
     <script src="/static/app.js"></script>

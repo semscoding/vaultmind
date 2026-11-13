@@ -1,5 +1,18 @@
 // VaultMind v2 Zero-Trust Frontend Controller (Strict XSS-Safe DOM Handling)
 let shamirChart = null;
+// Last known VSS state per node index, so a node that has just been rejected can be marked once.
+const lastNodeValid = {};
+const REDUCED_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Chart colours mirror the CSS tokens in style.css (ink, ok, bad).
+const CHART_COLORS = {
+    curve: "#3D4553",
+    ok: "#0B6E37",
+    bad: "#B42318",
+    ring: "#FCFCFD",
+    tick: "#555E6D",
+    grid: "rgba(18, 22, 29, 0.08)"
+};
 
 const SCENARIOS = {
     salary: "Evaluate a 15% annual bonus for employee Marcus Vance (salary: $130,000, rating: 4.9) and commit to database with master key.",
@@ -19,6 +32,10 @@ function escapeHtml(unsafe) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+    const hostBadge = document.getElementById("enclaveHostBadge");
+    if (hostBadge && window.location && window.location.host) {
+        hostBadge.textContent = `${window.location.host} · libvaultcrypto.dylib ACTIVE`;
+    }
     initChart();
     loadScenario("salary");
     detectLiveLLMConfig();
@@ -62,29 +79,30 @@ function initChart() {
                 {
                     label: "GF(2⁸) Interpolated Polynomial f(x)",
                     data: [],
-                    borderColor: "#8B5CF6",
-                    borderWidth: 2,
+                    borderColor: CHART_COLORS.curve,
+                    borderWidth: 1.5,
                     tension: 0.25,
-                    pointBackgroundColor: "#8B5CF6",
-                    pointRadius: 3,
+                    pointBackgroundColor: CHART_COLORS.curve,
+                    pointRadius: 2.5,
                     fill: false
                 },
                 {
                     label: "Feldman VSS Verified Shards",
                     data: [],
-                    pointBackgroundColor: "#10B981",
-                    pointBorderColor: "#FFFFFF",
+                    pointBackgroundColor: CHART_COLORS.ok,
+                    pointBorderColor: CHART_COLORS.ring,
+                    pointBorderWidth: 2,
                     pointRadius: 6,
                     showLine: false
                 },
                 {
                     label: "Tampered / Rejected Shards",
                     data: [],
-                    pointBackgroundColor: "#EF4444",
-                    pointBorderColor: "#FFFFFF",
+                    pointBackgroundColor: CHART_COLORS.bad,
+                    pointBorderColor: CHART_COLORS.bad,
                     pointStyle: "crossRot",
                     pointRadius: 8,
-                    pointBorderWidth: 2,
+                    pointBorderWidth: 2.5,
                     showLine: false
                 }
             ]
@@ -92,6 +110,7 @@ function initChart() {
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            animation: REDUCED_MOTION ? false : { duration: 250 },
             plugins: {
                 legend: { display: false },
                 tooltip: {
@@ -105,14 +124,14 @@ function initChart() {
                     type: "linear",
                     min: 0,
                     max: 5,
-                    ticks: { stepSize: 1, color: "#7C8BA1" },
-                    grid: { color: "rgba(255, 255, 255, 0.05)" }
+                    ticks: { stepSize: 1, color: CHART_COLORS.tick, font: { size: 12 } },
+                    grid: { color: CHART_COLORS.grid }
                 },
                 y: {
                     min: 0,
                     max: 260,
-                    ticks: { color: "#7C8BA1" },
-                    grid: { color: "rgba(255, 255, 255, 0.05)" }
+                    ticks: { color: CHART_COLORS.tick, font: { size: 12 } },
+                    grid: { color: CHART_COLORS.grid }
                 }
             }
         }
@@ -140,6 +159,24 @@ function updatePolynomialChart(polyData) {
     shamirChart.update();
 }
 
+// Seal receipt as a definition list; every value goes in via textContent.
+function renderReceipt(container, rows) {
+    container.textContent = "";
+    const dl = document.createElement("dl");
+    dl.className = "receipt-list";
+    rows.forEach(([label, value, bad]) => {
+        const dt = document.createElement("dt");
+        dt.textContent = label;
+        const dd = document.createElement("dd");
+        dd.textContent = value === null || value === undefined ? "" : String(value);
+        if (bad === true) dd.className = "receipt-bad";
+        else if (typeof bad === "string") dd.className = bad;
+        dl.appendChild(dt);
+        dl.appendChild(dd);
+    });
+    container.appendChild(dl);
+}
+
 function renderVaultTopology(vaultData) {
     const grid = document.getElementById("nodesGrid");
     grid.innerHTML = "";
@@ -153,29 +190,35 @@ function renderVaultTopology(vaultData) {
         let cls = "node-card";
         if (!node.vss_valid) cls += " tampered";
         else if (node.status === "QUORUM_ACTIVE") cls += " quorum-active";
+        // Mark a shard that was valid on the previous render and is now rejected (one short jolt).
+        if (!node.vss_valid && lastNodeValid[node.index] === true && !REDUCED_MOTION) cls += " just-rejected";
+        lastNodeValid[node.index] = !!node.vss_valid;
         card.className = cls;
 
         const dot = document.createElement("span");
         dot.className = "node-status-dot";
+        dot.setAttribute("aria-hidden", "true");
 
+        const nodeName = `node-0${node.index}`;
         const title = document.createElement("strong");
-        title.textContent = `node-0${node.index}`;
+        title.textContent = nodeName;
 
         const stateSpan = document.createElement("span");
-        stateSpan.style.color = !node.vss_valid
-            ? "var(--red-text)"
-            : (node.status === "QUORUM_ACTIVE" ? "var(--green-accent)" : "var(--text-muted)");
+        stateSpan.className = "node-state";
         stateSpan.textContent = !node.vss_valid
-            ? "TAMPERED"
-            : (node.status === "QUORUM_ACTIVE" ? "QUORUM" : "VSS OK");
+            ? "Rejected"
+            : (node.status === "QUORUM_ACTIVE" ? "In quorum" : "Verified");
 
         const fpSpan = document.createElement("span");
-        fpSpan.style.color = "var(--purple-text)";
+        fpSpan.className = "node-fp";
         fpSpan.textContent = `#${node.fingerprint}`;
 
         const corruptBtn = document.createElement("button");
+        corruptBtn.type = "button";
         corruptBtn.className = "btn-corrupt";
-        corruptBtn.textContent = "⚡ Corrupt";
+        corruptBtn.textContent = "Corrupt";
+        // Visible label stays "Corrupt"; the accessible name also says which node.
+        corruptBtn.setAttribute("aria-label", `Corrupt ${nodeName}`);
         corruptBtn.onclick = () => tamperNode(node.index);
 
         card.appendChild(dot);
@@ -253,6 +296,22 @@ function prettyBody(body) {
     }
 }
 
+function formatSafeRequestParts(req) {
+    const parts = [];
+    const method = escapeHtml(req.method || "POST");
+    // Defence in depth: never display a key that slipped into the query string.
+    const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
+    parts.push(`<strong class="wire-request-line">${method} ${escapeHtml(shownUrl)}</strong>`);
+    if (req.headers_redacted && typeof req.headers_redacted === "object") {
+        const hdrs = Object.entries(req.headers_redacted)
+            .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
+            .join("\n");
+        if (hdrs) parts.push(`<span class="wire-headers">${hdrs}</span>`);
+    }
+    parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
+    return parts;
+}
+
 // B4: show the request that was actually sent to the provider (no API key),
 // never a made-up endpoint. Returns an HTML string in which every dynamic value
 // is escaped with escapeHtml() before token highlighting.
@@ -263,27 +322,30 @@ function formatSafeHighlightedWire(payload) {
     const parts = [];
 
     if (req && req.url) {
-        const method = escapeHtml(req.method || "POST");
-        // Defence in depth: never display a key that slipped into the query string.
-        const shownUrl = String(req.url).replace(/([?&](?:key|api_key|apikey|access_token)=)[^&#]*/gi, "$1[REDACTED]");
-        parts.push(`<strong class="wire-section-label">${method} ${escapeHtml(shownUrl)}</strong>`);
-        if (req.headers_redacted && typeof req.headers_redacted === "object") {
-            const hdrs = Object.entries(req.headers_redacted)
-                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`)
-                .join("\n");
-            if (hdrs) parts.push(hdrs);
-        }
-        parts.push(highlightTokens(escapeHtml(prettyBody(req.body))));
+        parts.push(...formatSafeRequestParts(req));
     } else if (req) {
         // Offline engine: backend reports method/url/body = null.
-        parts.push('<strong class="wire-local-only">✔ LOCAL ONLY: offline engine, nothing left this machine</strong>');
-        if (req.note) parts.push(`// ${escapeHtml(req.note)}`);
-        parts.push('<span class="wire-section-label">Blinded prompt processed locally:</span>');
+        parts.push('<strong class="wire-local-only">Local only: nothing left this machine</strong>');
+        if (req.note) parts.push(`<span class="wire-note">${escapeHtml(req.note)}</span>`);
+        parts.push('<span class="wire-section-label">Blinded prompt, processed locally</span>');
         parts.push(highlightTokens(escapeHtml(blinded)));
     } else {
         // Older backend without actual_request: show only the blinded prompt.
-        parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request):</span>');
+        parts.push('<span class="wire-section-label">Blinded prompt (backend did not report the exact request)</span>');
         parts.push(highlightTokens(escapeHtml(blinded)));
+    }
+    return parts.join("\n\n");
+}
+
+function formatSafeFailedWire(err) {
+    const status = escapeHtml(err.status || 502);
+    const parts = [
+        `<span class="wire-note">Provider returned HTTP ${status}: no answer was used and nothing was sealed. Outbound request sent (API key redacted):</span>`
+    ];
+    if (err.wireRequest && err.wireRequest.url) {
+        parts.push(...formatSafeRequestParts(err.wireRequest));
+    } else {
+        parts.push(highlightTokens(escapeHtml(prettyBody(err.wireRequest))));
     }
     return parts.join("\n\n");
 }
@@ -321,9 +383,9 @@ function renderLeakCheck(payload) {
         const bad = (residual !== null && residual > 0) || flagged.length > 0;
         head.textContent = bad
             ? `⚠ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`
-            : `✔ Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`;
+            : `Leak check: ${spansTxt} spans blinded, ${residualTxt} residual matches`;
         if (bad) {
-            lines.push("WARNING: detected values are still present in the outgoing payload.");
+            lines.push("Detected values are still present in the outgoing payload.");
         }
         if (flagged.length) lines.push(`Flagged by backend: ${flagged.join(", ")}.`);
         if (lc.method) lines.push(`Method: ${lc.method}`);
@@ -333,7 +395,7 @@ function renderLeakCheck(payload) {
         }
         box.classList.add(bad ? "leak-bad" : "leak-ok");
         badge.classList.add(bad ? "leak-bad" : "leak-ok");
-        badge.textContent = bad ? `⚠ ${residualTxt} RESIDUAL MATCH(ES)` : `✔ 0 RESIDUAL MATCHES (heuristic)`;
+        badge.textContent = bad ? `⚠ ${residualTxt} residual match(es)` : `✔ 0 residual matches (heuristic)`;
     } else {
         head.textContent = flagged.length
             ? `⚠ Backend flags: ${flagged.join(", ")}`
@@ -342,7 +404,7 @@ function renderLeakCheck(payload) {
         if (flagged.length) {
             box.classList.add("leak-bad");
             badge.classList.add("leak-bad");
-            badge.textContent = "⚠ LEAK FLAGGED";
+            badge.textContent = "⚠ Leak flagged";
         } else {
             badge.classList.add("leak-unknown");
             badge.textContent = "Leak check: not reported";
@@ -351,7 +413,11 @@ function renderLeakCheck(payload) {
 
     box.appendChild(head);
     if (lines.length) {
-        box.appendChild(document.createTextNode("\n" + lines.join("\n")));
+        box.appendChild(document.createTextNode("\n"));
+        const detail = document.createElement("p");
+        detail.className = "leak-status-detail";
+        detail.textContent = lines.join("\n");
+        box.appendChild(detail);
     }
 }
 
@@ -392,16 +458,18 @@ async function readJsonSafe(res) {
     }
 }
 
+function resetTokenMap(container, message = "No active session tokens.") {
+    container.textContent = "";
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = message;
+    container.appendChild(empty);
+}
+
 function restoreRunButton(runBtn) {
     runBtn.disabled = false;
     runBtn.removeAttribute("aria-busy");
-    runBtn.textContent = "";
-    const icon = document.createElement("span");
-    icon.className = "btn-icon";
-    icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "⚡";
-    runBtn.appendChild(icon);
-    runBtn.appendChild(document.createTextNode(" Execute Zero-Trust Pipeline"));
+    runBtn.textContent = "Execute Zero-Trust Pipeline";
 }
 
 async function runPipeline() {
@@ -424,7 +492,7 @@ async function runPipeline() {
 
     runBtn.disabled = true;
     runBtn.setAttribute("aria-busy", "true");
-    runBtn.textContent = "⏳ Running C Enclave, Paillier & RLWE-BFV...";
+    runBtn.textContent = "Running C Enclave, Paillier & RLWE-BFV...";
     decryptedOutput.className = "content-output placeholder";
     decryptedOutput.textContent = "Blinding sensitive spans, running Paillier PHE / C RLWE-BFV (leveled, depth 1), and verifying 2048-bit Feldman shards...";
     fheBanner.classList.add("hidden");
@@ -512,7 +580,7 @@ async function runPipeline() {
                 .join("  |  ");
             const eng = payload.fhe_computation.engine || "Homomorphic engine";
             fheBanner.textContent =
-                `🧮 [${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
+                `[${eng}] ${payload.fhe_computation.formula}  ⟹  ${outs}`;
             fheBanner.classList.remove("hidden");
         }
 
@@ -556,6 +624,10 @@ async function runPipeline() {
             });
         }
 
+        if (!mappingTokens.firstChild) {
+            resetTokenMap(mappingTokens, "No sensitive spans detected in this prompt.");
+        }
+
         // Column 3: Vault Topology & C Enclave Receipt
         if (payload.vault_topology) {
             renderVaultTopology(payload.vault_topology);
@@ -563,22 +635,30 @@ async function runPipeline() {
 
         if (payload.enclave_receipt) {
             const r = payload.enclave_receipt;
+            const rejected = r.rejected_tampered_nodes && r.rejected_tampered_nodes.length > 0;
             receiptOutput.className = "receipt-content";
-            receiptOutput.textContent = [
-                `STATUS:      ${r.status} (SQLite Row #${r.ledger_row_id})`,
-                `ACTION:      ${r.action}`,
-                `TARGET:      ${r.target}`,
-                `QUORUM:      ${(r.quorum_nodes || []).join(", ")}`,
-                r.rejected_tampered_nodes && r.rejected_tampered_nodes.length > 0
-                    ? `REJECTED:    ${r.rejected_tampered_nodes.join(", ")} (Feldman VSS Failed!)`
-                    : `VSS_CHECK:   All inspected shards valid`,
-                `AES256_CT:   ${r.aes256_ciphertext_preview}`,
-                `HMAC_SHA256: ${r.hmac_sha256_tag}`,
-                `C_ZEROIZE:   ${r.c_enclave_zeroize}`
-            ].join("\n");
+            renderReceipt(receiptOutput, [
+                ["Status", `${r.status} (SQLite row #${r.ledger_row_id})`],
+                ["Action", r.action],
+                ["Target", r.target],
+                ["Quorum", (r.quorum_nodes || []).join(", ")],
+                rejected
+                    ? ["Rejected", `${r.rejected_tampered_nodes.join(", ")} (Feldman VSS failed)`, true]
+                    : ["VSS check", "All inspected shards valid"],
+                ["AES-256 ciphertext", r.aes256_ciphertext_preview],
+                ["HMAC-SHA256", r.hmac_sha256_tag],
+                ["Key wipe", r.c_enclave_zeroize, "receipt-prose"]
+            ]);
         } else if (payload.enclave_error) {
-            receiptOutput.className = "receipt-content";
-            receiptOutput.textContent = `❌ ENCLAVE BLOCKED:\n${payload.enclave_error}`;
+            receiptOutput.className = "receipt-content receipt-blocked";
+            receiptOutput.textContent = "";
+            const head = document.createElement("strong");
+            head.textContent = "Enclave blocked the write";
+            const detail = document.createElement("p");
+            detail.textContent = String(payload.enclave_error);
+            receiptOutput.appendChild(head);
+            receiptOutput.appendChild(document.createTextNode("\n"));
+            receiptOutput.appendChild(detail);
         } else {
             receiptOutput.className = "receipt-content placeholder";
             receiptOutput.textContent = "Read-only query: no privileged Enclave write required.";
@@ -592,10 +672,8 @@ async function runPipeline() {
         latencyBadge.classList.add("hidden");
         if (err.wireRequest && typeof err.wireRequest === "object") {
             wireOutput.className = "wire-code-block";
-            wireOutput.textContent =
-                `// Provider returned HTTP ${err.status || 502}: no answer was used and nothing was sealed.\n` +
-                `// Actual outbound request transmitted (API key redacted):\n\n` +
-                JSON.stringify(err.wireRequest, null, 2);
+            // Safe: formatSafeFailedWire escapes every dynamic value before highlighting tokens.
+            wireOutput.innerHTML = formatSafeFailedWire(err);
         } else {
             wireOutput.className = "wire-code-block placeholder";
             wireOutput.textContent = err.status === 502
@@ -603,6 +681,9 @@ async function runPipeline() {
                 : "No request completed.";
         }
         resetLeakCheck("Leak check: no result");
+        resetTokenMap(mappingTokens);
+        receiptOutput.className = "receipt-content placeholder";
+        receiptOutput.textContent = "No enclave write: request did not complete.";
     } finally {
         restoreRunButton(runBtn);
     }
